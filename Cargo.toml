@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = { version = "0.14", features = ["canvas", "image", "tokio"] }
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
 image = "0.25"
 anyhow = "1"
 tracing = "0.1"

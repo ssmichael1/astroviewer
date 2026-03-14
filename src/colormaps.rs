@@ -9,8 +9,10 @@ pub enum ColormapKind {
     Hot,
     Viridis,
     Inferno,
+    Plasma,
     Magma,
-    Red,
+    Cubehelix,
+    Turbo,
 }
 
 impl ColormapKind {
@@ -19,8 +21,10 @@ impl ColormapKind {
         ColormapKind::Hot,
         ColormapKind::Viridis,
         ColormapKind::Inferno,
+        ColormapKind::Plasma,
         ColormapKind::Magma,
-        ColormapKind::Red,
+        ColormapKind::Cubehelix,
+        ColormapKind::Turbo,
     ];
 
     pub fn name(&self) -> &'static str {
@@ -29,8 +33,10 @@ impl ColormapKind {
             ColormapKind::Hot => "Hot",
             ColormapKind::Viridis => "Viridis",
             ColormapKind::Inferno => "Inferno",
+            ColormapKind::Plasma => "Plasma",
             ColormapKind::Magma => "Magma",
-            ColormapKind::Red => "Red",
+            ColormapKind::Cubehelix => "Cubehelix",
+            ColormapKind::Turbo => "Turbo",
         }
     }
 
@@ -40,8 +46,10 @@ impl ColormapKind {
             ColormapKind::Hot => build_hot(),
             ColormapKind::Viridis => build_from_anchors(&VIRIDIS_ANCHORS),
             ColormapKind::Inferno => build_from_anchors(&INFERNO_ANCHORS),
+            ColormapKind::Plasma => build_from_anchors(&PLASMA_ANCHORS),
             ColormapKind::Magma => build_from_anchors(&MAGMA_ANCHORS),
-            ColormapKind::Red => build_red(),
+            ColormapKind::Cubehelix => build_cubehelix(),
+            ColormapKind::Turbo => build_from_anchors(&TURBO_ANCHORS),
         }
     }
 }
@@ -89,10 +97,28 @@ fn build_hot() -> [[u8; 3]; 256] {
     lut
 }
 
-fn build_red() -> [[u8; 3]; 256] {
+/// Dave Green's Cubehelix — designed for astronomical imaging.
+/// Monotonically increasing intensity with color variation.
+fn build_cubehelix() -> [[u8; 3]; 256] {
     let mut lut = [[0u8; 3]; 256];
+    let start = 0.5; // starting hue
+    let rotations = -1.5; // rotations in color
+    let saturation = 1.2;
+    let gamma = 1.0;
+
     for (i, entry) in lut.iter_mut().enumerate() {
-        *entry = [i as u8, 0, 0];
+        let t = i as f32 / 255.0;
+        let tg = t.powf(gamma);
+        let angle = 2.0 * std::f32::consts::PI * (start / 3.0 + 1.0 + rotations * t);
+        let amp = saturation * tg * (1.0 - tg) / 2.0;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+
+        let r = (tg + amp * (-0.14861 * cos_a + 1.78277 * sin_a)).clamp(0.0, 1.0);
+        let g = (tg + amp * (-0.29227 * cos_a - 0.90649 * sin_a)).clamp(0.0, 1.0);
+        let b = (tg + amp * (1.97294 * cos_a)).clamp(0.0, 1.0);
+
+        *entry = [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8];
     }
     lut
 }
@@ -103,7 +129,6 @@ fn build_from_anchors(anchors: &[[f32; 4]]) -> [[u8; 3]; 256] {
     let mut lut = [[0u8; 3]; 256];
     for (i, entry) in lut.iter_mut().enumerate() {
         let t = i as f32 / 255.0;
-        // Find the two anchors surrounding t
         let mut lo = 0;
         for (j, anchor) in anchors.iter().enumerate() {
             if anchor[0] <= t {
@@ -153,6 +178,19 @@ const INFERNO_ANCHORS: [[f32; 4]; 9] = [
     [1.000, 0.988, 1.000, 0.644],
 ];
 
+// Plasma anchor points (sampled from matplotlib)
+const PLASMA_ANCHORS: [[f32; 4]; 9] = [
+    [0.000, 0.050, 0.030, 0.528],
+    [0.125, 0.230, 0.015, 0.615],
+    [0.250, 0.397, 0.002, 0.658],
+    [0.375, 0.558, 0.047, 0.641],
+    [0.500, 0.700, 0.161, 0.564],
+    [0.625, 0.822, 0.290, 0.440],
+    [0.750, 0.916, 0.440, 0.290],
+    [0.875, 0.976, 0.615, 0.140],
+    [1.000, 0.940, 0.975, 0.131],
+];
+
 // Magma anchor points
 const MAGMA_ANCHORS: [[f32; 4]; 9] = [
     [0.000, 0.001, 0.000, 0.014],
@@ -164,4 +202,21 @@ const MAGMA_ANCHORS: [[f32; 4]; 9] = [
     [0.750, 0.870, 0.360, 0.400],
     [0.875, 0.950, 0.570, 0.550],
     [1.000, 0.987, 0.991, 0.750],
+];
+
+// Turbo anchor points (Google's improved rainbow)
+const TURBO_ANCHORS: [[f32; 4]; 13] = [
+    [0.000, 0.190, 0.072, 0.232],
+    [0.083, 0.256, 0.260, 0.750],
+    [0.167, 0.163, 0.471, 0.959],
+    [0.250, 0.088, 0.662, 0.866],
+    [0.333, 0.148, 0.810, 0.636],
+    [0.417, 0.340, 0.908, 0.392],
+    [0.500, 0.578, 0.964, 0.196],
+    [0.583, 0.780, 0.950, 0.116],
+    [0.667, 0.930, 0.860, 0.130],
+    [0.750, 0.992, 0.720, 0.130],
+    [0.833, 0.980, 0.538, 0.100],
+    [0.917, 0.889, 0.320, 0.076],
+    [1.000, 0.700, 0.130, 0.060],
 ];

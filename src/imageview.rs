@@ -2,11 +2,25 @@ use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, 
 
 use crate::colormaps::Colormap;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransferFn {
+    Linear,
+    Asinh,
+}
+
+impl TransferFn {
+    pub const ALL: &'static [(TransferFn, &'static str)] = &[
+        (TransferFn::Linear, "Linear"),
+        (TransferFn::Asinh, "Asinh"),
+    ];
+}
+
 /// Display parameters for the image viewer.
 pub struct DisplayParams {
     pub scale_min: f64,
     pub scale_max: f64,
     pub gamma: f32,
+    pub transfer: TransferFn,
     pub show_axes: bool,
     pub show_colorbar: bool,
 }
@@ -17,6 +31,7 @@ impl Default for DisplayParams {
             scale_min: 0.0,
             scale_max: 65535.0,
             gamma: 1.0,
+            transfer: TransferFn::Linear,
             show_axes: true,
             show_colorbar: true,
         }
@@ -94,9 +109,9 @@ impl ImageViewer {
         let available = ui.available_size();
 
         // Reserve space for axes and colorbar
-        let axis_margin_left = if params.show_axes { 55.0 } else { 0.0 };
-        let axis_margin_bottom = if params.show_axes { 35.0 } else { 0.0 };
-        let colorbar_width = if params.show_colorbar { 75.0 } else { 0.0 };
+        let axis_margin_left = if params.show_axes { 60.0 } else { 0.0 };
+        let axis_margin_bottom = if params.show_axes { 40.0 } else { 0.0 };
+        let colorbar_width = if params.show_colorbar { 80.0 } else { 0.0 };
 
         let image_area_w = (available.x - axis_margin_left - colorbar_width).max(1.0);
         let image_area_h = (available.y - axis_margin_bottom).max(1.0);
@@ -117,11 +132,15 @@ impl ImageViewer {
             self.draw_axes(ui, image_rect, width, height);
         }
 
-        // Draw the image
+        // Draw the image with full interaction sense (hover + drag)
         if let Some(tex) = &self.texture {
-            let image_widget = egui::Image::new(tex)
-                .fit_to_exact_size(Vec2::new(display_w, display_h));
-            let resp = ui.put(image_rect, image_widget);
+            let resp = ui.allocate_rect(image_rect, Sense::click_and_drag());
+            ui.painter().image(
+                tex.id(),
+                image_rect,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
 
             // Mouse interaction
             if let Some(pos) = resp.hover_pos() {
@@ -138,6 +157,11 @@ impl ImageViewer {
                         response.hovered_value = Some(mono_data[idx]);
                     }
                 }
+            }
+
+            // Left-click on image clears zoom ROI
+            if resp.clicked_by(egui::PointerButton::Primary) && self.roi_rect.is_some() {
+                self.roi_rect = None;
             }
 
             // ROI selection (right-click drag)
@@ -229,17 +253,30 @@ impl ImageViewer {
 
         let range = params.scale_max - params.scale_min;
         let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
-        let inv_gamma = if params.gamma != 0.0 {
-            1.0 / params.gamma
+        let inv_gamma = if params.gamma != 0.0 { 1.0 / params.gamma } else { 1.0 };
+        let apply_gamma = (params.gamma - 1.0).abs() > 1e-4;
+
+        // Precompute asinh normalization
+        let asinh_alpha = params.gamma as f64; // reuse gamma as alpha parameter
+        let asinh_norm = if matches!(params.transfer, TransferFn::Asinh) {
+            let v = (asinh_alpha).asinh();
+            if v > 0.0 { 1.0 / v } else { 1.0 }
         } else {
             1.0
         };
-        let apply_gamma = (params.gamma - 1.0).abs() > 1e-4;
 
         for (i, &val) in mono_data.iter().take(npix).enumerate() {
             let mut t = ((val - params.scale_min) * inv_range).clamp(0.0, 1.0) as f32;
-            if apply_gamma {
-                t = t.powf(inv_gamma);
+            match params.transfer {
+                TransferFn::Linear => {
+                    if apply_gamma {
+                        t = t.powf(inv_gamma);
+                    }
+                }
+                TransferFn::Asinh => {
+                    t = ((asinh_alpha * t as f64).asinh() * asinh_norm) as f32;
+                    t = t.clamp(0.0, 1.0);
+                }
             }
             let rgb = colormap.lookup(t);
             let off = i * 4;
@@ -252,9 +289,9 @@ impl ImageViewer {
 
     fn draw_axes(&self, ui: &mut egui::Ui, image_rect: Rect, width: u32, height: u32) {
         let painter = ui.painter();
-        let stroke = Stroke::new(1.0, Color32::GRAY);
-        let text_color = Color32::GRAY;
-        let font = egui::FontId::proportional(12.0);
+        let stroke = Stroke::new(1.0, Color32::from_rgb(97, 97, 97));
+        let text_color = Color32::from_rgb(51, 51, 51);
+        let font = egui::FontId::monospace(13.0);
 
         // Y-axis (left side)
         let num_y_ticks = 5;
@@ -332,11 +369,11 @@ impl ImageViewer {
         // Border
         let bar_rect =
             Rect::from_min_size(Pos2::new(bar_x, bar_top), Vec2::new(bar_width, bar_height));
-        painter.rect_stroke(bar_rect, 0.0, Stroke::new(1.0, Color32::GRAY), StrokeKind::Outside);
+        painter.rect_stroke(bar_rect, 0.0, Stroke::new(1.0, Color32::from_rgb(97, 97, 97)), StrokeKind::Outside);
 
         // Scale labels
-        let font = egui::FontId::proportional(12.0);
-        let text_color = Color32::GRAY;
+        let font = egui::FontId::monospace(13.0);
+        let text_color = Color32::from_rgb(51, 51, 51);
         let label_x = bar_x + bar_width + 4.0;
         let num_labels = 5;
         for i in 0..=num_labels {

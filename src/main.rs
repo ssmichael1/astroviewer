@@ -2,6 +2,7 @@ mod colormaps;
 mod fits_source;
 mod histogram;
 mod imageview;
+mod overlays;
 mod sim;
 mod widgets;
 
@@ -23,12 +24,12 @@ use sim::SimCamera;
 // ── Data types ──────────────────────────────────────────────────────────────
 
 struct FrameData {
-    mono: Vec<f64>,
+    mono: Vec<f32>,
     width: u32,
     height: u32,
     hist: histogram::Histogram,
-    mean: f64,
-    stddev: f64,
+    mean: f32,
+    stddev: f32,
     bit_depth: u8,
 }
 
@@ -66,8 +67,27 @@ enum CaptureState {
     Stopped,
 }
 
+#[cfg(feature = "starsolve")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedConfig {
+    solver_db_path: String,
+    fov_estimate_deg: f32,
+    sigma_threshold: f32,
+    min_pixels: usize,
+    max_pixels: usize,
+    max_centroids: Option<usize>,
+    local_bg_block_size: Option<u32>,
+    max_elongation: Option<f32>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BottomTab { Histogram, Controls, Log }
+enum BottomTab {
+    Histogram,
+    Controls,
+    #[cfg(feature = "starsolve")]
+    PlateSolve,
+    Log,
+}
 
 // ── Log ─────────────────────────────────────────────────────────────────────
 
@@ -107,9 +127,34 @@ struct ViewerApp {
     zoom_rgba: Vec<u8>,
 
     cursor_pixel: Option<(u32, u32)>,
-    cursor_value: Option<f64>,
+    cursor_value: Option<f32>,
     hist_drag: Option<HistDrag>,
     hist_log_y: bool,
+
+    // Overlay system
+    overlay_items: Vec<overlays::OverlayItem>,
+    #[cfg(feature = "starsolve")]
+    show_centroids: bool,
+    #[cfg(feature = "starsolve")]
+    show_matched_stars: bool,
+    #[cfg(feature = "starsolve")]
+    centroid_config: tetra3::CentroidExtractionConfig,
+    #[cfg(feature = "starsolve")]
+    centroid_count: usize,
+    #[cfg(feature = "starsolve")]
+    centroid_work_tx: Sender<(Vec<f32>, u32, u32, tetra3::CentroidExtractionConfig)>,
+    #[cfg(feature = "starsolve")]
+    centroid_result_rx: Receiver<Vec<overlays::OverlayItem>>,
+    #[cfg(feature = "starsolve")]
+    solver_db: Option<std::sync::Arc<tetra3::SolverDatabase>>,
+    #[cfg(feature = "starsolve")]
+    solver_db_path: Option<std::path::PathBuf>,
+    #[cfg(feature = "starsolve")]
+    fov_estimate_deg: f32,
+    #[cfg(feature = "starsolve")]
+    solve_rx: Option<Receiver<tetra3::SolveResult>>,
+    #[cfg(feature = "starsolve")]
+    last_solve: Option<tetra3::SolveResult>,
 
     frame_times: Vec<Instant>,
     fps: f64,
@@ -123,6 +168,7 @@ struct ViewerApp {
     sim_height: u32,
     sim_bit_depth: u8,
     sim_fps: u32,
+    fits_fps: u32,
 
     bottom_tab: BottomTab,
 
@@ -268,7 +314,26 @@ impl ViewerApp {
             capture_running = true;
         }
 
-        Self {
+        // Persistent centroid worker thread
+        #[cfg(feature = "starsolve")]
+        let (centroid_work_tx, centroid_result_rx) = {
+            let (work_tx, work_rx) = bounded::<(Vec<f32>, u32, u32, tetra3::CentroidExtractionConfig)>(1);
+            let (result_tx, result_rx) = bounded::<Vec<overlays::OverlayItem>>(1);
+            std::thread::spawn(move || {
+                while let Ok((pixels, w, h, config)) = work_rx.recv() {
+                    let items = match tetra3::extract_centroids_from_raw(&pixels, w, h, &config) {
+                        Ok(result) => result.centroids.iter()
+                            .map(overlays::centroid_to_overlay)
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    if result_tx.send(items).is_err() { break; }
+                }
+            });
+            (work_tx, result_rx)
+        };
+
+        let mut app = Self {
             frame_tx, frame_rx,
             current_frame: None,
             display_params: DisplayParams { scale_min: 0.0, scale_max: 4095.0, ..Default::default() },
@@ -280,10 +345,34 @@ impl ViewerApp {
             cursor_pixel: None, cursor_value: None,
             hist_drag: None,
             hist_log_y: false,
+            overlay_items: Vec::new(),
+            #[cfg(feature = "starsolve")]
+            show_centroids: false,
+            #[cfg(feature = "starsolve")]
+            show_matched_stars: true,
+            #[cfg(feature = "starsolve")]
+            centroid_config: tetra3::CentroidExtractionConfig::default(),
+            #[cfg(feature = "starsolve")]
+            centroid_count: 0,
+            #[cfg(feature = "starsolve")]
+            centroid_work_tx: centroid_work_tx,
+            #[cfg(feature = "starsolve")]
+            centroid_result_rx: centroid_result_rx,
+            #[cfg(feature = "starsolve")]
+            solver_db: None,
+            #[cfg(feature = "starsolve")]
+            solver_db_path: None,
+            #[cfg(feature = "starsolve")]
+            fov_estimate_deg: 15.0,
+            #[cfg(feature = "starsolve")]
+            solve_rx: None,
+            #[cfg(feature = "starsolve")]
+            last_solve: None,
             frame_times: Vec::new(), fps: 0.0,
             camera_source, capture_state, capture_running,
             recording: false,
             sim_width, sim_height, sim_bit_depth, sim_fps,
+            fits_fps: 10,
             bottom_tab: BottomTab::Histogram,
             log, log_rx, log_tx,
             pending_fits_path: None,
@@ -292,6 +381,70 @@ impl ViewerApp {
             discovered_cameras,
             #[cfg(feature = "svbony")]
             camera_error,
+        };
+
+        #[cfg(feature = "starsolve")]
+        app.load_config();
+
+        app
+    }
+
+    #[cfg(feature = "starsolve")]
+    fn config_path() -> std::path::PathBuf {
+        let dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("config.json")
+    }
+
+    #[cfg(feature = "starsolve")]
+    fn save_config(&self) {
+        let cfg = SavedConfig {
+            solver_db_path: self.solver_db_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            fov_estimate_deg: self.fov_estimate_deg,
+            sigma_threshold: self.centroid_config.sigma_threshold,
+            min_pixels: self.centroid_config.min_pixels,
+            max_pixels: self.centroid_config.max_pixels,
+            max_centroids: self.centroid_config.max_centroids,
+            local_bg_block_size: self.centroid_config.local_bg_block_size,
+            max_elongation: self.centroid_config.max_elongation,
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+            let _ = std::fs::write(Self::config_path(), json);
+        }
+    }
+
+    #[cfg(feature = "starsolve")]
+    fn load_config(&mut self) {
+        let config_path = Self::config_path();
+        if let Ok(data) = std::fs::read_to_string(&config_path) {
+            if let Ok(cfg) = serde_json::from_str::<SavedConfig>(&data) {
+                if (1.0..=60.0).contains(&cfg.fov_estimate_deg) {
+                    self.fov_estimate_deg = cfg.fov_estimate_deg;
+                }
+                self.centroid_config.sigma_threshold = cfg.sigma_threshold;
+                self.centroid_config.min_pixels = cfg.min_pixels;
+                self.centroid_config.max_pixels = cfg.max_pixels;
+                self.centroid_config.max_centroids = cfg.max_centroids;
+                self.centroid_config.local_bg_block_size = cfg.local_bg_block_size;
+                self.centroid_config.max_elongation = cfg.max_elongation;
+
+                if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
+                    self.add_log(LogEntry::info(format!("Auto-loading database: {}", cfg.solver_db_path)));
+                    match tetra3::SolverDatabase::load_from_file(&cfg.solver_db_path) {
+                        Ok(db) => {
+                            self.add_log(LogEntry::info(format!(
+                                "Database loaded: {} patterns, {} stars",
+                                db.props.num_patterns, db.star_vectors.len(),
+                            )));
+                            self.solver_db_path = Some(std::path::PathBuf::from(&cfg.solver_db_path));
+                            self.solver_db = Some(std::sync::Arc::new(db));
+                        }
+                        Err(e) => {
+                            self.add_log(LogEntry::error(format!("Auto-load failed: {}", e)));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -363,7 +516,7 @@ impl ViewerApp {
                         let h = source.height;
                         let bd = source.bit_depth;
                         let (stop_tx, stop_rx) = bounded(1);
-                        start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.sim_fps);
+                        start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps);
                         self.capture_state = CaptureState::Fits { _stop_tx: stop_tx };
                         self.capture_running = true;
                         self.add_log(LogEntry::info(format!(
@@ -424,13 +577,14 @@ impl ViewerApp {
                     }
                 }
                 ScaleMode::ZScale => {
-                    let (zmin, zmax) = zscale(&frame.mono);
-                    self.display_params.scale_min = zmin;
-                    self.display_params.scale_max = zmax;
+                    let mono_f64: Vec<f64> = frame.mono.iter().map(|&v| v as f64).collect();
+                    let (zmin, zmax) = zscale(&mono_f64);
+                    self.display_params.scale_min = zmin as f32;
+                    self.display_params.scale_max = zmax as f32;
                 }
                 ScaleMode::Full => {
                     self.display_params.scale_min = 0.0;
-                    self.display_params.scale_max = ((1u64 << frame.bit_depth) - 1) as f64;
+                    self.display_params.scale_max = ((1u64 << frame.bit_depth) - 1) as f32;
                 }
                 ScaleMode::Manual => {}
             }
@@ -441,6 +595,72 @@ impl ViewerApp {
                 let dt = self.frame_times.last().unwrap().duration_since(self.frame_times[0]);
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
+            // Dispatch centroid extraction to background thread (non-blocking)
+            #[cfg(feature = "starsolve")]
+            {
+                // Poll for completed centroid results
+                if let Ok(items) = self.centroid_result_rx.try_recv() {
+                    self.centroid_count = items.len();
+                    if self.show_centroids {
+                        self.overlay_items = items;
+                    } else {
+                        self.overlay_items.clear();
+                    }
+                }
+
+                // Always run centroid extraction (needed for plate solve + count)
+                if self.centroid_work_tx.is_empty() {
+                    let _ = self.centroid_work_tx.try_send((
+                        frame.mono.clone(),
+                        frame.width,
+                        frame.height,
+                        self.centroid_config.clone(),
+                    ));
+                }
+            }
+
+            // Auto plate-solve if database is loaded
+            #[cfg(feature = "starsolve")]
+            self.maybe_auto_solve(&frame);
+
+            // Poll solve result
+            #[cfg(feature = "starsolve")]
+            if let Some(rx) = &self.solve_rx {
+                if let Ok(result) = rx.try_recv() {
+                    // Update FOV estimate from successful solve
+                    if result.status == tetra3::SolveStatus::MatchFound {
+                        if let Some(fov) = result.fov_rad {
+                            self.fov_estimate_deg = fov.to_degrees();
+                        }
+                    }
+                    self.last_solve = Some(result);
+                    self.solve_rx = None;
+                }
+            }
+
+            // Append matched star markers from last solve (every frame)
+            #[cfg(feature = "starsolve")]
+            if self.show_matched_stars {
+                if let Some(ref result) = self.last_solve {
+                    if result.status == tetra3::SolveStatus::MatchFound {
+                        // Use matched centroid indices to mark which centroids were matched
+                        let n_centroids = self.overlay_items.len();
+                        for &cent_idx in &result.matched_centroid_indices {
+                            if cent_idx < n_centroids {
+                                if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
+                                    self.overlay_items.push(overlays::OverlayItem::Marker {
+                                        x: *x,
+                                        y: *y,
+                                        kind: overlays::MarkerKind::Crosshair,
+                                        label: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             self.current_frame = Some(frame);
         }
     }
@@ -475,6 +695,7 @@ impl ViewerApp {
             if let CameraSource::FitsFile(path) = &self.camera_source {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 ui.radio_value(&mut new_source, self.camera_source.clone(), format!("FITS: {}", name));
+                widgets::styled_slider_u32(ui, &mut self.fits_fps, 1..=60, "Playback FPS");
             }
             let dialog_pending = self.pending_fits_path.is_some();
             if !dialog_pending && widgets::styled_button(ui, "Open FITS...") {
@@ -580,15 +801,20 @@ impl ViewerApp {
             });
             if self.scale_mode == ScaleMode::Manual {
                 ui.add_space(4.0);
-                let max_range = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f64).unwrap_or(65535.0);
-                widgets::styled_slider_f64(ui, &mut self.display_params.scale_min, 0.0..=max_range, "Min");
-                widgets::styled_slider_f64(ui, &mut self.display_params.scale_max, 0.0..=max_range, "Max");
+                let max_range = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f32).unwrap_or(65535.0);
+                widgets::styled_slider(ui, &mut self.display_params.scale_min, 0.0..=max_range, "Min");
+                widgets::styled_slider(ui, &mut self.display_params.scale_max, 0.0..=max_range, "Max");
             } else {
                 ui.label(format!("Range: {:.0} – {:.0}", self.display_params.scale_min, self.display_params.scale_max));
             }
             ui.add_space(6.0);
             widgets::styled_checkbox(ui, &mut self.display_params.show_axes, "Show Axes");
             widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar");
+            #[cfg(feature = "starsolve")]
+            {
+                widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids");
+                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars");
+            }
         });
 
         ui.add_space(4.0);
@@ -631,11 +857,13 @@ impl ViewerApp {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
 
-                let tabs = [
+                let mut tabs: Vec<(BottomTab, &str)> = vec![
                     (BottomTab::Histogram, "Histogram"),
                     (BottomTab::Controls, "Controls"),
-                    (BottomTab::Log, "Log"),
                 ];
+                #[cfg(feature = "starsolve")]
+                tabs.push((BottomTab::PlateSolve, "Plate Solve"));
+                tabs.push((BottomTab::Log, "Log"));
 
                 for (tab, label) in tabs {
                     let is_active = self.bottom_tab == tab;
@@ -701,8 +929,8 @@ impl ViewerApp {
                 } else {
                     cy as f64
                 };
-                line_vec.push([cx - bin_width * 0.5, y]);
-                line_vec.push([cx + bin_width * 0.5, y]);
+                line_vec.push([(cx - bin_width * 0.5) as f64, y]);
+                line_vec.push([(cx + bin_width * 0.5) as f64, y]);
             }
 
             // Log Y toggle — placed in a horizontal bar above the plot
@@ -717,7 +945,7 @@ impl ViewerApp {
             // Fix x-axis range to the bit depth so it doesn't bounce
             let x_max = self.current_frame.as_ref()
                 .map(|f| ((1u64 << f.bit_depth) - 1) as f64)
-                .unwrap_or(65535.0);
+                .unwrap_or(65535.0);  // f64 for egui_plot
 
             let plot_resp = egui_plot::Plot::new("histogram")
                 .height(plot_height)
@@ -740,8 +968,8 @@ impl ViewerApp {
                             .fill_alpha(0.35),
                     );
                     if self.scale_mode == ScaleMode::Manual {
-                        let smin = self.display_params.scale_min;
-                        let smax = self.display_params.scale_max;
+                        let smin = self.display_params.scale_min as f64;
+                        let smax = self.display_params.scale_max as f64;
                         let grab_radius_data = {
                             let bounds = plot_ui.plot_bounds();
                             (bounds.max()[0] - bounds.min()[0]) * 0.015
@@ -786,8 +1014,8 @@ impl ViewerApp {
                         (bounds.max()[0] - bounds.min()[0]) * 0.02
                     };
                     if plot_resp.response.drag_started() {
-                        let dist_min = (plot_x - self.display_params.scale_min).abs();
-                        let dist_max = (plot_x - self.display_params.scale_max).abs();
+                        let dist_min = (plot_x - self.display_params.scale_min as f64).abs();
+                        let dist_max = (plot_x - self.display_params.scale_max as f64).abs();
                         if dist_min < grab_radius_data && dist_min <= dist_max { self.hist_drag = Some(HistDrag::Min); }
                         else if dist_max < grab_radius_data { self.hist_drag = Some(HistDrag::Max); }
                     }
@@ -795,11 +1023,11 @@ impl ViewerApp {
                     match self.hist_drag {
                         Some(HistDrag::Min) => {
                             self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_min = plot_x.max(0.0).min(self.display_params.scale_max - 1.0);
+                            self.display_params.scale_min = plot_x.max(0.0).min(self.display_params.scale_max as f64 - 1.0) as f32;
                         }
                         Some(HistDrag::Max) => {
                             self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_max = plot_x.max(self.display_params.scale_min + 1.0).min(bit_max);
+                            self.display_params.scale_max = plot_x.max(self.display_params.scale_min as f64 + 1.0).min(bit_max) as f32;
                         }
                         None => {}
                     }
@@ -840,16 +1068,14 @@ impl ViewerApp {
                             ui.end_row();
                         } else {
                             ctrl_label(ui, label_w, &caps.name);
-                            let mut v = cv.1 as f64;
+                            let mut v = cv.1 as f32;
                             let is_exposure = caps.control_type == svbony::ControlType::Exposure;
-                            let changed = if is_exposure {
-                                slider_log(ui, &mut v, caps.min_value.max(1) as f64, caps.max_value as f64)
+                            if is_exposure {
+                                widgets::styled_slider_log_bare(ui, &mut v, caps.min_value.max(1) as f32..=caps.max_value as f32);
                             } else {
-                                slider_i64(ui, &mut v, caps.min_value as f64, caps.max_value as f64)
-                            };
-                            if changed {
-                                cv.1 = v as i64;
+                                widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=caps.max_value as f32);
                             }
+                            cv.1 = v.round() as i64;
                             ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1)).monospace().size(12.0));
                             ui.end_row();
 
@@ -872,6 +1098,201 @@ impl ViewerApp {
                 ui.add_space(20.0);
                 ui.label(egui::RichText::new("No camera connected").color(widgets::TEXT_SECONDARY));
             });
+        }
+    }
+
+    #[cfg(feature = "starsolve")]
+    fn plate_solve_content(&mut self, ui: &mut egui::Ui) {
+        // ── Top bar: database + FOV + status + reset ────────────────────────
+        ui.horizontal(|ui| {
+            // Database
+            if self.solver_db.is_none() {
+                if widgets::styled_button(ui, "Load Database...") {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Database", &["rkyv"])
+                        .pick_file()
+                    {
+                        self.add_log(LogEntry::info(format!("Loading database: {}...", path.display())));
+                        match tetra3::SolverDatabase::load_from_file(path.to_str().unwrap_or("")) {
+                            Ok(db) => {
+                                self.add_log(LogEntry::info(format!(
+                                    "Database: {} patterns, {} stars, {:.1}°–{:.1}°",
+                                    db.props.num_patterns, db.star_vectors.len(),
+                                    db.props.min_fov_rad.to_degrees(), db.props.max_fov_rad.to_degrees(),
+                                )));
+                                self.solver_db = Some(std::sync::Arc::new(db));
+                                self.solver_db_path = Some(path.clone());
+                            }
+                            Err(e) => self.add_log(LogEntry::error(format!("Load failed: {}", e))),
+                        }
+                    }
+                }
+            } else {
+                ui.label(egui::RichText::new("DB").color(egui::Color32::from_rgb(34, 197, 94)));
+                if widgets::styled_button(ui, "Unload") {
+                    self.solver_db = None;
+                    self.last_solve = None;
+                }
+            }
+
+            ui.separator();
+
+            // FOV
+            ui.label("FOV:");
+            ui.add(egui::DragValue::new(&mut self.fov_estimate_deg)
+                .range(1.0..=60.0).speed(0.5).suffix("°").fixed_decimals(1));
+
+            ui.separator();
+
+            // Solve status
+            if self.solver_db.is_some() {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(75.0, 18.0), egui::Sense::hover());
+                let (text, color) = if self.solve_rx.is_some() {
+                    ("Solving...", egui::Color32::from_rgb(217, 119, 6))
+                } else if self.last_solve.as_ref().map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound) {
+                    ("Locked", egui::Color32::from_rgb(34, 197, 94))
+                } else {
+                    ("Searching...", widgets::TEXT_SECONDARY)
+                };
+                ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(13.0), color);
+            }
+
+            ui.separator();
+
+            // Centroid count (always shown, even when overlay is off)
+            if self.centroid_count > 0 {
+                ui.label(egui::RichText::new(format!("{} stars", self.centroid_count)).color(widgets::TEXT_SECONDARY));
+            }
+
+            // Reset defaults (far right)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::styled_button(ui, "Reset") {
+                    self.centroid_config = tetra3::CentroidExtractionConfig::default();
+                }
+            });
+        });
+
+        // ── Centroid parameters (compact horizontal grid) ───────────────────
+        ui.add_space(2.0);
+        // Centroid params — equal-width columns using allocate_ui
+        let total_w = ui.available_width();
+        let col_w = (total_w / 3.0 - 4.0).max(100.0);
+        let label_w = 85.0;
+        let slider_w = (col_w - label_w - 8.0).max(40.0);
+
+        // Helper: fixed-width label
+        let fixed_label = |ui: &mut egui::Ui, text: String| {
+            ui.allocate_ui(egui::vec2(label_w, 20.0), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(text).size(12.0));
+                });
+            });
+        };
+
+        // Row 1
+        ui.horizontal(|ui| {
+            fixed_label(ui, format!("SNR {:.1}", self.centroid_config.sigma_threshold));
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0);
+            });
+
+            let mut v = self.centroid_config.min_pixels as f32;
+            fixed_label(ui, format!("Min px {}", self.centroid_config.min_pixels));
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0);
+            });
+            self.centroid_config.min_pixels = v.round() as usize;
+
+            let mut v = self.centroid_config.max_pixels as f32;
+            fixed_label(ui, format!("Max px {}", self.centroid_config.max_pixels));
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0);
+            });
+            self.centroid_config.max_pixels = v as usize;
+        });
+
+        // Row 2
+        ui.horizontal(|ui| {
+            let mut v = self.centroid_config.max_centroids.unwrap_or(0) as f32;
+            let lbl = if self.centroid_config.max_centroids.is_none() { "Stars all".into() } else { format!("Stars {}", v.round() as usize) };
+            fixed_label(ui, lbl);
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0);
+            });
+            self.centroid_config.max_centroids = if (v as usize) == 0 { None } else { Some(v.round() as usize) };
+
+            let mut v = self.centroid_config.local_bg_block_size.unwrap_or(0) as f32;
+            let lbl = if self.centroid_config.local_bg_block_size.is_none() { "BG global".into() } else { format!("BG {}", v.round() as u32) };
+            fixed_label(ui, lbl);
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0);
+            });
+            self.centroid_config.local_bg_block_size = if (v as u32) == 0 { None } else { Some(v.round() as u32) };
+
+            let mut v = self.centroid_config.max_elongation.unwrap_or(0.0);
+            let lbl = if self.centroid_config.max_elongation.is_none() { "Elong. off".into() } else { format!("Elong. {:.1}", v) };
+            fixed_label(ui, lbl);
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0);
+            });
+            self.centroid_config.max_elongation = if v < 0.5 { None } else { Some(v) };
+        });
+
+        // Save config if any slider was interacted with this frame
+        // ── Solve results ───────────────────────────────────────────────────
+        if let Some(ref result) = self.last_solve {
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            if result.status == tetra3::SolveStatus::MatchFound {
+                ui.horizontal_wrapped(|ui| {
+                    let mono = egui::FontId::monospace(12.0);
+                    let dim = widgets::TEXT_SECONDARY;
+                    let sp = 10.0;
+                    if let Some(crval) = result.crval_rad {
+                        ui.label(egui::RichText::new("RA").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.4}°", crval[0].to_degrees())).font(mono.clone()));
+                        ui.add_space(sp);
+                        ui.label(egui::RichText::new("Dec").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.4}°", crval[1].to_degrees())).font(mono.clone()));
+                        ui.add_space(sp);
+                    }
+                    if let Some(fov) = result.fov_rad {
+                        ui.label(egui::RichText::new("FOV").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.2}°", fov.to_degrees())).font(mono.clone()));
+                        ui.add_space(sp);
+                        let ifov = fov.to_degrees() as f64 / result.image_width.max(1) as f64 * 3600.0;
+                        ui.label(egui::RichText::new("IFOV").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.2}\"/px", ifov)).font(mono.clone()));
+                        ui.add_space(sp);
+                    }
+                    if let Some(theta) = result.theta_rad {
+                        ui.label(egui::RichText::new("Rot").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.2}°", theta.to_degrees())).font(mono.clone()));
+                        ui.add_space(sp);
+                    }
+                    if let Some(n) = result.num_matches {
+                        ui.label(egui::RichText::new("Stars").color(dim));
+                        ui.label(egui::RichText::new(format!("{}", n)).font(mono.clone()));
+                        ui.add_space(sp);
+                    }
+                    if let Some(rmse) = result.rmse_rad {
+                        ui.label(egui::RichText::new("RMSE").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.1}\"", rmse.to_degrees() * 3600.0)).font(mono.clone()));
+                        ui.add_space(sp);
+                    }
+                    ui.label(egui::RichText::new("Solve").color(dim));
+                    ui.label(egui::RichText::new(format!("{:.0}ms", result.solve_time_ms)).font(mono));
+                });
+            } else {
+                let msg = match result.status {
+                    tetra3::SolveStatus::NoMatch => "No match",
+                    tetra3::SolveStatus::Timeout => "Timed out",
+                    tetra3::SolveStatus::TooFew => "Too few stars",
+                    _ => "",
+                };
+                ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+            }
         }
     }
 
@@ -916,82 +1337,6 @@ fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {
     }
 }
 
-#[cfg(feature = "svbony")]
-fn slider_i64(ui: &mut egui::Ui, value: &mut f64, min: f64, max: f64) -> bool {
-    let old = *value;
-    let handle_r = 6.0;
-    let desired_width = ui.available_width().max(500.0);
-    let height = 20.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(desired_width, height), egui::Sense::click_and_drag());
-    let track_left = rect.min.x + handle_r;
-    let track_right = rect.max.x - handle_r;
-    let track_width = track_right - track_left;
-    if response.dragged() || response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let t = ((pos.x - track_left) / track_width).clamp(0.0, 1.0) as f64;
-            *value = (min + t * (max - min)).round();
-        }
-    }
-    let t = ((*value - min) / (max - min)).clamp(0.0, 1.0) as f32;
-    let painter = ui.painter_at(rect);
-    let track_y = rect.center().y;
-    let track_rect = egui::Rect::from_min_max(egui::pos2(track_left, track_y - 2.0), egui::pos2(track_right, track_y + 2.0));
-    painter.rect_filled(track_rect, egui::CornerRadius::same(2), egui::Color32::from_rgb(215, 216, 222));
-    let filled = egui::Rect::from_min_max(track_rect.min, egui::pos2(track_left + t * track_width, track_rect.max.y));
-    if filled.width() > 1.0 { painter.rect_filled(filled, egui::CornerRadius::same(2), widgets::ACCENT); }
-    let hx = track_left + t * track_width;
-    let hc = egui::pos2(hx, track_y);
-    let hovered = response.hovered() || response.dragged();
-    let hbg = if hovered { egui::Color32::from_rgb(252, 252, 254) } else { egui::Color32::WHITE };
-    painter.circle_filled(hc, handle_r, hbg);
-    let hborder = if response.dragged() { widgets::ACCENT_DARK } else if hovered { widgets::ACCENT } else { widgets::BORDER };
-    painter.circle_stroke(hc, handle_r, egui::Stroke::new(1.5, hborder));
-    *value != old
-}
-
-/// Logarithmic slider — equal slider distance per order of magnitude.
-/// Ideal for exposure (1µs to 2000s spans ~10 decades).
-#[cfg(feature = "svbony")]
-fn slider_log(ui: &mut egui::Ui, value: &mut f64, min: f64, max: f64) -> bool {
-    let old = *value;
-    let handle_r = 6.0;
-    let desired_width = ui.available_width().max(500.0);
-    let height = 20.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(desired_width, height), egui::Sense::click_and_drag());
-    let track_left = rect.min.x + handle_r;
-    let track_right = rect.max.x - handle_r;
-    let track_width = track_right - track_left;
-
-    let log_min = min.max(1.0).ln();
-    let log_max = max.ln();
-
-    if response.dragged() || response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let t = ((pos.x - track_left) / track_width).clamp(0.0, 1.0) as f64;
-            *value = (log_min + t * (log_max - log_min)).exp().round();
-            *value = value.clamp(min, max);
-        }
-    }
-
-    let t = ((*value).max(1.0).ln() - log_min) / (log_max - log_min);
-    let t = t.clamp(0.0, 1.0) as f32;
-
-    let painter = ui.painter_at(rect);
-    let track_y = rect.center().y;
-    let track_rect = egui::Rect::from_min_max(egui::pos2(track_left, track_y - 2.0), egui::pos2(track_right, track_y + 2.0));
-    painter.rect_filled(track_rect, egui::CornerRadius::same(2), egui::Color32::from_rgb(215, 216, 222));
-    let filled = egui::Rect::from_min_max(track_rect.min, egui::pos2(track_left + t * track_width, track_rect.max.y));
-    if filled.width() > 1.0 { painter.rect_filled(filled, egui::CornerRadius::same(2), widgets::ACCENT); }
-    let hx = track_left + t * track_width;
-    let hc = egui::pos2(hx, track_y);
-    let hovered = response.hovered() || response.dragged();
-    let hbg = if hovered { egui::Color32::from_rgb(252, 252, 254) } else { egui::Color32::WHITE };
-    painter.circle_filled(hc, handle_r, hbg);
-    let hborder = if response.dragged() { widgets::ACCENT_DARK } else if hovered { widgets::ACCENT } else { widgets::BORDER };
-    painter.circle_stroke(hc, handle_r, egui::Stroke::new(1.5, hborder));
-    *value != old
-}
-
 fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
     let border = egui::Color32::from_rgb(229, 231, 235);
     egui::Frame::new()
@@ -1023,7 +1368,7 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
         });
 }
 
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "starsolve"))]
 fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.set_width(width);
@@ -1040,6 +1385,11 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str) {
 // ── Main update loop ────────────────────────────────────────────────────────
 
 impl eframe::App for ViewerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(feature = "starsolve")]
+        self.save_config();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_frame();
         self.poll_log();
@@ -1148,6 +1498,8 @@ impl eframe::App for ViewerApp {
                                 #[cfg(not(feature = "svbony"))]
                                 ui.label("Camera support not compiled in");
                             }
+                            #[cfg(feature = "starsolve")]
+                            BottomTab::PlateSolve => self.plate_solve_content(ui),
                             BottomTab::Log => self.log_content(ui),
                         }
                     });
@@ -1156,7 +1508,7 @@ impl eframe::App for ViewerApp {
         // Central panel
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(frame) = &self.current_frame {
-                let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap);
+                let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;
                 self.cursor_value = resp.hovered_value;
             } else {
@@ -1170,6 +1522,52 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
+    /// Auto-solve: dispatch to background thread if DB loaded and not already solving.
+    /// Called from poll_frame on each new frame.
+    #[cfg(feature = "starsolve")]
+    fn maybe_auto_solve(&mut self, frame: &FrameData) {
+        // Only if DB loaded and not already solving
+        if self.solver_db.is_none() || self.solve_rx.is_some() {
+            return;
+        }
+
+        let db = self.solver_db.as_ref().unwrap().clone();
+        let pixels: Vec<f32> = frame.mono.clone();
+        let w = frame.width;
+        let h = frame.height;
+        let config = self.centroid_config.clone();
+
+        // Use previous solve's FOV if available, otherwise user estimate
+        let fov_rad = self.last_solve.as_ref()
+            .and_then(|s| s.fov_rad)
+            .unwrap_or_else(|| (self.fov_estimate_deg as f32).to_radians());
+
+        // Wide FOV tolerance for initial solve, tight once we have a lock
+        let fov_max_error = if self.last_solve.as_ref().map_or(true, |s| s.status != tetra3::SolveStatus::MatchFound) {
+            Some((10.0_f32).to_radians()) // wide search initially
+        } else {
+            Some((2.0_f32).to_radians()) // tight once locked
+        };
+
+        let (tx, rx) = bounded(1);
+        self.solve_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let centroids = match tetra3::extract_centroids_from_raw(&pixels, w, h, &config) {
+                Ok(r) => r.centroids,
+                Err(_) => return,
+            };
+
+            let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
+            solve_config.fov_max_error_rad = fov_max_error;
+            solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
+            let result = db.solve_from_centroids(&centroids, &solve_config);
+            let _ = tx.send(result);
+        });
+    }
+
+
+
     fn show_zoom_window(&mut self, ctx: &egui::Context) {
         let roi = match self.image_viewer.roi_rect {
             Some(r) => r,
@@ -1193,8 +1591,8 @@ impl ViewerApp {
         let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
         let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
         let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
-        let asinh_alpha = self.display_params.gamma as f64;
-        let asinh_norm = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+        let asinh_alpha = self.display_params.gamma;
+        let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
             let v = asinh_alpha.asinh();
             if v > 0.0 { 1.0 / v } else { 1.0 }
         } else { 1.0 };
@@ -1203,10 +1601,10 @@ impl ViewerApp {
             for rx in 0..roi_w {
                 let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
                 let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
-                let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0) as f32;
+                let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
                 match self.display_params.transfer {
                     imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
-                    imageview::TransferFn::Asinh => { t = ((asinh_alpha * t as f64).asinh() * asinh_norm).clamp(0.0, 1.0) as f32; }
+                    imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
                 }
                 let rgb = self.colormap.lookup(t);
                 let off = (ry * roi_w + rx) * 4;
@@ -1244,6 +1642,12 @@ impl ViewerApp {
 
         let title = format!("Zoom  ({},{})–({},{})  {}×{}", x0, y0, x1, y1, roi_w, roi_h);
         let mut open = true;
+        let overlay_items = self.overlay_items.clone();
+        let img_w = frame.width as f32;
+        let img_h = frame.height as f32;
+        let img_cx = img_w / 2.0;
+        let img_cy = img_h / 2.0;
+
         egui::Window::new(title)
             .open(&mut open)
             .default_size([400.0, 400.0])
@@ -1260,7 +1664,43 @@ impl ViewerApp {
                     let image = egui::Image::new(tex)
                         .fit_to_exact_size(egui::vec2(w, h))
                         .texture_options(egui::TextureOptions::NEAREST);
-                    ui.add(image);
+                    let resp = ui.add(image);
+                    let img_rect = resp.rect;
+
+                    // Draw overlays in zoom window coordinate space
+                    let scale_x = w / roi_w as f32;
+                    let scale_y = h / roi_h as f32;
+
+                    let to_screen = |ox: f32, oy: f32| -> egui::Pos2 {
+                        // ox, oy are image-center origin
+                        let px = ox + img_cx - x0 as f32;
+                        let py = oy + img_cy - y0 as f32;
+                        egui::Pos2::new(
+                            img_rect.min.x + px * scale_x,
+                            img_rect.min.y + py * scale_y,
+                        )
+                    };
+
+                    let max_mass = overlay_items.iter().filter_map(|item| {
+                        if let overlays::OverlayItem::Centroid { mass, .. } = item { Some(*mass) } else { None }
+                    }).fold(0.0_f32, f32::max);
+
+                    overlays::draw_overlays(ui.painter(), &overlay_items, to_screen, scale_x, max_mass, 2.0);
+
+                    // Pixel info on hover
+                    if let Some(pos) = resp.hover_pos() {
+                        let rx = (pos.x - img_rect.min.x) / scale_x;
+                        let ry = (pos.y - img_rect.min.y) / scale_y;
+                        let px = (x0 as f32 + rx) as u32;
+                        let py = (y0 as f32 + ry) as u32;
+                        if px < img_w as u32 && py < img_h as u32 {
+                            let idx = (py * img_w as u32 + px) as usize;
+                            if let Some(&val) = frame.mono.get(idx) {
+                                self.cursor_pixel = Some((px, py));
+                                self.cursor_value = Some(val);
+                            }
+                        }
+                    }
                 }
             });
 
@@ -1314,19 +1754,19 @@ fn start_sim_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, width: u32, h
 fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
     let width = img.width();
     let height = img.height();
-    let mono: Vec<f64> = match &img {
-        DynamicImage::ImageLuma8(g) => g.as_raw().iter().map(|&v| v as f64).collect(),
-        DynamicImage::ImageLuma16(g) => g.as_raw().iter().map(|&v| v as f64).collect(),
-        DynamicImage::ImageRgb8(rgb) => rgb.pixels().map(|p| 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64).collect(),
-        _ => { let gray = img.to_luma8(); gray.as_raw().iter().map(|&v| v as f64).collect() }
+    let mono: Vec<f32> = match &img {
+        DynamicImage::ImageLuma8(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
+        DynamicImage::ImageLuma16(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
+        DynamicImage::ImageRgb8(rgb) => rgb.pixels().map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect(),
+        _ => { let gray = img.to_luma8(); gray.as_raw().iter().map(|&v| v as f32).collect() }
     };
     let hist = compute_histogram(&mono, 256);
     let (mean, stddev) = compute_stats(&mono);
     FrameData { mono, width, height, hist, mean, stddev, bit_depth }
 }
 
-fn snap_floor(v: f64, step: f64) -> f64 { (v / step).floor() * step }
-fn snap_ceil(v: f64, step: f64) -> f64 { (v / step).ceil() * step }
+fn snap_floor(v: f32, step: f32) -> f32 { (v / step).floor() * step }
+fn snap_ceil(v: f32, step: f32) -> f32 { (v / step).ceil() * step }
 
 /// ZScale algorithm (simplified IRAF/DS9 style).
 /// Samples pixels, sorts them, fits a line to the central portion,

@@ -2,13 +2,11 @@ mod button;
 mod checkbox;
 mod combo_box;
 mod slider;
-mod toggle_button;
 
 pub use button::styled_button;
 pub use checkbox::styled_checkbox;
 pub use combo_box::combo_box;
-pub use slider::{styled_slider, styled_slider_f64, styled_slider_u32};
-pub use toggle_button::toggle_button;
+pub use slider::{styled_slider, styled_slider_bare, styled_slider_log, styled_slider_log_bare, styled_slider_u32};
 
 use eframe::egui;
 

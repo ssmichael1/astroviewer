@@ -9,7 +9,9 @@ pub enum CameraCmd {
 
 /// Information about a discovered camera, plus its available controls.
 pub struct CameraHandle {
+    #[allow(dead_code)]
     pub info: CameraInfo,
+    #[allow(dead_code)]
     pub property: svbony::CameraProperty,
     pub controls: Vec<ControlCaps>,
     pub cmd_tx: Sender<CameraCmd>,

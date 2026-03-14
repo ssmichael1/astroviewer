@@ -21,17 +21,12 @@ impl SimCamera {
         }
     }
 
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    pub fn bit_depth(&self) -> u8 {
-        self.bit_depth
-    }
+    #[allow(dead_code)]
+    pub fn width(&self) -> u32 { self.width }
+    #[allow(dead_code)]
+    pub fn height(&self) -> u32 { self.height }
+    #[allow(dead_code)]
+    pub fn bit_depth(&self) -> u8 { self.bit_depth }
 
     /// Generate the next frame as a DynamicImage.
     pub fn next_frame(&mut self) -> DynamicImage {

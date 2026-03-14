@@ -1,6 +1,7 @@
 use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
 
 use crate::colormaps::Colormap;
+use crate::overlays::{self, OverlayItem};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TransferFn {
@@ -17,8 +18,8 @@ impl TransferFn {
 
 /// Display parameters for the image viewer.
 pub struct DisplayParams {
-    pub scale_min: f64,
-    pub scale_max: f64,
+    pub scale_min: f32,
+    pub scale_max: f32,
     pub gamma: f32,
     pub transfer: TransferFn,
     pub show_axes: bool,
@@ -41,7 +42,7 @@ impl Default for DisplayParams {
 /// Result of rendering the image widget — reports mouse interaction.
 pub struct ImageViewResponse {
     pub hovered_pixel: Option<(u32, u32)>,
-    pub hovered_value: Option<f64>,
+    pub hovered_value: Option<f32>,
 }
 
 /// Holds the texture and cached rendering state.
@@ -71,11 +72,12 @@ impl ImageViewer {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        mono_data: &[f64],
+        mono_data: &[f32],
         width: u32,
         height: u32,
         params: &DisplayParams,
         colormap: &Colormap,
+        overlay_items: &[OverlayItem],
     ) -> ImageViewResponse {
         let mut response = ImageViewResponse {
             hovered_pixel: None,
@@ -217,6 +219,30 @@ impl ImageViewer {
             }
         }
 
+        // Draw overlays
+        if !overlay_items.is_empty() {
+            let img_cx = width as f32 / 2.0;
+            let img_cy = height as f32 / 2.0;
+            let scale_x = display_w / width as f32;
+            let scale_y = display_h / height as f32;
+
+            let to_screen = |ox: f32, oy: f32| -> Pos2 {
+                // Convert from image-center origin to screen coords
+                let px = ox + img_cx;
+                let py = oy + img_cy;
+                Pos2::new(
+                    image_rect.min.x + px * scale_x,
+                    image_rect.min.y + py * scale_y,
+                )
+            };
+
+            let max_mass = overlay_items.iter().filter_map(|item| {
+                if let OverlayItem::Centroid { mass, .. } = item { Some(*mass) } else { None }
+            }).fold(0.0_f32, f32::max);
+
+            overlays::draw_overlays(ui.painter(), overlay_items, to_screen, scale_x, max_mass, 1.0);
+        }
+
         // Draw colorbar
         if params.show_colorbar {
             self.draw_colorbar(ui, image_rect, params, colormap);
@@ -237,7 +263,7 @@ impl ImageViewer {
 
     fn update_rgba(
         &mut self,
-        mono_data: &[f64],
+        mono_data: &[f32],
         width: u32,
         height: u32,
         params: &DisplayParams,
@@ -256,26 +282,22 @@ impl ImageViewer {
         let inv_gamma = if params.gamma != 0.0 { 1.0 / params.gamma } else { 1.0 };
         let apply_gamma = (params.gamma - 1.0).abs() > 1e-4;
 
-        // Precompute asinh normalization
-        let asinh_alpha = params.gamma as f64; // reuse gamma as alpha parameter
+        let asinh_alpha = params.gamma;
         let asinh_norm = if matches!(params.transfer, TransferFn::Asinh) {
-            let v = (asinh_alpha).asinh();
+            let v = asinh_alpha.asinh();
             if v > 0.0 { 1.0 / v } else { 1.0 }
         } else {
             1.0
         };
 
         for (i, &val) in mono_data.iter().take(npix).enumerate() {
-            let mut t = ((val - params.scale_min) * inv_range).clamp(0.0, 1.0) as f32;
+            let mut t = ((val - params.scale_min) * inv_range).clamp(0.0, 1.0);
             match params.transfer {
                 TransferFn::Linear => {
-                    if apply_gamma {
-                        t = t.powf(inv_gamma);
-                    }
+                    if apply_gamma { t = t.powf(inv_gamma); }
                 }
                 TransferFn::Asinh => {
-                    t = ((asinh_alpha * t as f64).asinh() * asinh_norm) as f32;
-                    t = t.clamp(0.0, 1.0);
+                    t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0);
                 }
             }
             let rgb = colormap.lookup(t);
@@ -378,7 +400,7 @@ impl ImageViewer {
         let num_labels = 5;
         for i in 0..=num_labels {
             let frac = i as f32 / num_labels as f32;
-            let val = params.scale_max - frac as f64 * (params.scale_max - params.scale_min);
+            let val = params.scale_max - frac * (params.scale_max - params.scale_min);
             let y = bar_top + frac * bar_height;
             painter.text(
                 Pos2::new(label_x, y),

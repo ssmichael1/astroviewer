@@ -13,13 +13,18 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 crossbeam-channel = "0.5"
 chrono = "0.4"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 fits4 = { path = "../fits4" }
 rfd = "0.15"
 svbony = { version = "0.1", features = ["image"], optional = true }
+tetra3 = { path = "../tetra3rs", features = ["image"], optional = true }
 
 [features]
 default = []
 svbony = ["dep:svbony"]
+starsolve = ["dep:tetra3"]
 
 [profile.test]
 opt-level = 3

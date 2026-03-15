@@ -1,4 +1,5 @@
 use eframe::egui;
+use super::Palette;
 
 /// A modern styled combo box / dropdown.
 pub fn combo_box<T: PartialEq + Copy>(
@@ -7,6 +8,7 @@ pub fn combo_box<T: PartialEq + Copy>(
     label: &str,
     current: &mut T,
     options: &[(T, &str)],
+    pal: &Palette,
 ) -> bool {
     let mut changed = false;
 
@@ -19,10 +21,10 @@ pub fn combo_box<T: PartialEq + Copy>(
     if !label.is_empty() {
         ui.horizontal(|ui| {
             ui.label(label);
-            changed = combo_box_inner(ui, id, current, current_label, options);
+            changed = combo_box_inner(ui, id, current, current_label, options, pal);
         });
     } else {
-        changed = combo_box_inner(ui, id, current, current_label, options);
+        changed = combo_box_inner(ui, id, current, current_label, options, pal);
     }
 
     changed
@@ -34,6 +36,7 @@ fn combo_box_inner<T: PartialEq + Copy>(
     current: &mut T,
     current_label: &str,
     options: &[(T, &str)],
+    pal: &Palette,
 ) -> bool {
     let mut changed = false;
     let popup_id = ui.make_persistent_id(id);
@@ -42,22 +45,14 @@ fn combo_box_inner<T: PartialEq + Copy>(
     let desired_width = ui.available_width().min(160.0).max(80.0);
     let height = 28.0;
 
-    let border_color = if is_open {
-        egui::Color32::from_rgb(0, 122, 204)
-    } else {
-        egui::Color32::from_rgb(206, 206, 206)
-    };
+    let border_color = if is_open { pal.combo_border_open } else { pal.combo_border };
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(desired_width, height),
         egui::Sense::click(),
     );
 
-    let bg = if response.hovered() || is_open {
-        egui::Color32::from_rgb(248, 248, 248)
-    } else {
-        egui::Color32::WHITE
-    };
+    let bg = if response.hovered() || is_open { pal.combo_hover_bg } else { pal.combo_bg };
 
     let painter = ui.painter();
     painter.rect(
@@ -74,27 +69,26 @@ fn combo_box_inner<T: PartialEq + Copy>(
         egui::Align2::LEFT_CENTER,
         current_label,
         egui::FontId::proportional(13.0),
-        egui::Color32::from_rgb(51, 51, 51),
+        pal.combo_text,
     );
 
     // Chevron
     let arrow_x = rect.max.x - 14.0;
     let arrow_y = rect.center().y;
     let arrow_size = 4.0;
-    let arrow_color = egui::Color32::from_rgb(120, 120, 120);
     painter.line_segment(
         [
             egui::pos2(arrow_x - arrow_size, arrow_y - arrow_size * 0.6),
             egui::pos2(arrow_x, arrow_y + arrow_size * 0.6),
         ],
-        egui::Stroke::new(1.5, arrow_color),
+        egui::Stroke::new(1.5, pal.combo_chevron),
     );
     painter.line_segment(
         [
             egui::pos2(arrow_x, arrow_y + arrow_size * 0.6),
             egui::pos2(arrow_x + arrow_size, arrow_y - arrow_size * 0.6),
         ],
-        egui::Stroke::new(1.5, arrow_color),
+        egui::Stroke::new(1.5, pal.combo_chevron),
     );
 
     if response.clicked() {
@@ -107,8 +101,8 @@ fn combo_box_inner<T: PartialEq + Copy>(
             .fixed_pos(egui::pos2(rect.min.x, rect.max.y + 2.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(206, 206, 206)))
+                    .fill(pal.combo_popup_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.combo_popup_border))
                     .corner_radius(egui::CornerRadius::same(4))
                     .shadow(egui::Shadow {
                         offset: [0, 2],
@@ -129,16 +123,16 @@ fn combo_box_inner<T: PartialEq + Copy>(
                             let resp = ui.allocate_rect(item_rect, egui::Sense::click());
 
                             let item_bg = if resp.hovered() {
-                                egui::Color32::from_rgb(0, 122, 204)
+                                pal.combo_item_hover_bg
                             } else if is_selected {
-                                egui::Color32::from_rgb(232, 240, 252)
+                                pal.combo_item_selected_bg
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
                             let text_color = if resp.hovered() {
-                                egui::Color32::WHITE
+                                pal.combo_item_hover_text
                             } else {
-                                egui::Color32::from_rgb(51, 51, 51)
+                                pal.combo_text
                             };
 
                             if item_bg != egui::Color32::TRANSPARENT {

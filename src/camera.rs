@@ -14,7 +14,10 @@ pub struct CameraHandle {
     #[allow(dead_code)]
     pub property: svbony::CameraProperty,
     pub controls: Vec<ControlCaps>,
+    /// Actual (value, is_auto) read from the camera at open time, parallel to `controls`.
+    pub initial_values: Vec<(i64, bool)>,
     pub cmd_tx: Sender<CameraCmd>,
+    pub join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Enumerate connected SVBony cameras. Returns an empty vec if none found.
@@ -34,11 +37,15 @@ pub fn start_camera(
     let prop = cam.property()?;
     let bit_depth = prop.max_bit_depth as u8;
 
-    // Query all controls
+    // Query all controls and read their current values
     let num_controls = cam.num_controls()?;
     let mut controls = Vec::with_capacity(num_controls);
+    let mut initial_values = Vec::with_capacity(num_controls);
     for i in 0..num_controls {
         if let Ok(caps) = cam.control_caps(i) {
+            let (val, is_auto) = cam.get_control(caps.control_type)
+                .unwrap_or((caps.default_value, false));
+            initial_values.push((val, is_auto));
             controls.push(caps);
         }
     }
@@ -90,18 +97,21 @@ pub fn start_camera(
         .unwrap_or(100_000);
     let base_timeout = ((exposure_us / 1000) * 2 + 500).max(2000) as i32;
 
-    let handle = CameraHandle {
+    let mut handle = CameraHandle {
         info: info.clone(),
         property: prop,
         controls,
+        initial_values,
         cmd_tx: cmd_tx.clone(),
+        join_handle: None,
     };
 
     let shift_bits = if needs_shift { 16 - bit_depth } else { 0 };
     let cam_name = info.name.clone();
-    std::thread::spawn(move || {
+    let join_handle = std::thread::spawn(move || {
         capture_loop(cam, &cam_name, frame_tx, cmd_rx, log_tx, bit_depth, base_timeout, shift_bits);
     });
+    handle.join_handle = Some(join_handle);
 
     Ok(handle)
 }

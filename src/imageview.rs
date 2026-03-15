@@ -24,6 +24,8 @@ pub struct DisplayParams {
     pub transfer: TransferFn,
     pub show_axes: bool,
     pub show_colorbar: bool,
+    pub axes_text_color: Color32,
+    pub axes_stroke_color: Color32,
 }
 
 impl Default for DisplayParams {
@@ -35,6 +37,8 @@ impl Default for DisplayParams {
             transfer: TransferFn::Linear,
             show_axes: true,
             show_colorbar: true,
+            axes_text_color: Color32::from_rgb(51, 51, 51),
+            axes_stroke_color: Color32::from_rgb(97, 97, 97),
         }
     }
 }
@@ -131,7 +135,7 @@ impl ImageViewer {
 
         // Draw axes
         if params.show_axes {
-            self.draw_axes(ui, image_rect, width, height);
+            self.draw_axes(ui, image_rect, width, height, params);
         }
 
         // Draw the image with full interaction sense (hover + drag)
@@ -309,10 +313,10 @@ impl ImageViewer {
         }
     }
 
-    fn draw_axes(&self, ui: &mut egui::Ui, image_rect: Rect, width: u32, height: u32) {
+    fn draw_axes(&self, ui: &mut egui::Ui, image_rect: Rect, width: u32, height: u32, params: &DisplayParams) {
         let painter = ui.painter();
-        let stroke = Stroke::new(1.0, Color32::from_rgb(97, 97, 97));
-        let text_color = Color32::from_rgb(51, 51, 51);
+        let stroke = Stroke::new(1.0, params.axes_stroke_color);
+        let text_color = params.axes_text_color;
         let font = egui::FontId::monospace(13.0);
 
         // Y-axis (left side)
@@ -391,11 +395,11 @@ impl ImageViewer {
         // Border
         let bar_rect =
             Rect::from_min_size(Pos2::new(bar_x, bar_top), Vec2::new(bar_width, bar_height));
-        painter.rect_stroke(bar_rect, 0.0, Stroke::new(1.0, Color32::from_rgb(97, 97, 97)), StrokeKind::Outside);
+        painter.rect_stroke(bar_rect, 0.0, Stroke::new(1.0, params.axes_stroke_color), StrokeKind::Outside);
 
         // Scale labels
         let font = egui::FontId::monospace(13.0);
-        let text_color = Color32::from_rgb(51, 51, 51);
+        let text_color = params.axes_text_color;
         let label_x = bar_x + bar_width + 4.0;
         let num_labels = 5;
         for i in 0..=num_labels {

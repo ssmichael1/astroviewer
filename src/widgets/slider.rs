@@ -1,5 +1,5 @@
 use eframe::egui;
-use super::*;
+use super::Palette;
 
 /// Mapping from slider position [0,1] to value and back.
 enum SliderMapping {
@@ -16,6 +16,7 @@ fn slider_core(
     label: &str,
     fmt: &str,
     mapping: &SliderMapping,
+    pal: &Palette,
 ) -> bool {
     let old = *value;
 
@@ -83,33 +84,30 @@ fn slider_core(
             egui::pos2(track_left, track_y - track_h / 2.0),
             egui::pos2(track_right, track_y + track_h / 2.0),
         );
-        painter.rect_filled(track_rect, egui::CornerRadius::same(2),
-            egui::Color32::from_rgb(215, 216, 222));
+        painter.rect_filled(track_rect, egui::CornerRadius::same(2), pal.slider_track);
         painter.hline(track_rect.x_range(), track_rect.min.y,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(192, 193, 200)));
+            egui::Stroke::new(1.0, pal.slider_track_top));
 
         let filled_rect = egui::Rect::from_min_max(
             track_rect.min,
             egui::pos2(track_left + t * track_width, track_rect.max.y),
         );
         if filled_rect.width() > 1.0 {
-            painter.rect_filled(filled_rect, egui::CornerRadius::same(2), ACCENT);
+            painter.rect_filled(filled_rect, egui::CornerRadius::same(2), pal.accent);
         }
 
         let handle_x = track_left + t * track_width;
         let hc = egui::pos2(handle_x, track_y);
         let hovered = response.hovered() || response.dragged();
 
-        painter.circle_filled(egui::pos2(hc.x, hc.y + 1.0), handle_r,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22));
-        let hbg = if hovered { egui::Color32::from_rgb(252, 252, 254) } else { BG_RAISED };
+        painter.circle_filled(egui::pos2(hc.x, hc.y + 1.0), handle_r, pal.slider_handle_shadow);
+        let hbg = if hovered { pal.slider_handle_hover } else { pal.slider_handle };
         painter.circle_filled(hc, handle_r, hbg);
-        let hborder = if response.dragged() { ACCENT_DARK }
-            else if hovered { ACCENT }
-            else { BORDER };
+        let hborder = if response.dragged() { pal.accent_dark }
+            else if hovered { pal.accent }
+            else { pal.border };
         painter.circle_stroke(hc, handle_r, egui::Stroke::new(1.5, hborder));
-        painter.circle_filled(egui::pos2(hc.x - 1.0, hc.y - 2.0), 2.5,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120));
+        painter.circle_filled(egui::pos2(hc.x - 1.0, hc.y - 2.0), 2.5, pal.slider_handle_highlight);
 
         if fmt != "none" {
             let display = match fmt {
@@ -130,23 +128,39 @@ pub fn styled_slider(
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     label: &str,
+    pal: &Palette,
 ) -> bool {
     let mut v = *value as f64;
-    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "2", &SliderMapping::Linear);
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "2", &SliderMapping::Linear, pal);
     *value = v as f32;
     changed
 }
 
-/// Styled logarithmic slider for f32 values.
+/// Styled logarithmic slider for f32 values (integer display).
 pub fn styled_slider_log(
     ui: &mut egui::Ui,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     label: &str,
+    pal: &Palette,
 ) -> bool {
     let mut v = *value as f64;
-    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "d", &SliderMapping::Logarithmic);
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "d", &SliderMapping::Logarithmic, pal);
     *value = v.round() as f32;
+    changed
+}
+
+/// Styled logarithmic slider for f32 values (decimal display).
+pub fn styled_slider_log_f(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    label: &str,
+    pal: &Palette,
+) -> bool {
+    let mut v = *value as f64;
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "2", &SliderMapping::Logarithmic, pal);
+    *value = v as f32;
     changed
 }
 
@@ -155,9 +169,10 @@ pub fn styled_slider_bare(
     ui: &mut egui::Ui,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
+    pal: &Palette,
 ) -> bool {
     let mut v = *value as f64;
-    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, "", "none", &SliderMapping::Linear);
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, "", "none", &SliderMapping::Linear, pal);
     *value = v as f32;
     changed
 }
@@ -167,9 +182,10 @@ pub fn styled_slider_log_bare(
     ui: &mut egui::Ui,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
+    pal: &Palette,
 ) -> bool {
     let mut v = *value as f64;
-    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, "", "none", &SliderMapping::Logarithmic);
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, "", "none", &SliderMapping::Logarithmic, pal);
     *value = v.round() as f32;
     changed
 }
@@ -180,9 +196,10 @@ pub fn styled_slider_u32(
     value: &mut u32,
     range: std::ops::RangeInclusive<u32>,
     label: &str,
+    pal: &Palette,
 ) -> bool {
     let mut v = *value as f64;
-    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "d", &SliderMapping::Linear);
+    let changed = slider_core(ui, &mut v, *range.start() as f64, *range.end() as f64, label, "d", &SliderMapping::Linear, pal);
     *value = v.round() as u32;
     changed
 }

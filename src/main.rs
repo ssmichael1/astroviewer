@@ -134,6 +134,8 @@ struct ViewerApp {
     zoom_texture: Option<egui::TextureHandle>,
     zoom_rgba: Vec<u8>,
 
+    ui_theme: widgets::UiTheme,
+
     cursor_pixel: Option<(u32, u32)>,
     cursor_value: Option<f32>,
     hist_drag: Option<HistDrag>,
@@ -235,32 +237,7 @@ impl ViewerApp {
         style.spacing.icon_spacing = 6.0;
         style.spacing.combo_width = 110.0;
 
-        use crate::widgets::*;
-        let r = egui::CornerRadius::same(6);
-        style.visuals.widgets.noninteractive.corner_radius = r;
-        style.visuals.widgets.inactive.corner_radius = r;
-        style.visuals.widgets.hovered.corner_radius = r;
-        style.visuals.widgets.active.corner_radius = r;
-        style.visuals.panel_fill = BG_SURFACE;
-        style.visuals.window_fill = egui::Color32::WHITE;
-        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235));
-        style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
-        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
-        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.5, TEXT_SECONDARY);
-        style.visuals.widgets.hovered.bg_fill = BG_HOVER;
-        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, ACCENT_LIGHT);
-        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, ACCENT);
-        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(238, 239, 244);
-        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, ACCENT);
-        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, ACCENT);
-        style.visuals.selection.bg_fill = ACCENT;
-        style.visuals.selection.stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
-        style.visuals.hyperlink_color = ACCENT;
-        style.visuals.window_shadow = egui::Shadow {
-            offset: [0, 4], blur: 12, spread: 0,
-            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 15),
-        };
+        // Theme colors are applied each frame by apply_theme()
         cc.egui_ctx.set_style(style);
 
         let (frame_tx, frame_rx) = bounded(2);
@@ -288,10 +265,9 @@ impl ViewerApp {
             if let Some(info) = discovered_cameras.first() {
                 match camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
                     Ok(handle) => {
-                        let mut control_values = Vec::new();
-                        for caps in &handle.controls {
-                            control_values.push((caps.control_type, caps.default_value, false));
-                        }
+                        let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
+                            .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
+                            .collect();
                         log.push(LogEntry::info(format!("Camera opened: {}", info.name)));
                         camera_source = CameraSource::SVBony(info.camera_id);
                         capture_state = CaptureState::SVBony { handle, control_values };
@@ -346,6 +322,9 @@ impl ViewerApp {
             (work_tx, result_rx)
         };
 
+        let ui_theme = widgets::UiTheme::Light;
+
+        #[allow(unused_mut)]
         let mut app = Self {
             frame_tx, frame_rx,
             current_frame: None,
@@ -355,6 +334,7 @@ impl ViewerApp {
             image_viewer: ImageViewer::new(),
             zoom_texture: None,
             zoom_rgba: Vec::new(),
+            ui_theme,
             cursor_pixel: None, cursor_value: None,
             hist_drag: None,
             hist_log_y: false,
@@ -469,6 +449,67 @@ impl ViewerApp {
     fn add_log(&mut self, entry: LogEntry) {
         self.log.push(entry);
         if self.log.len() > 500 { self.log.remove(0); }
+    }
+
+    fn pal(&self) -> widgets::Palette {
+        self.ui_theme.palette()
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let pal = self.pal();
+        let is_night = self.ui_theme == widgets::UiTheme::Night;
+        let mut style = (*ctx.style()).clone();
+
+        let r = egui::CornerRadius::same(6);
+        style.visuals.dark_mode = is_night;
+        style.visuals.widgets.noninteractive.corner_radius = r;
+        style.visuals.widgets.inactive.corner_radius = r;
+        style.visuals.widgets.hovered.corner_radius = r;
+        style.visuals.widgets.active.corner_radius = r;
+        style.visuals.panel_fill = pal.panel_fill;
+        style.visuals.window_fill = pal.window_fill;
+        // Text input / DragValue backgrounds
+        style.visuals.extreme_bg_color = if is_night {
+            egui::Color32::from_rgb(20, 8, 8)
+        } else {
+            egui::Color32::from_rgb(248, 248, 248)
+        };
+        style.visuals.faint_bg_color = if is_night {
+            egui::Color32::from_rgb(30, 12, 12)
+        } else {
+            egui::Color32::from_rgb(245, 245, 245)
+        };
+        style.visuals.widgets.noninteractive.bg_fill = pal.panel_fill;
+        style.visuals.widgets.noninteractive.weak_bg_fill = pal.panel_fill;
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pal.section_border);
+        style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, pal.text_primary);
+        style.visuals.widgets.inactive.bg_fill = pal.bg_raised;
+        style.visuals.widgets.inactive.weak_bg_fill = pal.bg_raised; // native button background
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, pal.border);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.5, pal.text_secondary);
+        style.visuals.widgets.hovered.bg_fill = pal.bg_hover;
+        style.visuals.widgets.hovered.weak_bg_fill = pal.bg_hover;
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.5, pal.accent_light);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, pal.accent);
+        style.visuals.widgets.active.bg_fill = pal.bg_hover;
+        style.visuals.widgets.active.weak_bg_fill = pal.bg_hover;
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, pal.accent);
+        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, pal.accent);
+        // Open widgets (active combo boxes, text edits in focus)
+        style.visuals.widgets.open.bg_fill = pal.bg_raised;
+        style.visuals.widgets.open.weak_bg_fill = pal.bg_raised;
+        style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.5, pal.accent);
+        style.visuals.widgets.open.fg_stroke = egui::Stroke::new(2.0, pal.accent);
+        style.visuals.widgets.open.corner_radius = r;
+        style.visuals.selection.bg_fill = pal.accent;
+        style.visuals.selection.stroke = egui::Stroke::new(1.5, pal.check_mark);
+        style.visuals.hyperlink_color = pal.accent;
+        style.visuals.override_text_color = Some(pal.text_primary);
+        style.visuals.window_shadow = egui::Shadow {
+            offset: [0, 4], blur: 12, spread: 0,
+            color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 15),
+        };
+        ctx.set_style(style);
     }
 
     fn start_recording(&mut self) {
@@ -599,8 +640,12 @@ impl ViewerApp {
             CaptureState::Sim { _stop_tx } => {}
             CaptureState::Fits { _stop_tx } => {}
             #[cfg(feature = "svbony")]
-            CaptureState::SVBony { handle, .. } => {
+            CaptureState::SVBony { mut handle, .. } => {
                 let _ = handle.cmd_tx.send(camera::CameraCmd::Stop);
+                // Wait for capture thread to finish so the SDK cleans up before we drop
+                if let Some(jh) = handle.join_handle.take() {
+                    let _ = jh.join();
+                }
             }
             CaptureState::Stopped => {}
         }
@@ -677,10 +722,9 @@ impl ViewerApp {
 
         match camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
-                let mut control_values = Vec::new();
-                for caps in &handle.controls {
-                    control_values.push((caps.control_type, caps.default_value, false));
-                }
+                let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
+                    .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
+                    .collect();
                 self.add_log(LogEntry::info(format!("Camera opened: {}", info.name)));
                 let camera_id = info.camera_id;
                 self.capture_state = CaptureState::SVBony { handle, control_values };
@@ -836,6 +880,8 @@ impl ViewerApp {
     // ── Side panel ──────────────────────────────────────────────────────────
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+
         // Poll pending FITS file dialog result (outside section closure)
         if let Some(rx) = &self.pending_fits_path {
             if let Ok(result) = rx.try_recv() {
@@ -846,27 +892,54 @@ impl ViewerApp {
             }
         }
 
-        section(ui, "Camera", |ui| {
-            let mut new_source = self.camera_source.clone();
+        section(ui, "Camera", &pal, |ui| {
+            // Current source status line
+            let source_label = match &self.camera_source {
+                CameraSource::Simulated => "Simulated".to_string(),
+                CameraSource::FitsFile(path) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    format!("FITS: {}", name)
+                }
+                #[cfg(feature = "svbony")]
+                CameraSource::SVBony(cam_id) => {
+                    self.discovered_cameras.iter()
+                        .find(|c| c.camera_id == *cam_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| format!("Camera {}", cam_id))
+                }
+            };
+            ui.label(egui::RichText::new(source_label).size(13.0).color(pal.accent));
 
-            // Only show simulated option if no real cameras are available
             #[cfg(feature = "svbony")]
-            let has_cameras = !self.discovered_cameras.is_empty();
-            #[cfg(not(feature = "svbony"))]
-            let has_cameras = false;
-
-            if !has_cameras {
-                ui.radio_value(&mut new_source, CameraSource::Simulated, "Simulated");
+            if let Some(err) = &self.camera_error {
+                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
 
-            // FITS file source
-            if let CameraSource::FitsFile(path) = &self.camera_source {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                ui.radio_value(&mut new_source, self.camera_source.clone(), format!("FITS: {}", name));
-                widgets::styled_slider_u32(ui, &mut self.fits_fps, 1..=60, "Playback FPS");
+            // Source-specific settings
+            match &self.camera_source {
+                CameraSource::Simulated => {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.sim_width).range(64..=4096).speed(8).prefix("W: "));
+                        ui.add(egui::DragValue::new(&mut self.sim_height).range(64..=4096).speed(8).prefix("H: "));
+                    });
+                    widgets::combo_box(ui, "bit_depth", "Bit depth:", &mut self.sim_bit_depth, &[
+                        (8, "8"), (12, "12"), (14, "14"), (16, "16"),
+                    ], &pal);
+                    widgets::styled_slider_u32(ui, &mut self.sim_fps, 1..=60, "FPS", &pal);
+                }
+                CameraSource::FitsFile(_) => {
+                    ui.add_space(4.0);
+                    widgets::styled_slider_u32(ui, &mut self.fits_fps, 1..=60, "Playback FPS", &pal);
+                }
+                #[cfg(feature = "svbony")]
+                CameraSource::SVBony(_) => {}
             }
+
+            // Open FITS shortcut
+            ui.add_space(4.0);
             let dialog_pending = self.pending_fits_path.is_some();
-            if !dialog_pending && widgets::styled_button(ui, "Open FITS...") {
+            if !dialog_pending && widgets::styled_button(ui, "Open FITS...", &pal) {
                 let (tx, rx) = bounded(1);
                 self.pending_fits_path = Some(rx);
                 std::thread::spawn(move || {
@@ -876,79 +949,26 @@ impl ViewerApp {
                     let _ = tx.send(result);
                 });
             }
-
-            #[cfg(feature = "svbony")]
-            {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label("SVBony Cameras:");
-                    if widgets::styled_button(ui, "Refresh") {
-                        self.discovered_cameras = camera::enumerate();
-                    }
-                });
-                if self.discovered_cameras.is_empty() {
-                    ui.label(egui::RichText::new("No cameras found").color(widgets::TEXT_SECONDARY).italics());
-                } else {
-                    for cam_info in &self.discovered_cameras.clone() {
-                        let source = CameraSource::SVBony(cam_info.camera_id);
-                        let label = format!("{} ({})", cam_info.name, cam_info.serial);
-                        ui.radio_value(&mut new_source, source, label);
-                    }
-                }
-                if let Some(err) = &self.camera_error {
-                    ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
-                }
-            }
-
-            if new_source != self.camera_source {
-                match &new_source {
-                    CameraSource::Simulated => self.start_sim(),
-                    CameraSource::FitsFile(path) => {
-                        let path = path.clone();
-                        self.start_fits(path);
-                    }
-                    #[cfg(feature = "svbony")]
-                    CameraSource::SVBony(cam_id) => {
-                        let cam_id = *cam_id;
-                        if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
-                            self.start_svbony(&info);
-                        }
-                    }
-                }
-            }
-
-            if self.camera_source == CameraSource::Simulated {
-                ui.add_space(4.0);
-                ui.label("Resolution:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.sim_width).range(64..=4096).speed(8).prefix("W: "));
-                    ui.add(egui::DragValue::new(&mut self.sim_height).range(64..=4096).speed(8).prefix("H: "));
-                });
-                widgets::combo_box(ui, "bit_depth", "Bit depth:", &mut self.sim_bit_depth, &[
-                    (8, "8"), (12, "12"), (14, "14"), (16, "16"),
-                ]);
-                widgets::styled_slider_u32(ui, &mut self.sim_fps, 1..=60, "FPS");
-            }
         });
 
         ui.add_space(4.0);
 
-        section(ui, "Display", |ui| {
+        section(ui, "Display", &pal, |ui| {
             let cmap_options: Vec<(ColormapKind, &str)> = ColormapKind::ALL.iter().map(|&k| (k, k.name())).collect();
             let label_w = 65.0;
             egui::Grid::new("display_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Colormap"); });
-                if widgets::combo_box(ui, "colormap", "", &mut self.colormap.kind, &cmap_options) {
+                if widgets::combo_box(ui, "colormap", "", &mut self.colormap.kind, &cmap_options, &pal) {
                     self.colormap = Colormap::new(self.colormap.kind);
                 }
                 ui.end_row();
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Scale"); });
-                widgets::combo_box(ui, "scale_mode", "", &mut self.scale_mode, ScaleMode::ALL);
+                widgets::combo_box(ui, "scale_mode", "", &mut self.scale_mode, ScaleMode::ALL, &pal);
                 ui.end_row();
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Transfer"); });
-                widgets::combo_box(ui, "transfer_fn", "", &mut self.display_params.transfer, imageview::TransferFn::ALL);
+                widgets::combo_box(ui, "transfer_fn", "", &mut self.display_params.transfer, imageview::TransferFn::ALL, &pal);
                 ui.end_row();
 
                 let gamma_label = match self.display_params.transfer {
@@ -956,7 +976,14 @@ impl ViewerApp {
                     imageview::TransferFn::Asinh => "Alpha",
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label(gamma_label); });
-                ui.horizontal(|ui| { widgets::styled_slider(ui, &mut self.display_params.gamma, 0.1..=10.0, ""); });
+                ui.horizontal(|ui| {
+                    let mut log_gamma = self.display_params.gamma.log10();
+                    ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut log_gamma, -1.0..=1.0, &pal);
+                    });
+                    self.display_params.gamma = 10.0_f32.powf(log_gamma);
+                    ui.label(egui::RichText::new(format!("{:.2}", self.display_params.gamma)).monospace().size(12.0));
+                });
                 ui.end_row();
             });
             ui.horizontal(|ui| {
@@ -965,30 +992,30 @@ impl ViewerApp {
                     imageview::TransferFn::Linear => "Reset Gamma",
                     imageview::TransferFn::Asinh => "Reset Alpha",
                 };
-                if widgets::styled_button(ui, reset_label) { self.display_params.gamma = 1.0; }
+                if widgets::styled_button(ui, reset_label, &pal) { self.display_params.gamma = 1.0; }
             });
             if self.scale_mode == ScaleMode::Manual {
                 ui.add_space(4.0);
                 let max_range = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f32).unwrap_or(65535.0);
-                widgets::styled_slider(ui, &mut self.display_params.scale_min, 0.0..=max_range, "Min");
-                widgets::styled_slider(ui, &mut self.display_params.scale_max, 0.0..=max_range, "Max");
+                widgets::styled_slider(ui, &mut self.display_params.scale_min, 0.0..=max_range, "Min", &pal);
+                widgets::styled_slider(ui, &mut self.display_params.scale_max, 0.0..=max_range, "Max", &pal);
             } else {
                 ui.label(format!("Range: {:.0} – {:.0}", self.display_params.scale_min, self.display_params.scale_max));
             }
             ui.add_space(6.0);
-            widgets::styled_checkbox(ui, &mut self.display_params.show_axes, "Show Axes");
-            widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar");
+            widgets::styled_checkbox(ui, &mut self.display_params.show_axes, "Show Axes", &pal);
+            widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar", &pal);
             #[cfg(feature = "starsolve")]
             {
-                widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids");
-                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars");
-                widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names");
+                widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
+                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
+                widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
             }
         });
 
         ui.add_space(4.0);
 
-        section(ui, "Statistics", |ui| {
+        section(ui, "Statistics", &pal, |ui| {
             let lw = 65.0;
             egui::Grid::new("stats_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
                 stat_row(ui, lw, "FPS", &format!("{:.1}", self.fps));
@@ -1011,15 +1038,11 @@ impl ViewerApp {
     // ── Bottom panel tabs ───────────────────────────────────────────────────
 
     fn bottom_panel_tabs(&mut self, ui: &mut egui::Ui) {
-        let tab_bar_color = egui::Color32::from_rgb(37, 37, 38);
-        let active_bg = egui::Color32::from_rgb(30, 30, 30);
-        let inactive_text = egui::Color32::from_rgb(150, 150, 150);
-        let active_text = egui::Color32::WHITE;
-        let accent_line = widgets::ACCENT;
+        let pal = self.pal();
 
         let avail = ui.available_rect_before_wrap();
         let bar_rect = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), 28.0));
-        ui.painter().rect_filled(bar_rect, egui::CornerRadius::ZERO, tab_bar_color);
+        ui.painter().rect_filled(bar_rect, egui::CornerRadius::ZERO, pal.tab_bar);
 
         #[allow(deprecated)]
         ui.allocate_ui_at_rect(bar_rect, |ui| {
@@ -1037,7 +1060,7 @@ impl ViewerApp {
                 for (tab, label) in tabs {
                     let is_active = self.bottom_tab == tab;
                     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-                    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), active_text);
+                    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.tab_active_text);
                     let tab_w = galley.size().x + 24.0;
                     let tab_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
@@ -1045,22 +1068,18 @@ impl ViewerApp {
                     );
                     let resp = ui.allocate_rect(tab_rect, egui::Sense::click());
 
-                    // Background
                     if is_active {
-                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO, active_bg);
-                        // Active indicator line at top
+                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO, pal.tab_active_bg);
                         ui.painter().hline(
                             tab_rect.x_range(),
                             tab_rect.min.y,
-                            egui::Stroke::new(2.0, accent_line),
+                            egui::Stroke::new(2.0, pal.accent),
                         );
                     } else if resp.hovered() {
-                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO,
-                            egui::Color32::from_rgb(45, 45, 46));
+                        ui.painter().rect_filled(tab_rect, egui::CornerRadius::ZERO, pal.tab_hover_bg);
                     }
 
-                    // Label
-                    let text_color = if is_active { active_text } else { inactive_text };
+                    let text_color = if is_active { pal.tab_active_text } else { pal.tab_inactive_text };
                     ui.painter().text(
                         tab_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -1086,6 +1105,7 @@ impl ViewerApp {
     }
 
     fn histogram_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
         if let Some(frame) = &self.current_frame {
             let hist = &frame.hist;
             let centers = hist.centers();
@@ -1102,19 +1122,18 @@ impl ViewerApp {
                 line_vec.push([(cx + bin_width * 0.5) as f64, y]);
             }
 
-            // Log Y toggle — placed in a horizontal bar above the plot
+            // Log Y toggle
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                widgets::styled_checkbox(ui, &mut self.hist_log_y, "Log Y");
+                widgets::styled_checkbox(ui, &mut self.hist_log_y, "Log Y", &pal);
             });
 
             let plot_height = ui.available_height().max(80.0);
             let y_label = if self.hist_log_y { "log₁₀(count+1)" } else { "" };
 
-            // Fix x-axis range to the bit depth so it doesn't bounce
             let x_max = self.current_frame.as_ref()
                 .map(|f| ((1u64 << f.bit_depth) - 1) as f64)
-                .unwrap_or(65535.0);  // f64 for egui_plot
+                .unwrap_or(65535.0);
 
             let plot_resp = egui_plot::Plot::new("histogram")
                 .height(plot_height)
@@ -1131,7 +1150,7 @@ impl ViewerApp {
                     let line_points: egui_plot::PlotPoints = line_vec.into();
                     plot_ui.line(
                         egui_plot::Line::new(line_points)
-                            .color(egui::Color32::from_rgb(79, 70, 229))
+                            .color(pal.plot_line)
                             .width(1.5)
                             .fill(0.0)
                             .fill_alpha(0.35),
@@ -1155,7 +1174,6 @@ impl ViewerApp {
                                 else if dist_max < grab_radius_data { near_max = true; }
                             }
                         }
-                        // Min line
                         let (min_c, min_w) = if near_min {
                             (egui::Color32::from_rgb(252, 85, 85), 4.0)
                         } else {
@@ -1163,7 +1181,6 @@ impl ViewerApp {
                         };
                         plot_ui.vline(egui_plot::VLine::new(smin).color(min_c).width(min_w).style(egui_plot::LineStyle::Solid));
 
-                        // Max line
                         let (max_c, max_w) = if near_max {
                             (egui::Color32::from_rgb(96, 165, 250), 4.0)
                         } else {
@@ -1208,76 +1225,149 @@ impl ViewerApp {
 
     #[cfg(feature = "svbony")]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
         if let CaptureState::SVBony { ref handle, ref mut control_values } = self.capture_state {
-            let label_w = 130.0;
-            ui.style_mut().spacing.item_spacing.y = 6.0;
-            egui::Grid::new("camera_controls_grid")
-                .num_columns(3)
-                .spacing([12.0, 7.0])
-                .show(ui, |ui| {
-                    for (caps, cv) in handle.controls.iter().zip(control_values.iter_mut()) {
-                        let old_val = cv.1;
-                        let old_auto = cv.2;
+            let n = handle.controls.len();
+            let mid = (n + 1) / 2;
+            let label_w = 120.0_f32;
+            let value_w = 80.0_f32;
+            let auto_w = 65.0_f32;
 
-                        if !caps.is_writable {
-                            ctrl_label(ui, label_w, &caps.name);
-                            ui.label(""); // empty slider column
-                            ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1)).monospace().size(12.0));
-                            ui.end_row();
-                            continue;
-                        }
-
-                        if caps.max_value - caps.min_value <= 1 {
-                            ctrl_label(ui, label_w, "");
-                            let mut on = cv.1 != 0;
-                            if widgets::styled_checkbox(ui, &mut on, &caps.name) {
-                                cv.1 = if on { 1 } else { 0 };
-                            }
-                            ui.label(""); // empty value column
-                            ui.end_row();
-                        } else {
-                            ctrl_label(ui, label_w, &caps.name);
-                            let mut v = cv.1 as f32;
-                            let is_exposure = caps.control_type == svbony::ControlType::Exposure;
-                            if is_exposure {
-                                let max_us = (caps.max_value as f32).min(1_000_000.0);
-                                widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=max_us);
-                            } else {
-                                widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=caps.max_value as f32);
-                            }
-                            cv.1 = v.round() as i64;
-                            ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1)).monospace().size(12.0));
-                            ui.end_row();
-
-                            if caps.is_auto_supported {
-                                ctrl_label(ui, label_w, "");
-                                let mut auto = cv.2;
-                                if widgets::styled_checkbox(ui, &mut auto, "Auto") { cv.2 = auto; }
-                                ui.label(""); // empty value column
-                                ui.end_row();
-                            }
-                        }
-
-                        if cv.1 != old_val || cv.2 != old_auto {
-                            let _ = handle.cmd_tx.send(camera::CameraCmd::SetControl(caps.control_type, cv.1, cv.2));
-                        }
-                    }
-                });
+            // Two-column layout
+            ui.columns(2, |cols| {
+                let col_w = cols[0].available_width();
+                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                cols[0].spacing_mut().item_spacing.y = 8.0;
+                for idx in 0..mid {
+                    Self::draw_control(&mut cols[0], &handle.controls[idx], &mut control_values[idx],
+                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                }
+                let col_w = cols[1].available_width();
+                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                cols[1].spacing_mut().item_spacing.y = 8.0;
+                for idx in mid..n {
+                    Self::draw_control(&mut cols[1], &handle.controls[idx], &mut control_values[idx],
+                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                }
+            });
         } else {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
-                ui.label(egui::RichText::new("No camera connected").color(widgets::TEXT_SECONDARY));
+                ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
             });
+        }
+    }
+
+    #[cfg(feature = "svbony")]
+    fn draw_control(
+        ui: &mut egui::Ui,
+        caps: &svbony::ControlCaps,
+        cv: &mut (svbony::ControlType, i64, bool),
+        cmd_tx: &Sender<camera::CameraCmd>,
+        label_w: f32,
+        slider_w: f32,
+        value_w: f32,
+        auto_w: f32,
+        pal: &widgets::Palette,
+    ) {
+        let old_val = cv.1;
+        let old_auto = cv.2;
+
+        if !caps.is_writable {
+            // Read-only control
+            egui::Grid::new(egui::Id::new("ctrl").with(&caps.name))
+                .num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+                ctrl_label(ui, label_w, &caps.name);
+                ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1))
+                    .monospace().size(12.0).color(pal.text_secondary));
+                ui.end_row();
+            });
+        } else if caps.max_value - caps.min_value <= 1 {
+            // Boolean toggle
+            egui::Grid::new(egui::Id::new("ctrl").with(&caps.name))
+                .num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+                ctrl_label(ui, label_w, "");
+                let mut on = cv.1 != 0;
+                if widgets::styled_checkbox(ui, &mut on, &caps.name, pal) {
+                    cv.1 = if on { 1 } else { 0 };
+                }
+                ui.end_row();
+            });
+        } else {
+            let is_exposure = caps.control_type == svbony::ControlType::Exposure;
+            egui::Grid::new(egui::Id::new("ctrl").with(&caps.name))
+                .num_columns(4).spacing([4.0, 4.0]).show(ui, |ui| {
+                // Label
+                ctrl_label(ui, label_w, &caps.name);
+                // Slider
+                let mut v = cv.1 as f32;
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    if is_exposure {
+                        let max_us = (caps.max_value as f32).min(10_000_000.0);
+                        widgets::styled_slider_log_bare(ui, &mut v, (caps.min_value as f32).max(1.0)..=max_us, pal);
+                    } else {
+                        widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=caps.max_value as f32, pal);
+                    }
+                });
+                cv.1 = v.round() as i64;
+                // Value display
+                if is_exposure {
+                    let mut v_us = cv.1 as f64;
+                    let speed = (v_us * 0.005).max(1.0);
+                    let dv = egui::DragValue::new(&mut v_us)
+                        .range(caps.min_value as f64..=(caps.max_value as f64).min(10_000_000.0))
+                        .speed(speed)
+                        .custom_formatter(|v, _| {
+                            if v >= 1_000_000.0 { format!("{:.2} s", v / 1_000_000.0) }
+                            else if v >= 1_000.0 { format!("{:.1} ms", v / 1_000.0) }
+                            else { format!("{:.0} µs", v) }
+                        })
+                        .custom_parser(|s| {
+                            let s = s.trim();
+                            if let Some(n) = s.strip_suffix("ms").and_then(|n| n.trim().parse::<f64>().ok()) {
+                                Some(n * 1_000.0)
+                            } else if let Some(n) = s.strip_suffix("µs").or_else(|| s.strip_suffix("us")).and_then(|n| n.trim().parse::<f64>().ok()) {
+                                Some(n)
+                            } else if let Some(n) = s.strip_suffix('s').and_then(|n| n.trim().parse::<f64>().ok()) {
+                                Some(n * 1_000_000.0)
+                            } else {
+                                s.parse::<f64>().ok()
+                            }
+                        });
+                    ui.add_sized([value_w, 20.0], dv);
+                    cv.1 = v_us.round() as i64;
+                } else {
+                    ui.allocate_ui(egui::vec2(value_w, 20.0), |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1))
+                                .monospace().size(12.0));
+                        });
+                    });
+                }
+                // Auto checkbox
+                if caps.is_auto_supported {
+                    ui.allocate_ui(egui::vec2(auto_w, 20.0), |ui| {
+                        let mut auto = cv.2;
+                        if widgets::styled_checkbox(ui, &mut auto, "Auto", pal) { cv.2 = auto; }
+                    });
+                }
+                ui.end_row();
+            });
+        }
+
+        if cv.1 != old_val || cv.2 != old_auto {
+            let _ = cmd_tx.send(camera::CameraCmd::SetControl(cv.0, cv.1, cv.2));
         }
     }
 
     #[cfg(feature = "starsolve")]
     fn plate_solve_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
         // ── Top bar: database + FOV + status + reset ────────────────────────
         ui.horizontal(|ui| {
             // Database
             if self.solver_db.is_none() {
-                if widgets::styled_button(ui, "Load Database...") {
+                if widgets::styled_button(ui, "Load Database...", &pal) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Database", &["rkyv"])
                         .pick_file()
@@ -1299,7 +1389,7 @@ impl ViewerApp {
                 }
             } else {
                 ui.label(egui::RichText::new("DB").color(egui::Color32::from_rgb(34, 197, 94)));
-                if widgets::styled_button(ui, "Unload") {
+                if widgets::styled_button(ui, "Unload", &pal) {
                     self.solver_db = None;
                     self.last_solve = None;
                 }
@@ -1322,7 +1412,7 @@ impl ViewerApp {
                 } else if self.last_solve.as_ref().map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound) {
                     ("Locked", egui::Color32::from_rgb(34, 197, 94))
                 } else {
-                    ("Searching...", widgets::TEXT_SECONDARY)
+                    ("Searching...", pal.text_secondary)
                 };
                 ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(13.0), color);
             }
@@ -1331,12 +1421,12 @@ impl ViewerApp {
 
             // Centroid count (always shown, even when overlay is off)
             if self.centroid_count > 0 {
-                ui.label(egui::RichText::new(format!("{} stars", self.centroid_count)).color(widgets::TEXT_SECONDARY));
+                ui.label(egui::RichText::new(format!("{} stars", self.centroid_count)).color(pal.text_secondary));
             }
 
             // Reset defaults (far right)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::styled_button(ui, "Reset") {
+                if widgets::styled_button(ui, "Reset", &pal) {
                     self.centroid_config = tetra3::CentroidExtractionConfig::default();
                 }
             });
@@ -1344,13 +1434,11 @@ impl ViewerApp {
 
         // ── Centroid parameters (compact horizontal grid) ───────────────────
         ui.add_space(2.0);
-        // Centroid params — equal-width columns using allocate_ui
         let total_w = ui.available_width();
         let col_w = (total_w / 3.0 - 4.0).max(100.0);
         let label_w = 85.0;
         let slider_w = (col_w - label_w - 8.0).max(40.0);
 
-        // Helper: fixed-width label
         let fixed_label = |ui: &mut egui::Ui, text: String| {
             ui.allocate_ui(egui::vec2(label_w, 20.0), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1363,20 +1451,20 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             fixed_label(ui, format!("SNR {:.1}", self.centroid_config.sigma_threshold));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0);
+                widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0, &pal);
             });
 
             let mut v = self.centroid_config.min_pixels as f32;
             fixed_label(ui, format!("Min px {}", self.centroid_config.min_pixels));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0);
+                widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0, &pal);
             });
             self.centroid_config.min_pixels = v.round() as usize;
 
             let mut v = self.centroid_config.max_pixels as f32;
             fixed_label(ui, format!("Max px {}", self.centroid_config.max_pixels));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0);
+                widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0, &pal);
             });
             self.centroid_config.max_pixels = v as usize;
         });
@@ -1387,7 +1475,7 @@ impl ViewerApp {
             let lbl = if self.centroid_config.max_centroids.is_none() { "Stars all".into() } else { format!("Stars {}", v.round() as usize) };
             fixed_label(ui, lbl);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0);
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0, &pal);
             });
             self.centroid_config.max_centroids = if (v as usize) == 0 { None } else { Some(v.round() as usize) };
 
@@ -1395,7 +1483,7 @@ impl ViewerApp {
             let lbl = if self.centroid_config.local_bg_block_size.is_none() { "BG global".into() } else { format!("BG {}", v.round() as u32) };
             fixed_label(ui, lbl);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0);
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0, &pal);
             });
             self.centroid_config.local_bg_block_size = if (v as u32) == 0 { None } else { Some(v.round() as u32) };
 
@@ -1403,12 +1491,11 @@ impl ViewerApp {
             let lbl = if self.centroid_config.max_elongation.is_none() { "Elong. off".into() } else { format!("Elong. {:.1}", v) };
             fixed_label(ui, lbl);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0);
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0, &pal);
             });
             self.centroid_config.max_elongation = if v < 0.5 { None } else { Some(v) };
         });
 
-        // Save config if any slider was interacted with this frame
         // ── Solve results ───────────────────────────────────────────────────
         if let Some(ref result) = self.last_solve {
             ui.add_space(2.0);
@@ -1417,7 +1504,7 @@ impl ViewerApp {
             if result.status == tetra3::SolveStatus::MatchFound {
                 ui.horizontal_wrapped(|ui| {
                     let mono = egui::FontId::monospace(12.0);
-                    let dim = widgets::TEXT_SECONDARY;
+                    let dim = pal.text_secondary;
                     let sp = 10.0;
                     if let Some(crval) = result.crval_rad {
                         ui.label(egui::RichText::new("RA").color(dim));
@@ -1467,7 +1554,8 @@ impl ViewerApp {
     }
 
     fn log_content(&mut self, ui: &mut egui::Ui) {
-        if widgets::styled_button(ui, "Clear") {
+        let pal = self.pal();
+        if widgets::styled_button(ui, "Clear", &pal) {
             self.log.clear();
         }
         ui.add_space(4.0);
@@ -1477,12 +1565,12 @@ impl ViewerApp {
             .show(ui, |ui| {
                 for entry in self.log.iter().rev() {
                     let color = match entry.level {
-                        LogLevel::Info => widgets::TEXT_SECONDARY,
+                        LogLevel::Info => pal.text_secondary,
                         LogLevel::Warn => egui::Color32::from_rgb(217, 119, 6),
                         LogLevel::Error => egui::Color32::from_rgb(220, 38, 38),
                     };
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&entry.timestamp).monospace().size(11.0).color(widgets::TEXT_SECONDARY));
+                        ui.label(egui::RichText::new(&entry.timestamp).monospace().size(11.0).color(pal.text_secondary));
                         ui.label(egui::RichText::new(&entry.message).size(12.0).color(color));
                     });
                 }
@@ -1507,11 +1595,10 @@ fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {
     }
 }
 
-fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
-    let border = egui::Color32::from_rgb(229, 231, 235);
+fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .fill(egui::Color32::WHITE)
-        .stroke(egui::Stroke::new(1.0, border))
+        .fill(pal.section_body_fill)
+        .stroke(egui::Stroke::new(1.0, pal.section_border))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin { left: 1, right: 1, top: 1, bottom: 1 })
         .show(ui, |ui| {
@@ -1520,8 +1607,8 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
             let header_rect = {
                 let avail = ui.available_rect_before_wrap();
                 let rect = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), header_h));
-                ui.painter().rect_filled(rect, egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, egui::Color32::from_rgb(232, 234, 246));
-                ui.painter().hline(rect.x_range(), rect.max.y, egui::Stroke::new(1.0, border));
+                ui.painter().rect_filled(rect, egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, pal.section_header_fill);
+                ui.painter().hline(rect.x_range(), rect.max.y, egui::Stroke::new(1.0, pal.section_border));
                 rect
             };
             ui.painter().text(
@@ -1529,7 +1616,7 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
                 egui::Align2::LEFT_CENTER,
                 &title.to_uppercase(),
                 egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                egui::Color32::from_rgb(75, 70, 110),
+                pal.section_header_text,
             );
             ui.allocate_space(egui::vec2(0.0, header_h));
             egui::Frame::new()
@@ -1540,9 +1627,11 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
 
 #[cfg(any(feature = "svbony", feature = "starsolve"))]
 fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.set_width(width);
-        ui.label(egui::RichText::new(text).size(13.0));
+    ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
+        ui.set_max_width(width);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true), |ui| {
+            ui.label(egui::RichText::new(text).size(13.0));
+        });
     });
 }
 
@@ -1556,6 +1645,7 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str) {
 
 impl eframe::App for ViewerApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_capture();
         #[cfg(feature = "starsolve")]
         self.save_config();
     }
@@ -1564,16 +1654,169 @@ impl eframe::App for ViewerApp {
         self.poll_frame();
         self.poll_log();
         self.poll_fits_load();
+        self.apply_theme(ctx);
 
         if self.capture_running || self.pending_fits_load.is_some() { ctx.request_repaint(); }
+
+        let pal = self.pal();
+
+        // Menu bar
+        egui::TopBottomPanel::top("menu_bar")
+            .frame(egui::Frame::new()
+                .fill(pal.toolbar_fill)
+                .inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 2 })
+                .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
+            )
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    // ── File ────────────────────────────────────────────
+                    ui.menu_button("File", |ui| {
+                        let dialog_pending = self.pending_fits_path.is_some();
+                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
+                            let (tx, rx) = bounded(1);
+                            self.pending_fits_path = Some(rx);
+                            std::thread::spawn(move || {
+                                let result = rfd::FileDialog::new()
+                                    .add_filter("FITS", &["fits", "fit", "fts"])
+                                    .pick_file();
+                                let _ = tx.send(result);
+                            });
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if self.recording {
+                            if ui.button("Stop Recording").clicked() {
+                                self.stop_recording();
+                                ui.close_menu();
+                            }
+                        } else {
+                            if ui.button("Start Recording").clicked() {
+                                self.start_recording();
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+
+                    // ── View ────────────────────────────────────────────
+                    ui.menu_button("View", |ui| {
+                        ui.menu_button("Colormap", |ui| {
+                            for &kind in ColormapKind::ALL {
+                                if menu_radio(ui, self.colormap.kind == kind, kind.name()) {
+                                    self.colormap = Colormap::new(kind);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Scale Mode", |ui| {
+                            for &(mode, name) in ScaleMode::ALL {
+                                if menu_radio(ui, self.scale_mode == mode, name) {
+                                    self.scale_mode = mode;
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Transfer Function", |ui| {
+                            for &(tf, name) in imageview::TransferFn::ALL {
+                                if menu_radio(ui, self.display_params.transfer == tf, name) {
+                                    self.display_params.transfer = tf;
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if menu_check(ui, self.display_params.show_axes, "Show Axes") {
+                            self.display_params.show_axes = !self.display_params.show_axes;
+                        }
+                        if menu_check(ui, self.display_params.show_colorbar, "Show Colorbar") {
+                            self.display_params.show_colorbar = !self.display_params.show_colorbar;
+                        }
+                        #[cfg(feature = "starsolve")]
+                        {
+                            ui.separator();
+                            if menu_check(ui, self.show_centroids, "Show Centroids") {
+                                self.show_centroids = !self.show_centroids;
+                            }
+                            if menu_check(ui, self.show_matched_stars, "Show Matched Stars") {
+                                self.show_matched_stars = !self.show_matched_stars;
+                            }
+                            if menu_check(ui, self.show_star_names, "Show Star Names") {
+                                self.show_star_names = !self.show_star_names;
+                            }
+                        }
+                    });
+
+                    // ── Camera ──────────────────────────────────────────
+                    ui.menu_button("Camera", |ui| {
+                        if self.capture_running {
+                            if ui.button("Stop").clicked() {
+                                self.stop_capture();
+                                ui.close_menu();
+                            }
+                        } else {
+                            if ui.button("Play").clicked() {
+                                match &self.camera_source.clone() {
+                                    CameraSource::Simulated => self.start_sim(),
+                                    CameraSource::FitsFile(path) => {
+                                        let path = path.clone();
+                                        self.start_fits(path);
+                                    }
+                                    #[cfg(feature = "svbony")]
+                                    CameraSource::SVBony(cam_id) => {
+                                        let cam_id = *cam_id;
+                                        if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
+                                            self.start_svbony(&info);
+                                        }
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        let is_sim = matches!(self.camera_source, CameraSource::Simulated);
+                        if menu_radio(ui, is_sim, "Simulated") && !is_sim {
+                            self.start_sim();
+                            ui.close_menu();
+                        }
+                        #[cfg(feature = "svbony")]
+                        {
+                            ui.separator();
+                            if ui.button("Refresh Cameras").clicked() {
+                                self.discovered_cameras = camera::enumerate();
+                            }
+                            for cam_info in &self.discovered_cameras.clone() {
+                                let is_this = matches!(&self.camera_source, CameraSource::SVBony(id) if *id == cam_info.camera_id);
+                                let label = format!("{} ({})", cam_info.name, cam_info.serial);
+                                if menu_radio(ui, is_this, &label) && !is_this {
+                                    self.start_svbony(cam_info);
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
+
+                    // ── Theme ───────────────────────────────────────────
+                    ui.menu_button("Theme", |ui| {
+                        for &(theme, name) in widgets::UiTheme::ALL {
+                            if menu_radio(ui, self.ui_theme == theme, name) {
+                                self.ui_theme = theme;
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+            });
 
         // Top toolbar
         egui::TopBottomPanel::top("toolbar")
             .exact_height(38.0)
             .frame(egui::Frame::new()
-                .fill(egui::Color32::from_rgb(243, 244, 246))
+                .fill(pal.toolbar_fill)
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 6 })
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 235)))
+                .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -1613,15 +1856,18 @@ impl eframe::App for ViewerApp {
                     }
                     ui.separator();
                     let cmap_options: Vec<(ColormapKind, &str)> = ColormapKind::ALL.iter().map(|&k| (k, k.name())).collect();
-                    if widgets::combo_box(ui, "toolbar_cmap", "", &mut self.colormap.kind, &cmap_options) {
+                    if widgets::combo_box(ui, "toolbar_cmap", "", &mut self.colormap.kind, &cmap_options, &pal) {
                         self.colormap = Colormap::new(self.colormap.kind);
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("Scale:").size(13.0));
-                    widgets::combo_box(ui, "toolbar_scale", "", &mut self.scale_mode, ScaleMode::ALL);
+                    widgets::combo_box(ui, "toolbar_scale", "", &mut self.scale_mode, ScaleMode::ALL, &pal);
+                    ui.separator();
+                    // Theme selector
+                    widgets::combo_box(ui, "toolbar_theme", "", &mut self.ui_theme, widgets::UiTheme::ALL, &pal);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        ui.label(egui::RichText::new(format!("{:.1} fps", self.fps)).monospace().size(13.0).color(egui::Color32::from_rgb(79, 70, 229)));
+                        ui.label(egui::RichText::new(format!("{:.1} fps", self.fps)).monospace().size(13.0).color(pal.accent));
                         if let (Some((px, py)), Some(val)) = (self.cursor_pixel, self.cursor_value) {
                             ui.label(egui::RichText::new(format!("({}, {}) = {:.0}", px, py, val)).monospace().size(13.0));
                         }
@@ -1629,24 +1875,13 @@ impl eframe::App for ViewerApp {
                 });
             });
 
-        // Side panel
-        egui::SidePanel::left("controls")
-            .resizable(true).default_width(220.0)
-            .frame(egui::Frame::new()
-                .fill(egui::Color32::from_rgb(249, 250, 251))
-                .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
-            )
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
-            });
-
-        // Status bar
+        // Status bar — rendered before side panel so it spans the full window width
         egui::TopBottomPanel::bottom("status_bar")
             .exact_height(22.0)
             .frame(egui::Frame::new()
-                .fill(egui::Color32::from_rgb(237, 238, 242))
+                .fill(pal.statusbar_fill)
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 2 })
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(218, 220, 224)))
+                .stroke(egui::Stroke::new(1.0, pal.statusbar_border))
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
@@ -1657,18 +1892,29 @@ impl eframe::App for ViewerApp {
                         )).size(11.0).color(egui::Color32::from_rgb(220, 40, 40)).monospace());
                     } else {
                         ui.label(egui::RichText::new("Ready").size(11.0)
-                            .color(egui::Color32::from_rgb(107, 114, 128)).monospace());
+                            .color(pal.text_secondary).monospace());
                     }
                 });
             });
 
-        // Bottom tabbed panel
+        // Side panel — rendered before bottom panel so it extends full height to status bar
+        egui::SidePanel::left("controls")
+            .resizable(true).default_width(220.0)
+            .frame(egui::Frame::new()
+                .fill(pal.panel_fill)
+                .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
+            });
+
+        // Bottom tabbed panel — rendered after side panel so it only spans the image area
         egui::TopBottomPanel::bottom("bottom_panel")
             .resizable(true)
             .default_height(300.0)
             .height_range(150.0..=600.0)
             .frame(egui::Frame::new()
-                .fill(egui::Color32::from_rgb(249, 250, 251))
+                .fill(pal.panel_fill)
                 .inner_margin(egui::Margin::ZERO)
             )
             .show(ctx, |ui| {
@@ -1676,6 +1922,7 @@ impl eframe::App for ViewerApp {
                 self.bottom_panel_tabs(ui);
 
                 egui::Frame::new()
+                    .fill(pal.panel_fill)
                     .inner_margin(egui::Margin { left: 4, right: 4, top: 0, bottom: 4 })
                     .show(ui, |ui| {
                         match self.bottom_tab {
@@ -1697,8 +1944,17 @@ impl eframe::App for ViewerApp {
                     });
             });
 
+        // Update display params with current palette colors
+        self.display_params.axes_text_color = pal.axes_text;
+        self.display_params.axes_stroke_color = pal.axes_stroke;
+
         // Central panel
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new()
+                .fill(pal.image_bg)
+                .inner_margin(egui::Margin { left: 4, right: 4, top: 12, bottom: 4 })
+            )
+            .show(ctx, |ui| {
             if let Some(frame) = &self.current_frame {
                 let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;
@@ -1952,9 +2208,22 @@ fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
         DynamicImage::ImageRgb8(rgb) => rgb.pixels().map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect(),
         _ => { let gray = img.to_luma8(); gray.as_raw().iter().map(|&v| v as f32).collect() }
     };
-    let hist = compute_histogram(&mono, 256);
+    let range_max = ((1u64 << bit_depth) - 1) as f32;
+    let hist = compute_histogram(&mono, 256, 0.0, range_max);
     let (mean, stddev) = compute_stats(&mono);
     FrameData { mono, width, height, hist, mean, stddev, bit_depth }
+}
+
+/// Menu item with checkmark prefix for toggles.
+fn menu_check(ui: &mut egui::Ui, checked: bool, label: &str) -> bool {
+    let prefix = if checked { "\u{2713}  " } else { "    " };
+    ui.button(format!("{prefix}{label}")).clicked()
+}
+
+/// Menu item with dot prefix for radio-style selections.
+fn menu_radio(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+    let prefix = if selected { "\u{2022}  " } else { "    " };
+    ui.button(format!("{prefix}{label}")).clicked()
 }
 
 fn snap_floor(v: f32, step: f32) -> f32 { (v / step).floor() * step }

@@ -89,6 +89,13 @@ enum BottomTab {
     Log,
 }
 
+// ── Recording ───────────────────────────────────────────────────────────────
+
+enum RecordMsg {
+    Frame { mono: Vec<f32>, width: u32, height: u32, date_obs: String, exptime_s: f64 },
+    Stop,
+}
+
 // ── Log ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -163,6 +170,9 @@ struct ViewerApp {
     capture_state: CaptureState,
     capture_running: bool,
     recording: bool,
+    rec_tx: Option<Sender<RecordMsg>>,
+    rec_filename: String,
+    rec_frame_count: u32,
 
     sim_width: u32,
     sim_height: u32,
@@ -371,6 +381,9 @@ impl ViewerApp {
             frame_times: Vec::new(), fps: 0.0,
             camera_source, capture_state, capture_running,
             recording: false,
+            rec_tx: None,
+            rec_filename: String::new(),
+            rec_frame_count: 0,
             sim_width, sim_height, sim_bit_depth, sim_fps,
             fits_fps: 10,
             bottom_tab: BottomTab::Histogram,
@@ -453,6 +466,123 @@ impl ViewerApp {
         if self.log.len() > 500 { self.log.remove(0); }
     }
 
+    fn start_recording(&mut self) {
+        // Create data directory
+        let data_dir = std::path::PathBuf::from("data");
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            self.add_log(LogEntry::error(format!("Failed to create data/: {}", e)));
+            return;
+        }
+
+        let filename = format!("astroviewer-{}.fits", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let filepath = data_dir.join(&filename);
+
+        let (tx, rx) = bounded::<RecordMsg>(16);
+        let log_tx = self.log_tx.clone();
+        let fname = filename.clone();
+
+        thread::spawn(move || {
+            use fits4::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
+
+            let mut fits = FitsFile::with_empty_primary();
+            fits.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
+            let mut frame_count: u32 = 0;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s } => {
+                        // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
+                        let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
+                            let clamped = v.clamp(0.0, 65535.0) as u16;
+                            (clamped as i32 - 32768) as i16
+                        }).collect();
+
+                        let img = ImageData::new(
+                            vec![width as usize, height as usize],
+                            PixelData::I16(pixels_i16),
+                        );
+                        let mut hdu = Hdu::image_extension(img);
+                        hdu.header.set("BZERO", HeaderValue::Float(32768.0), Some("unsigned 16-bit offset"));
+                        hdu.header.set("BSCALE", HeaderValue::Float(1.0), Some("default scaling"));
+                        hdu.header.set("DATE-OBS", HeaderValue::String(date_obs), Some("estimated mid-exposure UTC"));
+                        hdu.header.set("EXPTIME", HeaderValue::Float(exptime_s), Some("exposure time in seconds"));
+                        fits.push_extension(hdu);
+                        frame_count += 1;
+                    }
+                    RecordMsg::Stop => break,
+                }
+            }
+
+            // Write file
+            if frame_count > 0 {
+                match fits.to_file(&filepath) {
+                    Ok(_) => {
+                        let _ = log_tx.send(LogEntry::info(
+                            format!("Recording saved: {} ({} frames)", fname, frame_count)
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = log_tx.send(LogEntry::error(
+                            format!("Failed to write {}: {}", fname, e)
+                        ));
+                    }
+                }
+            } else {
+                let _ = log_tx.send(LogEntry::info("Recording cancelled (no frames)".to_string()));
+            }
+        });
+
+        self.rec_tx = Some(tx);
+        self.rec_filename = filename.clone();
+        self.rec_frame_count = 0;
+        self.recording = true;
+        self.add_log(LogEntry::info(format!("Recording started: {}", filename)));
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(tx) = self.rec_tx.take() {
+            let _ = tx.send(RecordMsg::Stop);
+        }
+        self.recording = false;
+        self.add_log(LogEntry::info(format!(
+            "Recording stopped: {} ({} frames)", self.rec_filename, self.rec_frame_count
+        )));
+    }
+
+    fn record_frame(&mut self, frame: &FrameData) {
+        if let Some(tx) = &self.rec_tx {
+            // Estimate exposure time from camera controls (microseconds)
+            let exposure_us: f64 = {
+                #[cfg(feature = "svbony")]
+                {
+                    if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
+                        control_values.iter()
+                            .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
+                            .map(|(_, v, _)| *v as f64)
+                            .unwrap_or(0.0)
+                    } else { 0.0 }
+                }
+                #[cfg(not(feature = "svbony"))]
+                { 0.0 }
+            };
+            let exptime_s = exposure_us / 1_000_000.0;
+            // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
+            let mid = chrono::Utc::now() - chrono::Duration::microseconds((exposure_us / 2.0) as i64);
+            let date_obs = mid.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+
+            let msg = RecordMsg::Frame {
+                mono: frame.mono.clone(),
+                width: frame.width,
+                height: frame.height,
+                date_obs,
+                exptime_s,
+            };
+            if tx.try_send(msg).is_ok() {
+                self.rec_frame_count += 1;
+            }
+        }
+    }
+
     fn poll_log(&mut self) {
         while let Ok(entry) = self.log_rx.try_recv() {
             self.add_log(entry);
@@ -473,6 +603,9 @@ impl ViewerApp {
         self.frame_times.clear();
         self.fps = 0.0;
         while self.frame_rx.try_recv().is_ok() {}
+        if self.recording {
+            self.stop_recording();
+        }
     }
 
     fn start_sim(&mut self) {
@@ -659,6 +792,11 @@ impl ViewerApp {
                         }
                     }
                 }
+            }
+
+            // Record frame if recording
+            if self.recording {
+                self.record_frame(&frame);
             }
 
             self.current_frame = Some(frame);
@@ -1071,7 +1209,8 @@ impl ViewerApp {
                             let mut v = cv.1 as f32;
                             let is_exposure = caps.control_type == svbony::ControlType::Exposure;
                             if is_exposure {
-                                widgets::styled_slider_log_bare(ui, &mut v, caps.min_value.max(1) as f32..=caps.max_value as f32);
+                                let max_us = (caps.max_value as f32).min(1_000_000.0);
+                                widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=max_us);
                             } else {
                                 widgets::styled_slider_bare(ui, &mut v, caps.min_value as f32..=caps.max_value as f32);
                             }
@@ -1431,7 +1570,7 @@ impl eframe::App for ViewerApp {
                     ui.separator();
                     if self.recording {
                         let btn = ui.button(egui::RichText::new("Stop Rec").size(14.0).color(egui::Color32::from_rgb(239, 68, 68)));
-                        if btn.clicked() { self.recording = false; }
+                        if btn.clicked() { self.stop_recording(); }
                         let t = ui.input(|i| i.time);
                         let alpha = ((t * 3.0).sin() * 0.5 + 0.5) as u8 * 200 + 55;
                         ui.painter().circle_filled(
@@ -1439,7 +1578,7 @@ impl eframe::App for ViewerApp {
                             4.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, alpha),
                         );
                     } else if ui.button(egui::RichText::new("Record").size(14.0)).clicked() {
-                        self.recording = true;
+                        self.start_recording();
                     }
                     ui.separator();
                     let cmap_options: Vec<(ColormapKind, &str)> = ColormapKind::ALL.iter().map(|&k| (k, k.name())).collect();
@@ -1468,6 +1607,28 @@ impl eframe::App for ViewerApp {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
+            });
+
+        // Status bar
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(22.0)
+            .frame(egui::Frame::new()
+                .fill(egui::Color32::from_rgb(237, 238, 242))
+                .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 2 })
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(218, 220, 224)))
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if self.recording {
+                        ui.label(egui::RichText::new(format!(
+                            "Recording: {} | {} frames",
+                            self.rec_filename, self.rec_frame_count
+                        )).size(11.0).color(egui::Color32::from_rgb(220, 40, 40)).monospace());
+                    } else {
+                        ui.label(egui::RichText::new("Ready").size(11.0)
+                            .color(egui::Color32::from_rgb(107, 114, 128)).monospace());
+                    }
+                });
             });
 
         // Bottom tabbed panel

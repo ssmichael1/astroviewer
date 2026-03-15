@@ -143,7 +143,7 @@ pub fn draw_overlays(
                 let center = to_screen(*x, *y);
                 match kind {
                     MarkerKind::Crosshair => {
-                        let s = 6.0 * stroke_scale;
+                        let s = 4.5 * stroke_scale;
                         let stroke = Stroke::new(1.0 * stroke_scale, Color32::from_rgb(50, 255, 50));
                         painter.line_segment([Pos2::new(center.x - s, center.y), Pos2::new(center.x + s, center.y)], stroke);
                         painter.line_segment([Pos2::new(center.x, center.y - s), Pos2::new(center.x, center.y + s)], stroke);

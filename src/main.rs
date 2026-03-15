@@ -1,3 +1,4 @@
+mod bright_stars;
 mod colormaps;
 mod fits_source;
 mod histogram;
@@ -144,6 +145,8 @@ struct ViewerApp {
     show_centroids: bool,
     #[cfg(feature = "starsolve")]
     show_matched_stars: bool,
+    #[cfg(feature = "starsolve")]
+    show_star_names: bool,
     #[cfg(feature = "starsolve")]
     centroid_config: tetra3::CentroidExtractionConfig,
     #[cfg(feature = "starsolve")]
@@ -360,6 +363,8 @@ impl ViewerApp {
             show_centroids: false,
             #[cfg(feature = "starsolve")]
             show_matched_stars: true,
+            #[cfg(feature = "starsolve")]
+            show_star_names: true,
             #[cfg(feature = "starsolve")]
             centroid_config: tetra3::CentroidExtractionConfig::default(),
             #[cfg(feature = "starsolve")]
@@ -794,6 +799,31 @@ impl ViewerApp {
                 }
             }
 
+            // Append named bright star labels from last solve
+            #[cfg(feature = "starsolve")]
+            if self.show_star_names && self.show_matched_stars && self.show_centroids {
+                if let Some(ref result) = self.last_solve {
+                    if result.status == tetra3::SolveStatus::MatchFound {
+                        let hw = frame.width as f32 / 2.0;
+                        let hh = frame.height as f32 / 2.0;
+                        for star in bright_stars::NAMED_STARS {
+                            if let Some((px, py)) = result.world_to_pixel(star.ra_deg, star.dec_deg) {
+                                let px = px as f32;
+                                let py = py as f32;
+                                if px.abs() < hw && py.abs() < hh {
+                                    self.overlay_items.push(overlays::OverlayItem::Marker {
+                                        x: px,
+                                        y: py,
+                                        kind: overlays::MarkerKind::Label,
+                                        label: Some(star.name.to_string()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Record frame if recording
             if self.recording {
                 self.record_frame(&frame);
@@ -952,6 +982,7 @@ impl ViewerApp {
             {
                 widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids");
                 widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars");
+                widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names");
             }
         });
 

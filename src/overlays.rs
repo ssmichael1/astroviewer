@@ -41,6 +41,7 @@ pub enum MarkerKind {
     Crosshair,
     Circle(f32), // radius in pixels
     Diamond(f32),
+    Label, // text-only, no symbol
 }
 
 /// Convert tetra3rs centroid to overlay item.
@@ -165,11 +166,22 @@ pub fn draw_overlays(
                             painter.line_segment([w[0], w[1]], stroke);
                         }
                     }
+                    MarkerKind::Label => {} // text-only, no symbol drawn
                 }
                 if let Some(label) = label {
+                    let (pos, align) = match kind {
+                        MarkerKind::Label => (
+                            Pos2::new(center.x + 6.0, center.y - 6.0),
+                            egui::Align2::LEFT_BOTTOM,
+                        ),
+                        _ => (
+                            Pos2::new(center.x + 10.0, center.y),
+                            egui::Align2::LEFT_CENTER,
+                        ),
+                    };
                     painter.text(
-                        Pos2::new(center.x + 10.0, center.y),
-                        egui::Align2::LEFT_CENTER,
+                        pos,
+                        align,
                         label,
                         egui::FontId::proportional(10.0),
                         Color32::from_rgb(255, 255, 0),

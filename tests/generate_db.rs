@@ -8,10 +8,13 @@
 #[cfg(feature = "starsolve")]
 #[test]
 fn generate_solver_database() {
-    use tetra3::{GenerateDatabaseConfig, SolverDatabase};
     use std::time::Instant;
+    use tetra3::{GenerateDatabaseConfig, SolverDatabase};
 
-    let catalog_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tetra3rs/data/gaia_merged.bin");
+    let catalog_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tetra3rs/data/gaia_merged.bin"
+    );
     let output_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/data");
     let output_path = format!("{}/solver_5_40.rkyv", output_dir);
 
@@ -21,6 +24,7 @@ fn generate_solver_database() {
         max_fov_deg: 40.0,
         min_fov_deg: Some(5.0),
         epoch_proper_motion_year: Some(2025.0),
+        verification_stars_per_fov: 500,
         ..Default::default()
     };
 
@@ -42,5 +46,9 @@ fn generate_solver_database() {
     let save_time = t1.elapsed();
 
     let file_size = std::fs::metadata(&output_path).unwrap().len();
-    println!("Saved in {:.1}s, file size: {:.1} MB", save_time.as_secs_f64(), file_size as f64 / 1e6);
+    println!(
+        "Saved in {:.1}s, file size: {:.1} MB",
+        save_time.as_secs_f64(),
+        file_size as f64 / 1e6
+    );
 }

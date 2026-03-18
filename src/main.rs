@@ -1,3 +1,4 @@
+#[cfg(feature = "starsolve")]
 mod bright_stars;
 mod colormaps;
 mod fits_source;
@@ -79,6 +80,8 @@ struct SavedConfig {
     max_centroids: Option<usize>,
     local_bg_block_size: Option<u32>,
     max_elongation: Option<f32>,
+    #[serde(default)]
+    camera_model_path: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -167,6 +170,10 @@ struct ViewerApp {
     solve_rx: Option<Receiver<tetra3::SolveResult>>,
     #[cfg(feature = "starsolve")]
     last_solve: Option<tetra3::SolveResult>,
+    #[cfg(feature = "starsolve")]
+    camera_model: Option<tetra3::CameraModel>,
+    #[cfg(feature = "starsolve")]
+    camera_model_path: Option<std::path::PathBuf>,
 
     frame_times: Vec<Instant>,
     fps: f64,
@@ -363,6 +370,10 @@ impl ViewerApp {
             solve_rx: None,
             #[cfg(feature = "starsolve")]
             last_solve: None,
+            #[cfg(feature = "starsolve")]
+            camera_model: None,
+            #[cfg(feature = "starsolve")]
+            camera_model_path: None,
             frame_times: Vec::new(), fps: 0.0,
             camera_source, capture_state, capture_running,
             recording: false,
@@ -405,6 +416,7 @@ impl ViewerApp {
             max_centroids: self.centroid_config.max_centroids,
             local_bg_block_size: self.centroid_config.local_bg_block_size,
             max_elongation: self.centroid_config.max_elongation,
+            camera_model_path: self.camera_model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(Self::config_path(), json);
@@ -439,6 +451,23 @@ impl ViewerApp {
                         }
                         Err(e) => {
                             self.add_log(LogEntry::error(format!("Auto-load failed: {}", e)));
+                        }
+                    }
+                }
+
+                if !cfg.camera_model_path.is_empty() && std::path::Path::new(&cfg.camera_model_path).exists() {
+                    match tetra3::CameraModel::load_from_file(&cfg.camera_model_path) {
+                        Ok(cam) => {
+                            self.add_log(LogEntry::info(format!(
+                                "Camera model loaded: f={:.1}px, {}x{}, FOV {:.2}°",
+                                cam.focal_length_px, cam.image_width, cam.image_height, cam.fov_deg(),
+                            )));
+                            self.fov_estimate_deg = cam.fov_deg() as f32;
+                            self.camera_model = Some(cam);
+                            self.camera_model_path = Some(std::path::PathBuf::from(&cfg.camera_model_path));
+                        }
+                        Err(e) => {
+                            self.add_log(LogEntry::error(format!("Camera model load failed: {}", e)));
                         }
                     }
                 }
@@ -1397,6 +1426,37 @@ impl ViewerApp {
 
             ui.separator();
 
+            // Camera model
+            if self.camera_model.is_none() {
+                if widgets::styled_button(ui, "Load Calib...", &pal) {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Camera Model", &["rkyv"])
+                        .pick_file()
+                    {
+                        match tetra3::CameraModel::load_from_file(&path) {
+                            Ok(cam) => {
+                                self.add_log(LogEntry::info(format!(
+                                    "Camera model: f={:.1}px, {}x{}, FOV {:.2}°",
+                                    cam.focal_length_px, cam.image_width, cam.image_height, cam.fov_deg(),
+                                )));
+                                self.fov_estimate_deg = cam.fov_deg() as f32;
+                                self.camera_model = Some(cam);
+                                self.camera_model_path = Some(path);
+                            }
+                            Err(e) => self.add_log(LogEntry::error(format!("Camera model load failed: {}", e))),
+                        }
+                    }
+                }
+            } else {
+                ui.label(egui::RichText::new("Cal").color(egui::Color32::from_rgb(34, 197, 94)));
+                if widgets::styled_button(ui, "Unload", &pal) {
+                    self.camera_model = None;
+                    self.camera_model_path = None;
+                }
+            }
+
+            ui.separator();
+
             // FOV
             ui.label("FOV:");
             ui.add(egui::DragValue::new(&mut self.fov_estimate_deg)
@@ -1625,7 +1685,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
         });
 }
 
-#[cfg(any(feature = "svbony", feature = "starsolve"))]
+#[cfg(feature = "svbony")]
 fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
     ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
         ui.set_max_width(width);
@@ -1997,6 +2057,8 @@ impl ViewerApp {
             Some((2.0_f32).to_radians()) // tight once locked
         };
 
+        let camera_model = self.camera_model.clone();
+
         let (tx, rx) = bounded(1);
         self.solve_rx = Some(rx);
 
@@ -2009,6 +2071,9 @@ impl ViewerApp {
             let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
             solve_config.fov_max_error_rad = fov_max_error;
             solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
+            if let Some(cam) = camera_model {
+                solve_config.camera_model = cam;
+            }
             let result = db.solve_from_centroids(&centroids, &solve_config);
             let _ = tx.send(result);
         });

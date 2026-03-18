@@ -4,6 +4,7 @@ pub struct NamedStar {
     pub name: &'static str,
     pub ra_deg: f64,
     pub dec_deg: f64,
+    #[allow(dead_code)]
     pub mag: f32,
 }
 

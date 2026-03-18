@@ -137,6 +137,7 @@ pub fn styled_slider(
 }
 
 /// Styled logarithmic slider for f32 values (integer display).
+#[allow(dead_code)]
 pub fn styled_slider_log(
     ui: &mut egui::Ui,
     value: &mut f32,
@@ -151,6 +152,7 @@ pub fn styled_slider_log(
 }
 
 /// Styled logarithmic slider for f32 values (decimal display).
+#[allow(dead_code)]
 pub fn styled_slider_log_f(
     ui: &mut egui::Ui,
     value: &mut f32,
@@ -178,6 +180,7 @@ pub fn styled_slider_bare(
 }
 
 /// Styled logarithmic slider — no value text, fills available width.
+#[allow(dead_code)]
 pub fn styled_slider_log_bare(
     ui: &mut egui::Ui,
     value: &mut f32,

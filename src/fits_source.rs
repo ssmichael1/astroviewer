@@ -84,6 +84,27 @@ impl FitsSource {
         self.frames.len()
     }
 
+    /// Compute per-pixel percentile across all frames.
+    /// `percentile` should be in 0.0..1.0 (e.g. 0.35 for 35th percentile).
+    pub fn compute_background(&self, percentile: f32) -> Vec<f32> {
+        let npix = (self.width as usize) * (self.height as usize);
+        let nframes = self.frames.len();
+        let mut bg = vec![0.0f32; npix];
+        let mut col = vec![0.0f64; nframes];
+        let p = (percentile.clamp(0.0, 1.0) as f64) * (nframes - 1) as f64;
+        let lo = p.floor() as usize;
+        let hi = (lo + 1).min(nframes - 1);
+        let frac = p - lo as f64;
+        for i in 0..npix {
+            for (j, frame) in self.frames.iter().enumerate() {
+                col[j] = frame[i];
+            }
+            col.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            bg[i] = (col[lo] * (1.0 - frac) + col[hi] * frac) as f32;
+        }
+        bg
+    }
+
     /// Return the next frame as a DynamicImage, cycling back to the start.
     pub fn next_frame(&mut self) -> DynamicImage {
         let mono = &self.frames[self.current];

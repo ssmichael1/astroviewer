@@ -15,6 +15,8 @@ use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
 use image::DynamicImage;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -186,7 +188,7 @@ struct ViewerApp {
     sim_height: u32,
     sim_bit_depth: u8,
     sim_fps: u32,
-    fits_fps: u32,
+    fits_fps: Arc<AtomicU32>,
 
     side_panel_open: bool,
     bottom_tab: BottomTab,
@@ -196,10 +198,17 @@ struct ViewerApp {
     log_rx: Receiver<LogEntry>,
     log_tx: Sender<LogEntry>,
 
+    // Background subtraction
+    bg_subtract_enabled: bool,
+    bg_percentile: f32,
+    bg_image: Option<Vec<f32>>,
+    bg_hist_range: Option<(f32, f32)>,
+    pending_bg: Option<Receiver<Vec<f32>>>,
+
     // Async file dialog result
     pending_fits_path: Option<Receiver<Option<std::path::PathBuf>>>,
-    // Async FITS loading result
-    pending_fits_load: Option<Receiver<Result<(std::path::PathBuf, fits_source::FitsSource), String>>>,
+    // Async FITS loading result (path, source, optional background)
+    pending_fits_load: Option<Receiver<Result<(std::path::PathBuf, fits_source::FitsSource, Option<Vec<f32>>), String>>>,
 
     #[cfg(feature = "svbony")]
     discovered_cameras: Vec<svbony::CameraInfo>,
@@ -355,10 +364,15 @@ impl ViewerApp {
             rec_filename: String::new(),
             rec_frame_count: 0,
             sim_width, sim_height, sim_bit_depth, sim_fps,
-            fits_fps: 10,
+            fits_fps: Arc::new(AtomicU32::new(10)),
             side_panel_open: true,
             bottom_tab: BottomTab::Histogram,
             log, log_rx, log_tx,
+            bg_subtract_enabled: false,
+            bg_percentile: 0.35,
+            bg_image: None,
+            bg_hist_range: None,
+            pending_bg: None,
             pending_fits_path: None,
             pending_fits_load: None,
             #[cfg(feature = "svbony")]
@@ -664,6 +678,9 @@ impl ViewerApp {
 
     fn start_sim(&mut self) {
         self.stop_capture();
+        self.bg_image = None;
+        self.bg_subtract_enabled = false;
+        self.bg_hist_range = None;
         let (stop_tx, stop_rx) = bounded(1);
         start_sim_capture(self.frame_tx.clone(), stop_rx, self.sim_width, self.sim_height, self.sim_bit_depth, self.sim_fps);
         self.capture_state = CaptureState::Sim { _stop_tx: stop_tx };
@@ -682,11 +699,19 @@ impl ViewerApp {
 
         // Load in background thread to avoid freezing the UI
         let (tx, rx) = bounded(1);
+        let percentile = self.bg_percentile;
         self.pending_fits_load = Some(rx);
         std::thread::spawn(move || {
             let path_str = path.to_str().unwrap_or("").to_string();
             match fits_source::FitsSource::from_file(&path_str) {
-                Ok(source) => { let _ = tx.send(Ok((path, source))); }
+                Ok(source) => {
+                    let bg = if source.num_frames() > 1 {
+                        Some(source.compute_background(percentile))
+                    } else {
+                        None
+                    };
+                    let _ = tx.send(Ok((path, source, bg)));
+                }
                 Err(e) => { let _ = tx.send(Err(format!("{}", e))); }
             }
         });
@@ -697,13 +722,14 @@ impl ViewerApp {
             if let Ok(result) = rx.try_recv() {
                 self.pending_fits_load = None;
                 match result {
-                    Ok((path, source)) => {
+                    Ok((path, source, bg)) => {
                         let nframes = source.num_frames();
                         let w = source.width;
                         let h = source.height;
                         let bd = source.bit_depth;
+                        self.bg_image = bg;
                         let (stop_tx, stop_rx) = bounded(1);
-                        start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps);
+                        start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps.clone());
                         self.capture_state = CaptureState::Fits { _stop_tx: stop_tx };
                         self.capture_running = true;
                         self.add_log(LogEntry::info(format!(
@@ -715,6 +741,36 @@ impl ViewerApp {
                         self.add_log(LogEntry::error(format!("Failed to open FITS: {}", e)));
                     }
                 }
+            }
+        }
+    }
+
+    fn recompute_background(&mut self) {
+        let path = match &self.camera_source {
+            CameraSource::FitsFile(p) => p.clone(),
+            _ => return,
+        };
+        let percentile = self.bg_percentile;
+        let (tx, rx) = bounded(1);
+        self.pending_bg = Some(rx);
+        self.add_log(LogEntry::info(format!("Recomputing background at {:.0}%...", percentile * 100.0)));
+        std::thread::spawn(move || {
+            let path_str = path.to_str().unwrap_or("").to_string();
+            if let Ok(source) = fits_source::FitsSource::from_file(&path_str) {
+                if source.num_frames() > 1 {
+                    let _ = tx.send(source.compute_background(percentile));
+                }
+            }
+        });
+    }
+
+    fn poll_bg(&mut self) {
+        if let Some(rx) = &self.pending_bg {
+            if let Ok(bg) = rx.try_recv() {
+                self.pending_bg = None;
+                self.bg_image = Some(bg);
+                self.bg_hist_range = None;
+                self.add_log(LogEntry::info("Background recomputed".into()));
             }
         }
     }
@@ -752,7 +808,29 @@ impl ViewerApp {
                 Err(TryRecvError::Disconnected) => { self.capture_running = false; break; }
             }
         }
-        if let Some(frame) = latest {
+        if let Some(mut frame) = latest {
+            // Apply background subtraction if enabled
+            if self.bg_subtract_enabled {
+                if let Some(bg) = &self.bg_image {
+                    if bg.len() == frame.mono.len() {
+                        for (px, bg_val) in frame.mono.iter_mut().zip(bg.iter()) {
+                            *px -= bg_val;
+                        }
+                        // Recompute histogram and stats on subtracted data
+                        // Use stable range that only expands across frames
+                        let (dmin, dmax) = frame.mono.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                        let (rmin, rmax) = match self.bg_hist_range {
+                            Some((prev_min, prev_max)) => (prev_min.min(dmin), prev_max.max(dmax)),
+                            None => (dmin, dmax),
+                        };
+                        self.bg_hist_range = Some((rmin, rmax));
+                        frame.hist = compute_histogram(&frame.mono, 256, rmin, rmax);
+                        let (mean, stddev) = compute_stats(&frame.mono);
+                        frame.mean = mean;
+                        frame.stddev = stddev;
+                    }
+                }
+            }
             match self.scale_mode {
                 ScaleMode::Auto => {
                     let new_min = snap_floor(frame.hist.data_min, 100.0);
@@ -769,8 +847,13 @@ impl ViewerApp {
                     self.display_params.scale_max = zmax as f32;
                 }
                 ScaleMode::Full => {
-                    self.display_params.scale_min = 0.0;
-                    self.display_params.scale_max = ((1u64 << frame.bit_depth) - 1) as f32;
+                    if self.bg_subtract_enabled && self.bg_image.is_some() {
+                        self.display_params.scale_min = frame.hist.data_min;
+                        self.display_params.scale_max = frame.hist.data_max;
+                    } else {
+                        self.display_params.scale_min = 0.0;
+                        self.display_params.scale_max = ((1u64 << frame.bit_depth) - 1) as f32;
+                    }
                 }
                 ScaleMode::Manual => {}
             }
@@ -926,7 +1009,10 @@ impl ViewerApp {
                 }
                 CameraSource::FitsFile(_) => {
                     ui.add_space(4.0);
-                    widgets::styled_slider_u32(ui, &mut self.fits_fps, 1..=60, "Playback FPS", &pal);
+                    let mut fps = self.fits_fps.load(Ordering::Relaxed);
+                    if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
+                        self.fits_fps.store(fps, Ordering::Relaxed);
+                    }
                 }
                 #[cfg(feature = "svbony")]
                 CameraSource::SVBony(_) => {}
@@ -992,9 +1078,14 @@ impl ViewerApp {
             });
             if self.scale_mode == ScaleMode::Manual {
                 ui.add_space(4.0);
-                let max_range = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f32).unwrap_or(65535.0);
-                widgets::styled_slider(ui, &mut self.display_params.scale_min, 0.0..=max_range, "Min", &pal);
-                widgets::styled_slider(ui, &mut self.display_params.scale_max, 0.0..=max_range, "Max", &pal);
+                let (range_lo, range_hi) = if self.bg_subtract_enabled {
+                    self.bg_hist_range.unwrap_or((-1000.0, 1000.0))
+                } else {
+                    let max = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f32).unwrap_or(65535.0);
+                    (0.0, max)
+                };
+                widgets::styled_slider(ui, &mut self.display_params.scale_min, range_lo..=range_hi, "Min", &pal);
+                widgets::styled_slider(ui, &mut self.display_params.scale_max, range_lo..=range_hi, "Max", &pal);
             } else {
                 ui.label(format!("Range: {:.0} – {:.0}", self.display_params.scale_min, self.display_params.scale_max));
             }
@@ -1006,6 +1097,35 @@ impl ViewerApp {
                 widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
                 widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
                 widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
+            }
+        });
+
+        ui.add_space(4.0);
+
+        section(ui, "Background", &pal, |ui| {
+            let has_bg = self.bg_image.is_some();
+            let was_enabled = self.bg_subtract_enabled;
+            if has_bg {
+                widgets::styled_checkbox(ui, &mut self.bg_subtract_enabled, "Subtract Background", &pal);
+            } else {
+                ui.add_enabled(false, egui::Checkbox::new(&mut self.bg_subtract_enabled, "Subtract Background"));
+                ui.label(egui::RichText::new("Load a multi-frame FITS to enable").weak().small());
+            }
+            if has_bg && self.bg_subtract_enabled {
+                let old_pct = self.bg_percentile;
+                let mut pct_int = (self.bg_percentile * 100.0).round() as u32;
+                widgets::styled_slider_u32(ui, &mut pct_int, 10..=50, "Percentile", &pal);
+                self.bg_percentile = pct_int as f32 / 100.0;
+                if self.bg_percentile != old_pct {
+                    self.recompute_background();
+                }
+            }
+            if !was_enabled && self.bg_subtract_enabled {
+                self.scale_mode = ScaleMode::Auto;
+                self.bg_hist_range = None;
+            }
+            if was_enabled && !self.bg_subtract_enabled {
+                self.bg_hist_range = None;
             }
         });
 
@@ -1201,15 +1321,20 @@ impl ViewerApp {
                         if dist_min < grab_radius_data && dist_min <= dist_max { self.hist_drag = Some(HistDrag::Min); }
                         else if dist_max < grab_radius_data { self.hist_drag = Some(HistDrag::Max); }
                     }
-                    let bit_max = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f64).unwrap_or(65535.0);
+                    let (drag_lo, drag_hi) = if self.bg_subtract_enabled {
+                        self.bg_hist_range.map(|(lo, hi)| (lo as f64, hi as f64)).unwrap_or((-1000.0, 1000.0))
+                    } else {
+                        let bit_max = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f64).unwrap_or(65535.0);
+                        (0.0, bit_max)
+                    };
                     match self.hist_drag {
                         Some(HistDrag::Min) => {
                             self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_min = plot_x.max(0.0).min(self.display_params.scale_max as f64 - 1.0) as f32;
+                            self.display_params.scale_min = plot_x.max(drag_lo).min(self.display_params.scale_max as f64 - 1.0) as f32;
                         }
                         Some(HistDrag::Max) => {
                             self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_max = plot_x.max(self.display_params.scale_min as f64 + 1.0).min(bit_max) as f32;
+                            self.display_params.scale_max = plot_x.max(self.display_params.scale_min as f64 + 1.0).min(drag_hi) as f32;
                         }
                         None => {}
                     }
@@ -1681,9 +1806,10 @@ impl eframe::App for ViewerApp {
         self.poll_frame();
         self.poll_log();
         self.poll_fits_load();
+        self.poll_bg();
         self.apply_theme(ctx);
 
-        if self.capture_running || self.pending_fits_load.is_some() { ctx.request_repaint(); }
+        if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
 
         let pal = self.pal();
 
@@ -2217,11 +2343,12 @@ impl ViewerApp {
 
 // ── Sim capture ─────────────────────────────────────────────────────────────
 
-fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: fits_source::FitsSource, target_fps: u32) {
+fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: fits_source::FitsSource, target_fps: Arc<AtomicU32>) {
     let bit_depth = source.bit_depth;
     thread::spawn(move || {
-        let frame_interval = std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
         loop {
+            let fps = target_fps.load(Ordering::Relaxed).max(1);
+            let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
             let t0 = Instant::now();
             match stop_rx.try_recv() {
                 Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,

@@ -11,10 +11,7 @@ fn generate_solver_database() {
     use std::time::Instant;
     use tetra3::{GenerateDatabaseConfig, SolverDatabase};
 
-    let catalog_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tetra3rs/data/gaia_merged.bin"
-    );
+    let catalog_path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/gaia_merged.bin");
     let output_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/data");
     let output_path = format!("{}/solver_5_40.rkyv", output_dir);
 

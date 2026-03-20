@@ -157,10 +157,6 @@ struct ViewerApp {
     #[cfg(feature = "starsolve")]
     centroid_count: usize,
     #[cfg(feature = "starsolve")]
-    centroid_work_tx: Sender<(Vec<f32>, u32, u32, tetra3::CentroidExtractionConfig)>,
-    #[cfg(feature = "starsolve")]
-    centroid_result_rx: Receiver<Vec<overlays::OverlayItem>>,
-    #[cfg(feature = "starsolve")]
     solver_db: Option<std::sync::Arc<tetra3::SolverDatabase>>,
     #[cfg(feature = "starsolve")]
     solver_db_path: Option<std::path::PathBuf>,
@@ -192,6 +188,7 @@ struct ViewerApp {
     sim_fps: u32,
     fits_fps: u32,
 
+    side_panel_open: bool,
     bottom_tab: BottomTab,
 
     // Log
@@ -310,25 +307,6 @@ impl ViewerApp {
             capture_running = true;
         }
 
-        // Persistent centroid worker thread
-        #[cfg(feature = "starsolve")]
-        let (centroid_work_tx, centroid_result_rx) = {
-            let (work_tx, work_rx) = bounded::<(Vec<f32>, u32, u32, tetra3::CentroidExtractionConfig)>(1);
-            let (result_tx, result_rx) = bounded::<Vec<overlays::OverlayItem>>(1);
-            std::thread::spawn(move || {
-                while let Ok((pixels, w, h, config)) = work_rx.recv() {
-                    let items = match tetra3::extract_centroids_from_raw(&pixels, w, h, &config) {
-                        Ok(result) => result.centroids.iter()
-                            .map(overlays::centroid_to_overlay)
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    };
-                    if result_tx.send(items).is_err() { break; }
-                }
-            });
-            (work_tx, result_rx)
-        };
-
         let ui_theme = widgets::UiTheme::Light;
 
         #[allow(unused_mut)]
@@ -357,10 +335,6 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             centroid_count: 0,
             #[cfg(feature = "starsolve")]
-            centroid_work_tx: centroid_work_tx,
-            #[cfg(feature = "starsolve")]
-            centroid_result_rx: centroid_result_rx,
-            #[cfg(feature = "starsolve")]
             solver_db: None,
             #[cfg(feature = "starsolve")]
             solver_db_path: None,
@@ -382,6 +356,7 @@ impl ViewerApp {
             rec_frame_count: 0,
             sim_width, sim_height, sim_bit_depth, sim_fps,
             fits_fps: 10,
+            side_panel_open: true,
             bottom_tab: BottomTab::Histogram,
             log, log_rx, log_tx,
             pending_fits_path: None,
@@ -806,27 +781,19 @@ impl ViewerApp {
                 let dt = self.frame_times.last().unwrap().duration_since(self.frame_times[0]);
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
-            // Dispatch centroid extraction to background thread (non-blocking)
+            // Extract centroids inline (same frame, zero latency)
             #[cfg(feature = "starsolve")]
             {
-                // Poll for completed centroid results
-                if let Ok(items) = self.centroid_result_rx.try_recv() {
-                    self.centroid_count = items.len();
-                    if self.show_centroids {
-                        self.overlay_items = items;
-                    } else {
-                        self.overlay_items.clear();
-                    }
-                }
-
-                // Always run centroid extraction (needed for plate solve + count)
-                if self.centroid_work_tx.is_empty() {
-                    let _ = self.centroid_work_tx.try_send((
-                        frame.mono.clone(),
-                        frame.width,
-                        frame.height,
-                        self.centroid_config.clone(),
-                    ));
+                let items: Vec<overlays::OverlayItem> = tetra3::extract_centroids_from_raw(
+                    &frame.mono, frame.width, frame.height, &self.centroid_config,
+                )
+                .map(|result| result.centroids.iter().map(overlays::centroid_to_overlay).collect())
+                .unwrap_or_default();
+                self.centroid_count = items.len();
+                if self.show_centroids {
+                    self.overlay_items = items;
+                } else {
+                    self.overlay_items.clear();
                 }
             }
 
@@ -1720,6 +1687,14 @@ impl eframe::App for ViewerApp {
 
         let pal = self.pal();
 
+        // Keyboard shortcuts
+        if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command && !i.modifiers.ctrl) {
+            // Only toggle if no text edit is focused
+            if !ctx.wants_keyboard_input() {
+                self.side_panel_open = !self.side_panel_open;
+            }
+        }
+
         // Menu bar
         egui::TopBottomPanel::top("menu_bar")
             .frame(egui::Frame::new()
@@ -1787,6 +1762,10 @@ impl eframe::App for ViewerApp {
                                 }
                             }
                         });
+                        ui.separator();
+                        if menu_check(ui, self.side_panel_open, "Side Panel") {
+                            self.side_panel_open = !self.side_panel_open;
+                        }
                         ui.separator();
                         if menu_check(ui, self.display_params.show_axes, "Show Axes") {
                             self.display_params.show_axes = !self.display_params.show_axes;
@@ -1881,6 +1860,16 @@ impl eframe::App for ViewerApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    // Toggle side panel
+                    let sidebar_icon = if self.side_panel_open { "\u{25E8}" } else { "\u{25E7}" };
+                    let sidebar_btn = ui.add(egui::Button::new(
+                        egui::RichText::new(sidebar_icon).size(16.0)
+                    ).min_size(egui::vec2(28.0, 0.0)));
+                    if sidebar_btn.clicked() {
+                        self.side_panel_open = !self.side_panel_open;
+                    }
+                    sidebar_btn.on_hover_text("Toggle side panel (S)");
+                    ui.separator();
                     if self.capture_running {
                         if ui.button(egui::RichText::new("\u{23F9}  Stop").size(14.0)).clicked() {
                             self.stop_capture();
@@ -1958,15 +1947,17 @@ impl eframe::App for ViewerApp {
             });
 
         // Side panel — rendered before bottom panel so it extends full height to status bar
-        egui::SidePanel::left("controls")
-            .resizable(true).default_width(220.0)
-            .frame(egui::Frame::new()
-                .fill(pal.panel_fill)
-                .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
-            )
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
-            });
+        if self.side_panel_open {
+            egui::SidePanel::left("controls")
+                .resizable(true).default_width(220.0)
+                .frame(egui::Frame::new()
+                    .fill(pal.panel_fill)
+                    .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
+                )
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
+                });
+        }
 
         // Bottom tabbed panel — rendered after side panel so it only spans the image area
         egui::TopBottomPanel::bottom("bottom_panel")

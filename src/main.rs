@@ -5,7 +5,6 @@ mod fits_source;
 mod histogram;
 mod imageview;
 mod overlays;
-mod sim;
 mod widgets;
 
 #[cfg(feature = "svbony")]
@@ -23,7 +22,6 @@ use std::time::Instant;
 use colormaps::{Colormap, ColormapKind};
 use histogram::{compute_histogram, compute_stats};
 use imageview::{DisplayParams, ImageViewer};
-use sim::SimCamera;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -54,14 +52,13 @@ enum HistDrag { Min, Max }
 
 #[derive(Clone, PartialEq, Eq)]
 enum CameraSource {
-    Simulated,
+    None,
     FitsFile(std::path::PathBuf),
     #[cfg(feature = "svbony")]
     SVBony(i32),
 }
 
 enum CaptureState {
-    Sim { _stop_tx: Sender<()> },
     Fits { _stop_tx: Sender<()> },
     #[cfg(feature = "svbony")]
     SVBony {
@@ -184,10 +181,6 @@ struct ViewerApp {
     rec_filename: String,
     rec_frame_count: u32,
 
-    sim_width: u32,
-    sim_height: u32,
-    sim_bit_depth: u8,
-    sim_fps: u32,
     fits_fps: Arc<AtomicU32>,
 
     side_panel_open: bool,
@@ -256,15 +249,10 @@ impl ViewerApp {
         let (frame_tx, frame_rx) = bounded(2);
         let (log_tx, log_rx) = bounded(64);
 
-        let sim_width = 1280u32;
-        let sim_height = 960u32;
-        let sim_bit_depth = 12u8;
-        let sim_fps = 30u32;
-
         let mut log = Vec::new();
         log.push(LogEntry::info("Viewer started".to_string()));
 
-        // Try to start with an SVBony camera if available, else fall back to simulated
+        // Try to start with an SVBony camera if available
         #[cfg(feature = "svbony")]
         let discovered_cameras = camera::enumerate();
 
@@ -290,30 +278,23 @@ impl ViewerApp {
                         let msg = format!("Failed to open camera: {}", e);
                         log.push(LogEntry::error(msg.clone()));
                         camera_error = Some(msg);
-                        // Fall back to simulated
-                        let (stop_tx, stop_rx) = bounded(1);
-                        start_sim_capture(frame_tx.clone(), stop_rx, sim_width, sim_height, sim_bit_depth, sim_fps);
-                        camera_source = CameraSource::Simulated;
-                        capture_state = CaptureState::Sim { _stop_tx: stop_tx };
-                        capture_running = true;
+                        camera_source = CameraSource::None;
+                        capture_state = CaptureState::Stopped;
+                        capture_running = false;
                     }
                 }
             } else {
-                let (stop_tx, stop_rx) = bounded(1);
-                start_sim_capture(frame_tx.clone(), stop_rx, sim_width, sim_height, sim_bit_depth, sim_fps);
-                camera_source = CameraSource::Simulated;
-                capture_state = CaptureState::Sim { _stop_tx: stop_tx };
-                capture_running = true;
+                camera_source = CameraSource::None;
+                capture_state = CaptureState::Stopped;
+                capture_running = false;
             }
         }
 
         #[cfg(not(feature = "svbony"))]
         {
-            let (stop_tx, stop_rx) = bounded(1);
-            start_sim_capture(frame_tx.clone(), stop_rx, sim_width, sim_height, sim_bit_depth, sim_fps);
-            camera_source = CameraSource::Simulated;
-            capture_state = CaptureState::Sim { _stop_tx: stop_tx };
-            capture_running = true;
+            camera_source = CameraSource::None;
+            capture_state = CaptureState::Stopped;
+            capture_running = false;
         }
 
         let ui_theme = widgets::UiTheme::Light;
@@ -363,7 +344,6 @@ impl ViewerApp {
             rec_tx: None,
             rec_filename: String::new(),
             rec_frame_count: 0,
-            sim_width, sim_height, sim_bit_depth, sim_fps,
             fits_fps: Arc::new(AtomicU32::new(10)),
             side_panel_open: true,
             bottom_tab: BottomTab::Histogram,
@@ -655,7 +635,6 @@ impl ViewerApp {
 
     fn stop_capture(&mut self) {
         match std::mem::replace(&mut self.capture_state, CaptureState::Stopped) {
-            CaptureState::Sim { _stop_tx } => {}
             CaptureState::Fits { _stop_tx } => {}
             #[cfg(feature = "svbony")]
             CaptureState::SVBony { mut handle, .. } => {
@@ -674,19 +653,6 @@ impl ViewerApp {
         if self.recording {
             self.stop_recording();
         }
-    }
-
-    fn start_sim(&mut self) {
-        self.stop_capture();
-        self.bg_image = None;
-        self.bg_subtract_enabled = false;
-        self.bg_hist_range = None;
-        let (stop_tx, stop_rx) = bounded(1);
-        start_sim_capture(self.frame_tx.clone(), stop_rx, self.sim_width, self.sim_height, self.sim_bit_depth, self.sim_fps);
-        self.capture_state = CaptureState::Sim { _stop_tx: stop_tx };
-        self.camera_source = CameraSource::Simulated;
-        self.capture_running = true;
-        self.add_log(LogEntry::info("Simulated camera started".to_string()));
     }
 
     fn start_fits(&mut self, path: std::path::PathBuf) {
@@ -974,7 +940,7 @@ impl ViewerApp {
         section(ui, "Camera", &pal, |ui| {
             // Current source status line
             let source_label = match &self.camera_source {
-                CameraSource::Simulated => "Simulated".to_string(),
+                CameraSource::None => "No source".to_string(),
                 CameraSource::FitsFile(path) => {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     format!("FITS: {}", name)
@@ -996,17 +962,7 @@ impl ViewerApp {
 
             // Source-specific settings
             match &self.camera_source {
-                CameraSource::Simulated => {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut self.sim_width).range(64..=4096).speed(8).prefix("W: "));
-                        ui.add(egui::DragValue::new(&mut self.sim_height).range(64..=4096).speed(8).prefix("H: "));
-                    });
-                    widgets::combo_box(ui, "bit_depth", "Bit depth:", &mut self.sim_bit_depth, &[
-                        (8, "8"), (12, "12"), (14, "14"), (16, "16"),
-                    ], &pal);
-                    widgets::styled_slider_u32(ui, &mut self.sim_fps, 1..=60, "FPS", &pal);
-                }
+                CameraSource::None => {}
                 CameraSource::FitsFile(_) => {
                     ui.add_space(4.0);
                     let mut fps = self.fits_fps.load(Ordering::Relaxed);
@@ -1924,7 +1880,7 @@ impl eframe::App for ViewerApp {
                         } else {
                             if ui.button("Play").clicked() {
                                 match &self.camera_source.clone() {
-                                    CameraSource::Simulated => self.start_sim(),
+                                    CameraSource::None => {}
                                     CameraSource::FitsFile(path) => {
                                         let path = path.clone();
                                         self.start_fits(path);
@@ -1939,12 +1895,6 @@ impl eframe::App for ViewerApp {
                                 }
                                 ui.close_menu();
                             }
-                        }
-                        ui.separator();
-                        let is_sim = matches!(self.camera_source, CameraSource::Simulated);
-                        if menu_radio(ui, is_sim, "Simulated") && !is_sim {
-                            self.start_sim();
-                            ui.close_menu();
                         }
                         #[cfg(feature = "svbony")]
                         {
@@ -2002,7 +1952,7 @@ impl eframe::App for ViewerApp {
                         }
                     } else if ui.button(egui::RichText::new("\u{25B6}  Play").size(14.0)).clicked() {
                         match &self.camera_source.clone() {
-                            CameraSource::Simulated => self.start_sim(),
+                            CameraSource::None => {}
                             CameraSource::FitsFile(path) => {
                                 let path = path.clone();
                                 self.start_fits(path);
@@ -2355,25 +2305,6 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
             let img = source.next_frame();
-            let frame_data = process_image(img, bit_depth);
-            if tx.try_send(frame_data).is_err() && tx.is_empty() { break; }
-            let elapsed = t0.elapsed();
-            if elapsed < frame_interval { thread::sleep(frame_interval - elapsed); }
-        }
-    });
-}
-
-fn start_sim_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, width: u32, height: u32, bit_depth: u8, target_fps: u32) {
-    thread::spawn(move || {
-        let mut cam = SimCamera::new(width, height, bit_depth);
-        let frame_interval = std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
-        loop {
-            let t0 = Instant::now();
-            match stop_rx.try_recv() {
-                Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                Err(crossbeam_channel::TryRecvError::Empty) => {}
-            }
-            let img = cam.next_frame();
             let frame_data = process_image(img, bit_depth);
             if tx.try_send(frame_data).is_err() && tx.is_empty() { break; }
             let elapsed = t0.elapsed();

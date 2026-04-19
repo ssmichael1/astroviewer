@@ -81,7 +81,14 @@ struct SavedConfig {
     max_elongation: Option<f32>,
     #[serde(default)]
     camera_model_path: String,
+    #[serde(default = "default_snr_min")]
+    snr_min: Option<f32>,
+    #[serde(default)]
+    matched_filter_sigma: Option<f32>,
 }
+
+#[cfg(feature = "starsolve")]
+fn default_snr_min() -> Option<f32> { Some(5.0) }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
@@ -155,6 +162,8 @@ struct ViewerApp {
     centroid_config: tetra3::CentroidExtractionConfig,
     #[cfg(feature = "starsolve")]
     centroid_count: usize,
+    #[cfg(feature = "starsolve")]
+    centroid_time_ms: f32,
     #[cfg(feature = "starsolve")]
     solver_db: Option<std::sync::Arc<tetra3::SolverDatabase>>,
     #[cfg(feature = "starsolve")]
@@ -325,6 +334,8 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             centroid_count: 0,
             #[cfg(feature = "starsolve")]
+            centroid_time_ms: 0.0,
+            #[cfg(feature = "starsolve")]
             solver_db: None,
             #[cfg(feature = "starsolve")]
             solver_db_path: None,
@@ -386,6 +397,8 @@ impl ViewerApp {
             local_bg_block_size: self.centroid_config.local_bg_block_size,
             max_elongation: self.centroid_config.max_elongation,
             camera_model_path: self.camera_model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            snr_min: self.centroid_config.snr_min,
+            matched_filter_sigma: self.centroid_config.matched_filter_sigma,
         };
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(Self::config_path(), json);
@@ -406,6 +419,8 @@ impl ViewerApp {
                 self.centroid_config.max_centroids = cfg.max_centroids;
                 self.centroid_config.local_bg_block_size = cfg.local_bg_block_size;
                 self.centroid_config.max_elongation = cfg.max_elongation;
+                self.centroid_config.snr_min = cfg.snr_min;
+                self.centroid_config.matched_filter_sigma = cfg.matched_filter_sigma;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
                     self.add_log(LogEntry::info(format!("Auto-loading database: {}", cfg.solver_db_path)));
@@ -830,25 +845,26 @@ impl ViewerApp {
                 let dt = self.frame_times.last().unwrap().duration_since(self.frame_times[0]);
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
-            // Extract centroids inline (same frame, zero latency)
+            // Extract centroids inline (same frame, zero latency) and reuse for solve.
             #[cfg(feature = "starsolve")]
             {
-                let items: Vec<overlays::OverlayItem> = tetra3::extract_centroids_from_raw(
+                let t0 = Instant::now();
+                let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
                     &frame.mono, frame.width, frame.height, &self.centroid_config,
                 )
-                .map(|result| result.centroids.iter().map(overlays::centroid_to_overlay).collect())
+                .map(|result| result.centroids)
                 .unwrap_or_default();
-                self.centroid_count = items.len();
+                self.centroid_time_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                self.centroid_count = centroids.len();
                 if self.show_centroids {
-                    self.overlay_items = items;
+                    self.overlay_items = centroids.iter().map(overlays::centroid_to_overlay).collect();
                 } else {
                     self.overlay_items.clear();
                 }
-            }
 
-            // Auto plate-solve if database is loaded
-            #[cfg(feature = "starsolve")]
-            self.maybe_auto_solve(&frame);
+                // Auto plate-solve if database is loaded
+                self.maybe_auto_solve(centroids, frame.width, frame.height);
+            }
 
             // Poll solve result
             #[cfg(feature = "starsolve")]
@@ -1557,7 +1573,7 @@ impl ViewerApp {
 
         // Row 1
         ui.horizontal(|ui| {
-            fixed_label(ui, format!("SNR {:.1}", self.centroid_config.sigma_threshold));
+            fixed_label(ui, format!("Pix σ {:.1}", self.centroid_config.sigma_threshold));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0, &pal);
             });
@@ -1588,7 +1604,7 @@ impl ViewerApp {
             self.centroid_config.max_centroids = if (v as usize) == 0 { None } else { Some(v.round() as usize) };
 
             let mut v = self.centroid_config.local_bg_block_size.unwrap_or(0) as f32;
-            let lbl = if self.centroid_config.local_bg_block_size.is_none() { "BG global".into() } else { format!("BG {}", v.round() as u32) };
+            let lbl = if self.centroid_config.local_bg_block_size.is_none() { "Global BG".into() } else { format!("BG tile {} px", v.round() as u32) };
             fixed_label(ui, lbl);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0, &pal);
@@ -1602,6 +1618,25 @@ impl ViewerApp {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0, &pal);
             });
             self.centroid_config.max_elongation = if v < 0.5 { None } else { Some(v) };
+        });
+
+        // Row 3: SNR min and matched-filter σ (new in tetra3 0.6)
+        ui.horizontal(|ui| {
+            let mut v = self.centroid_config.snr_min.unwrap_or(0.0);
+            let lbl = if self.centroid_config.snr_min.is_none() { "SNR off".into() } else { format!("SNR {:.1}", v) };
+            fixed_label(ui, lbl);
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=15.0, &pal);
+            });
+            self.centroid_config.snr_min = if v < 0.5 { None } else { Some(v) };
+
+            let mut v = self.centroid_config.matched_filter_sigma.unwrap_or(0.0);
+            let lbl = if self.centroid_config.matched_filter_sigma.is_none() { "Blur off".into() } else { format!("Blur σ {:.1}", v) };
+            fixed_label(ui, lbl);
+            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
+            });
+            self.centroid_config.matched_filter_sigma = if v < 0.1 { None } else { Some(v) };
         });
 
         // ── Solve results ───────────────────────────────────────────────────
@@ -1646,6 +1681,9 @@ impl ViewerApp {
                         ui.label(egui::RichText::new(format!("{:.1}\"", rmse.to_degrees() * 3600.0)).font(mono.clone()));
                         ui.add_space(sp);
                     }
+                    ui.label(egui::RichText::new("Extract").color(dim));
+                    ui.label(egui::RichText::new(format!("{:.0}ms", self.centroid_time_ms)).font(mono.clone()));
+                    ui.add_space(sp);
                     ui.label(egui::RichText::new("Solve").color(dim));
                     ui.label(egui::RichText::new(format!("{:.0}ms", result.solve_time_ms)).font(mono));
                 });
@@ -2098,31 +2136,33 @@ impl eframe::App for ViewerApp {
 
 impl ViewerApp {
     /// Auto-solve: dispatch to background thread if DB loaded and not already solving.
-    /// Called from poll_frame on each new frame.
+    /// Called from poll_frame on each new frame. Takes ownership of the centroids
+    /// already extracted for overlay display, so we don't re-extract or clone pixels.
     #[cfg(feature = "starsolve")]
-    fn maybe_auto_solve(&mut self, frame: &FrameData) {
+    fn maybe_auto_solve(&mut self, centroids: Vec<tetra3::Centroid>, w: u32, h: u32) {
         // Only if DB loaded and not already solving
         if self.solver_db.is_none() || self.solve_rx.is_some() {
             return;
         }
 
         let db = self.solver_db.as_ref().unwrap().clone();
-        let pixels: Vec<f32> = frame.mono.clone();
-        let w = frame.width;
-        let h = frame.height;
-        let config = self.centroid_config.clone();
 
         // Use previous solve's FOV if available, otherwise user estimate
+        let prev_locked = self.last_solve.as_ref()
+            .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound);
         let fov_rad = self.last_solve.as_ref()
             .and_then(|s| s.fov_rad)
             .unwrap_or_else(|| (self.fov_estimate_deg as f32).to_radians());
 
         // Wide FOV tolerance for initial solve, tight once we have a lock
-        let fov_max_error = if self.last_solve.as_ref().map_or(true, |s| s.status != tetra3::SolveStatus::MatchFound) {
-            Some((10.0_f32).to_radians()) // wide search initially
+        let fov_max_error = if prev_locked {
+            Some((2.0_f32).to_radians())
         } else {
-            Some((2.0_f32).to_radians()) // tight once locked
+            Some((10.0_f32).to_radians())
         };
+
+        // Seed tracking-mode solve with previous attitude when locked.
+        let attitude_hint = self.last_solve.as_ref().and_then(|s| s.qicrs2cam);
 
         let camera_model = self.camera_model.clone();
 
@@ -2130,16 +2170,15 @@ impl ViewerApp {
         self.solve_rx = Some(rx);
 
         std::thread::spawn(move || {
-            let centroids = match tetra3::extract_centroids_from_raw(&pixels, w, h, &config) {
-                Ok(r) => r.centroids,
-                Err(_) => return,
-            };
-
             let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
             solve_config.fov_max_error_rad = fov_max_error;
             solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
             if let Some(cam) = camera_model {
                 solve_config.camera_model = cam;
+            }
+            if let Some(q) = attitude_hint {
+                solve_config.attitude_hint = Some(q);
+                solve_config.hint_uncertainty_rad = 2.0_f32.to_radians();
             }
             let result = db.solve_from_centroids(&centroids, &solve_config);
             let _ = tx.send(result);

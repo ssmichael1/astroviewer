@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use fits4::{FitsFile, HduData};
+use fitskit::{FitsFile, HduData};
 use image::{DynamicImage, ImageBuffer, Luma};
 
 /// A FITS-file-based image source that cycles through frames.

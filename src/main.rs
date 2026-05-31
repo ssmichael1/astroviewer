@@ -18,10 +18,69 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Instant;
+#[cfg(feature = "starsolve")]
+use cpu_time::ThreadTime;
 
 use colormaps::{Colormap, ColormapKind};
 use histogram::{compute_histogram, compute_stats};
 use imageview::{DisplayParams, ImageViewer};
+
+// ── Plate-solve worker ────────────────────────────────────────────────────────
+
+/// A single plate-solve job handed to the dedicated solver thread.
+#[cfg(feature = "starsolve")]
+struct SolveRequest {
+    db: Arc<tetra3::SolverDatabase>,
+    centroids: Vec<tetra3::Centroid>,
+    config: tetra3::SolveConfig,
+}
+
+/// Raise the calling thread's scheduling priority so the solver isn't preempted
+/// by the user-interactive egui UI thread under load. macOS-only; no-op elsewhere.
+#[cfg(feature = "starsolve")]
+fn raise_solver_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: a plain libc call with no preconditions; ignores the return code
+    // because failing to raise priority is non-fatal (the solve just runs slower).
+    unsafe {
+        // USER_INITIATED == "the user is actively waiting for this result": high
+        // priority, one tier below the UI thread's USER_INTERACTIVE.
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
+/// Spawn the long-lived solver thread once. It blocks on the request channel,
+/// runs one solve at a time, and returns results on the result channel.
+///
+/// The solver runs here — on its own dedicated thread — rather than on the UI
+/// thread (a multi-hundred-ms solve would freeze egui) or the capture thread
+/// (it would stall frame acquisition). Both channels are `bounded(1)`: the UI
+/// only ever cares about the newest frame, so stale requests are dropped rather
+/// than queued.
+#[cfg(feature = "starsolve")]
+fn spawn_solver_worker() -> (Sender<SolveRequest>, Receiver<tetra3::SolveResult>) {
+    let (req_tx, req_rx) = bounded::<SolveRequest>(1);
+    let (res_tx, res_rx) = bounded::<tetra3::SolveResult>(1);
+    thread::Builder::new()
+        .name("solver".into())
+        .spawn(move || {
+            raise_solver_priority();
+            while let Ok(req) = req_rx.recv() {
+                // Measure this thread's CPU time around the solve so the reported
+                // number reflects actual compute, not wall-clock scheduling delay.
+                // The library's internal (wall-clock) timeout still bounds runtime;
+                // we only override the value used for display.
+                let cpu0 = ThreadTime::now();
+                let mut result = req.db.solve_from_centroids(&req.centroids, &req.config);
+                result.solve_time_ms = cpu0.elapsed().as_secs_f32() * 1000.0;
+                if res_tx.send(result).is_err() {
+                    break; // UI gone — shut the worker down
+                }
+            }
+        })
+        .expect("failed to spawn solver thread");
+    (req_tx, res_rx)
+}
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
@@ -166,7 +225,11 @@ struct ViewerApp {
     #[cfg(feature = "starsolve")]
     fov_estimate_deg: f32,
     #[cfg(feature = "starsolve")]
-    solve_rx: Option<Receiver<tetra3::SolveResult>>,
+    solve_req_tx: Sender<SolveRequest>,
+    #[cfg(feature = "starsolve")]
+    solve_result_rx: Receiver<tetra3::SolveResult>,
+    #[cfg(feature = "starsolve")]
+    solve_inflight: bool,
     #[cfg(feature = "starsolve")]
     last_solve: Option<tetra3::SolveResult>,
     #[cfg(feature = "starsolve")]
@@ -303,6 +366,9 @@ impl ViewerApp {
 
         let ui_theme = widgets::UiTheme::Light;
 
+        #[cfg(feature = "starsolve")]
+        let (solve_req_tx, solve_result_rx) = spawn_solver_worker();
+
         #[allow(unused_mut)]
         let mut app = Self {
             frame_tx, frame_rx,
@@ -337,7 +403,11 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             fov_estimate_deg: 15.0,
             #[cfg(feature = "starsolve")]
-            solve_rx: None,
+            solve_req_tx,
+            #[cfg(feature = "starsolve")]
+            solve_result_rx,
+            #[cfg(feature = "starsolve")]
+            solve_inflight: false,
             #[cfg(feature = "starsolve")]
             last_solve: None,
             #[cfg(feature = "starsolve")]
@@ -534,7 +604,7 @@ impl ViewerApp {
         let fname = filename.clone();
 
         thread::spawn(move || {
-            use fits4::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
+            use fitskit::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
 
             let mut fits = FitsFile::with_empty_primary();
             fits.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
@@ -841,13 +911,15 @@ impl ViewerApp {
             // Extract centroids inline (same frame, zero latency) and reuse for solve.
             #[cfg(feature = "starsolve")]
             {
-                let t0 = Instant::now();
+                // Thread-CPU time, not wall-clock, so the displayed extract cost
+                // isn't inflated by this (busy) UI thread being descheduled.
+                let cpu0 = ThreadTime::now();
                 let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
                     &frame.mono, frame.width, frame.height, &self.centroid_config,
                 )
                 .map(|result| result.centroids)
                 .unwrap_or_default();
-                self.centroid_time_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                self.centroid_time_ms = cpu0.elapsed().as_secs_f32() * 1000.0;
                 self.centroid_count = centroids.len();
                 if self.show_centroids {
                     self.overlay_items = centroids.iter().map(overlays::centroid_to_overlay).collect();
@@ -859,19 +931,17 @@ impl ViewerApp {
                 self.maybe_auto_solve(centroids, frame.width, frame.height);
             }
 
-            // Poll solve result
+            // Poll solve result from the dedicated solver thread
             #[cfg(feature = "starsolve")]
-            if let Some(rx) = &self.solve_rx {
-                if let Ok(result) = rx.try_recv() {
-                    // Update FOV estimate from successful solve
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        if let Some(fov) = result.fov_rad {
-                            self.fov_estimate_deg = fov.to_degrees();
-                        }
+            if let Ok(result) = self.solve_result_rx.try_recv() {
+                self.solve_inflight = false;
+                // Update FOV estimate from successful solve
+                if result.status == tetra3::SolveStatus::MatchFound {
+                    if let Some(fov) = result.fov_rad {
+                        self.fov_estimate_deg = fov.to_degrees();
                     }
-                    self.last_solve = Some(result);
-                    self.solve_rx = None;
                 }
+                self.last_solve = Some(result);
             }
 
             // Append matched star markers from last solve (every frame)
@@ -1524,7 +1594,7 @@ impl ViewerApp {
             // Solve status
             if self.solver_db.is_some() {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(75.0, 18.0), egui::Sense::hover());
-                let (text, color) = if self.solve_rx.is_some() {
+                let (text, color) = if self.solve_inflight {
                     ("Solving...", egui::Color32::from_rgb(217, 119, 6))
                 } else if self.last_solve.as_ref().map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound) {
                     ("Locked", egui::Color32::from_rgb(34, 197, 94))
@@ -2126,8 +2196,9 @@ impl ViewerApp {
     /// already extracted for overlay display, so we don't re-extract or clone pixels.
     #[cfg(feature = "starsolve")]
     fn maybe_auto_solve(&mut self, centroids: Vec<tetra3::Centroid>, w: u32, h: u32) {
-        // Only if DB loaded and not already solving
-        if self.solver_db.is_none() || self.solve_rx.is_some() {
+        // Only if DB loaded and the solver thread isn't already busy. Skipping
+        // here (rather than queuing) keeps us solving the freshest frame.
+        if self.solver_db.is_none() || self.solve_inflight {
             return;
         }
 
@@ -2150,25 +2221,22 @@ impl ViewerApp {
         // Seed tracking-mode solve with previous attitude when locked.
         let attitude_hint = self.last_solve.as_ref().and_then(|s| s.qicrs2cam);
 
-        let camera_model = self.camera_model.clone();
+        let mut config = tetra3::SolveConfig::new(fov_rad, w, h);
+        config.fov_max_error_rad = fov_max_error;
+        config.solve_timeout_ms = Some(2000); // fast timeout for live use
+        if let Some(cam) = self.camera_model.clone() {
+            config.camera_model = cam;
+        }
+        if let Some(q) = attitude_hint {
+            config.attitude_hint = Some(q);
+            config.hint_uncertainty_rad = 2.0_f32.to_radians();
+        }
 
-        let (tx, rx) = bounded(1);
-        self.solve_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
-            solve_config.fov_max_error_rad = fov_max_error;
-            solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
-            if let Some(cam) = camera_model {
-                solve_config.camera_model = cam;
-            }
-            if let Some(q) = attitude_hint {
-                solve_config.attitude_hint = Some(q);
-                solve_config.hint_uncertainty_rad = 2.0_f32.to_radians();
-            }
-            let result = db.solve_from_centroids(&centroids, &solve_config);
-            let _ = tx.send(result);
-        });
+        // Hand the job to the dedicated solver thread. If the channel is full the
+        // worker is still busy with a prior frame — drop this one rather than wait.
+        if self.solve_req_tx.try_send(SolveRequest { db, centroids, config }).is_ok() {
+            self.solve_inflight = true;
+        }
     }
 
 

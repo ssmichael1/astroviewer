@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
-egui_plot = "0.31"
+eframe = "0.34"
+egui = "0.34"
+egui_plot = "0.35"
 image = "0.25"
 anyhow = "1"
 tracing = "0.1"
@@ -17,9 +17,12 @@ dirs = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fits4 = { path = "../fits4" }
-rfd = "0.15"
+rfd = "0.17.2"
 svbony = { version = "0.1", features = ["image"], optional = true }
-tetra3 = { path = "../tetra3rs", features = ["image"], optional = true }
+tetra3 = { version = "0.7.2", path = "../tetra3rs", features = [
+    "image",
+], optional = true }
+# tetra3 = { version = "0.7.2", features = ["image"], optional = true }
 
 [features]
 default = []

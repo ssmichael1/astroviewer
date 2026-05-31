@@ -81,14 +81,9 @@ struct SavedConfig {
     max_elongation: Option<f32>,
     #[serde(default)]
     camera_model_path: String,
-    #[serde(default = "default_snr_min")]
-    snr_min: Option<f32>,
     #[serde(default)]
     matched_filter_sigma: Option<f32>,
 }
-
-#[cfg(feature = "starsolve")]
-fn default_snr_min() -> Option<f32> { Some(5.0) }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
@@ -238,7 +233,7 @@ impl ViewerApp {
         cc.egui_ctx.set_fonts(fonts);
 
         // Theme
-        let mut style = (*cc.egui_ctx.style()).clone();
+        let mut style = (*cc.egui_ctx.global_style()).clone();
         style.text_styles.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
         style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(15.0, egui::FontFamily::Proportional));
         style.text_styles.insert(egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Proportional));
@@ -253,7 +248,7 @@ impl ViewerApp {
         style.spacing.combo_width = 110.0;
 
         // Theme colors are applied each frame by apply_theme()
-        cc.egui_ctx.set_style(style);
+        cc.egui_ctx.set_global_style(style);
 
         let (frame_tx, frame_rx) = bounded(2);
         let (log_tx, log_rx) = bounded(64);
@@ -397,7 +392,6 @@ impl ViewerApp {
             local_bg_block_size: self.centroid_config.local_bg_block_size,
             max_elongation: self.centroid_config.max_elongation,
             camera_model_path: self.camera_model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-            snr_min: self.centroid_config.snr_min,
             matched_filter_sigma: self.centroid_config.matched_filter_sigma,
         };
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
@@ -419,7 +413,6 @@ impl ViewerApp {
                 self.centroid_config.max_centroids = cfg.max_centroids;
                 self.centroid_config.local_bg_block_size = cfg.local_bg_block_size;
                 self.centroid_config.max_elongation = cfg.max_elongation;
-                self.centroid_config.snr_min = cfg.snr_min;
                 self.centroid_config.matched_filter_sigma = cfg.matched_filter_sigma;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
@@ -471,7 +464,7 @@ impl ViewerApp {
     fn apply_theme(&self, ctx: &egui::Context) {
         let pal = self.pal();
         let is_night = self.ui_theme == widgets::UiTheme::Night;
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
 
         let r = egui::CornerRadius::same(6);
         style.visuals.dark_mode = is_night;
@@ -522,7 +515,7 @@ impl ViewerApp {
             offset: [0, 4], blur: 12, spread: 0,
             color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 15),
         };
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 
     fn start_recording(&mut self) {
@@ -1237,7 +1230,7 @@ impl ViewerApp {
                 .show(ui, |plot_ui| {
                     let line_points: egui_plot::PlotPoints = line_vec.into();
                     plot_ui.line(
-                        egui_plot::Line::new(line_points)
+                        egui_plot::Line::new("histogram", line_points)
                             .color(pal.plot_line)
                             .width(1.5)
                             .fill(0.0)
@@ -1267,14 +1260,14 @@ impl ViewerApp {
                         } else {
                             (egui::Color32::from_rgba_unmultiplied(220, 50, 50, 200), 3.0)
                         };
-                        plot_ui.vline(egui_plot::VLine::new(smin).color(min_c).width(min_w).style(egui_plot::LineStyle::Solid));
+                        plot_ui.vline(egui_plot::VLine::new("scale_min", smin).color(min_c).width(min_w).style(egui_plot::LineStyle::Solid));
 
                         let (max_c, max_w) = if near_max {
                             (egui::Color32::from_rgb(96, 165, 250), 4.0)
                         } else {
                             (egui::Color32::from_rgba_unmultiplied(59, 130, 246, 200), 3.0)
                         };
-                        plot_ui.vline(egui_plot::VLine::new(smax).color(max_c).width(max_w).style(egui_plot::LineStyle::Solid));
+                        plot_ui.vline(egui_plot::VLine::new("scale_max", smax).color(max_c).width(max_w).style(egui_plot::LineStyle::Solid));
                     }
                 });
 
@@ -1462,7 +1455,7 @@ impl ViewerApp {
             if self.solver_db.is_none() {
                 if widgets::styled_button(ui, "Load Database...", &pal) {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Database", &["rkyv"])
+                        .add_filter("Database", &["bin"])
                         .pick_file()
                     {
                         self.add_log(LogEntry::info(format!("Loading database: {}...", path.display())));
@@ -1494,7 +1487,7 @@ impl ViewerApp {
             if self.camera_model.is_none() {
                 if widgets::styled_button(ui, "Load Calib...", &pal) {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Camera Model", &["rkyv"])
+                        .add_filter("Camera Model", &["bin"])
                         .pick_file()
                     {
                         match tetra3::CameraModel::load_from_file(&path) {
@@ -1620,16 +1613,8 @@ impl ViewerApp {
             self.centroid_config.max_elongation = if v < 0.5 { None } else { Some(v) };
         });
 
-        // Row 3: SNR min and matched-filter σ (new in tetra3 0.6)
+        // Row 3
         ui.horizontal(|ui| {
-            let mut v = self.centroid_config.snr_min.unwrap_or(0.0);
-            let lbl = if self.centroid_config.snr_min.is_none() { "SNR off".into() } else { format!("SNR {:.1}", v) };
-            fixed_label(ui, lbl);
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=15.0, &pal);
-            });
-            self.centroid_config.snr_min = if v < 0.5 { None } else { Some(v) };
-
             let mut v = self.centroid_config.matched_filter_sigma.unwrap_or(0.0);
             let lbl = if self.centroid_config.matched_filter_sigma.is_none() { "Blur off".into() } else { format!("Blur σ {:.1}", v) };
             fixed_label(ui, lbl);
@@ -1790,18 +1775,19 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str) {
 // ── Main update loop ────────────────────────────────────────────────────────
 
 impl eframe::App for ViewerApp {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.stop_capture();
         #[cfg(feature = "starsolve")]
         self.save_config();
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.poll_frame();
         self.poll_log();
         self.poll_fits_load();
         self.poll_bg();
-        self.apply_theme(ctx);
+        self.apply_theme(&ctx);
 
         if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
 
@@ -1810,20 +1796,20 @@ impl eframe::App for ViewerApp {
         // Keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command && !i.modifiers.ctrl) {
             // Only toggle if no text edit is focused
-            if !ctx.wants_keyboard_input() {
+            if !ctx.egui_wants_keyboard_input() {
                 self.side_panel_open = !self.side_panel_open;
             }
         }
 
         // Menu bar
-        egui::TopBottomPanel::top("menu_bar")
+        egui::Panel::top("menu_bar")
             .frame(egui::Frame::new()
                 .fill(pal.toolbar_fill)
                 .inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 2 })
                 .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
             )
-            .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
+            .show_inside(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
                     // ── File ────────────────────────────────────────────
                     ui.menu_button("File", |ui| {
                         let dialog_pending = self.pending_fits_path.is_some();
@@ -1836,18 +1822,18 @@ impl eframe::App for ViewerApp {
                                     .pick_file();
                                 let _ = tx.send(result);
                             });
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if self.recording {
                             if ui.button("Stop Recording").clicked() {
                                 self.stop_recording();
-                                ui.close_menu();
+                                ui.close();
                             }
                         } else {
                             if ui.button("Start Recording").clicked() {
                                 self.start_recording();
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                         ui.separator();
@@ -1862,7 +1848,7 @@ impl eframe::App for ViewerApp {
                             for &kind in ColormapKind::ALL {
                                 if menu_radio(ui, self.colormap.kind == kind, kind.name()) {
                                     self.colormap = Colormap::new(kind);
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1870,7 +1856,7 @@ impl eframe::App for ViewerApp {
                             for &(mode, name) in ScaleMode::ALL {
                                 if menu_radio(ui, self.scale_mode == mode, name) {
                                     self.scale_mode = mode;
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1878,7 +1864,7 @@ impl eframe::App for ViewerApp {
                             for &(tf, name) in imageview::TransferFn::ALL {
                                 if menu_radio(ui, self.display_params.transfer == tf, name) {
                                     self.display_params.transfer = tf;
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         });
@@ -1913,7 +1899,7 @@ impl eframe::App for ViewerApp {
                         if self.capture_running {
                             if ui.button("Stop").clicked() {
                                 self.stop_capture();
-                                ui.close_menu();
+                                ui.close();
                             }
                         } else {
                             if ui.button("Play").clicked() {
@@ -1931,7 +1917,7 @@ impl eframe::App for ViewerApp {
                                         }
                                     }
                                 }
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                         #[cfg(feature = "svbony")]
@@ -1945,7 +1931,7 @@ impl eframe::App for ViewerApp {
                                 let label = format!("{} ({})", cam_info.name, cam_info.serial);
                                 if menu_radio(ui, is_this, &label) && !is_this {
                                     self.start_svbony(cam_info);
-                                    ui.close_menu();
+                                    ui.close();
                                 }
                             }
                         }
@@ -1956,7 +1942,7 @@ impl eframe::App for ViewerApp {
                         for &(theme, name) in widgets::UiTheme::ALL {
                             if menu_radio(ui, self.ui_theme == theme, name) {
                                 self.ui_theme = theme;
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
@@ -1964,14 +1950,14 @@ impl eframe::App for ViewerApp {
             });
 
         // Top toolbar
-        egui::TopBottomPanel::top("toolbar")
-            .exact_height(38.0)
+        egui::Panel::top("toolbar")
+            .exact_size(38.0)
             .frame(egui::Frame::new()
                 .fill(pal.toolbar_fill)
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 6 })
                 .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     // Toggle side panel
@@ -2039,14 +2025,14 @@ impl eframe::App for ViewerApp {
             });
 
         // Status bar — rendered before side panel so it spans the full window width
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(22.0)
+        egui::Panel::bottom("status_bar")
+            .exact_size(22.0)
             .frame(egui::Frame::new()
                 .fill(pal.statusbar_fill)
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 2 })
                 .stroke(egui::Stroke::new(1.0, pal.statusbar_border))
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     if self.recording {
                         ui.label(egui::RichText::new(format!(
@@ -2062,27 +2048,27 @@ impl eframe::App for ViewerApp {
 
         // Side panel — rendered before bottom panel so it extends full height to status bar
         if self.side_panel_open {
-            egui::SidePanel::left("controls")
-                .resizable(true).default_width(220.0)
+            egui::Panel::left("controls")
+                .resizable(true).default_size(220.0)
                 .frame(egui::Frame::new()
                     .fill(pal.panel_fill)
                     .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
                 )
-                .show(ctx, |ui| {
+                .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
                 });
         }
 
         // Bottom tabbed panel — rendered after side panel so it only spans the image area
-        egui::TopBottomPanel::bottom("bottom_panel")
+        egui::Panel::bottom("bottom_panel")
             .resizable(true)
-            .default_height(300.0)
-            .height_range(150.0..=600.0)
+            .default_size(300.0)
+            .size_range(150.0..=600.0)
             .frame(egui::Frame::new()
                 .fill(pal.panel_fill)
                 .inner_margin(egui::Margin::ZERO)
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.set_min_height(260.0);
                 self.bottom_panel_tabs(ui);
 
@@ -2119,7 +2105,7 @@ impl eframe::App for ViewerApp {
                 .fill(pal.image_bg)
                 .inner_margin(egui::Margin { left: 4, right: 4, top: 12, bottom: 4 })
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
             if let Some(frame) = &self.current_frame {
                 let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;
@@ -2130,7 +2116,7 @@ impl eframe::App for ViewerApp {
         });
 
         // Zoom popup window
-        self.show_zoom_window(ctx);
+        self.show_zoom_window(&ctx);
     }
 }
 

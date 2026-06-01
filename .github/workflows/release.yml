@@ -1,14 +1,20 @@
 name: Build & Release
 
-# Builds packaged binaries for macOS (Apple Silicon) and Windows (x64),
-# bundling the SVBony runtime libraries. Uploads a zip artifact on every
-# push/PR, and attaches the zips to a GitHub Release when a `v*` tag is pushed.
+# Builds packaged binaries for macOS (Apple Silicon), Windows (x64), and
+# Linux (x64 + arm64), bundling the SVBony runtime libraries. Uploads a
+# per-platform archive artifact on every push/PR, and attaches them to a
+# GitHub Release when a `v*` tag is pushed.
 #
-# Requires two repository variables (Settings -> Secrets and variables ->
+# Requires three repository variables (Settings -> Secrets and variables ->
 # Actions -> Variables) pointing at hosted SVBony SDK zips:
-#   SVB_SDK_URL_MACOS    - URL of the macOS SDK zip (contains lib/arm64/...)
-#   SVB_SDK_URL_WINDOWS  - URL of the Windows SDK zip (contains lib/x64/...)
+#   SVB_SDK_URL_MACOS    - macOS SDK zip   (contains lib/arm64/...)
+#   SVB_SDK_URL_WINDOWS  - Windows SDK zip (contains lib/x64/...)
+#   SVB_SDK_URL_LINUX    - Linux SDK zip   (contains lib/x64 and lib/armv8/...)
 # The download is cached; bump SDK_CACHE_VERSION below if the SDK contents change.
+#
+# Note: Linux GUI binaries are not fully self-contained. They bundle libusb,
+# but the target machine must already provide system libraries (OpenGL,
+# X11/Wayland, GTK3).
 
 on:
   push:
@@ -36,6 +42,12 @@ jobs:
             os: macos-14
           - name: windows
             os: windows-latest
+          - name: linux-x64
+            os: ubuntu-22.04
+            libdir: x64
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            libdir: armv8
 
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +55,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
 
       - name: Cache SVBony SDK
         id: sdk-cache
@@ -55,12 +77,12 @@ jobs:
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
-          SDK_URL: ${{ matrix.name == 'windows' && vars.SVB_SDK_URL_WINDOWS || vars.SVB_SDK_URL_MACOS }}
+          SDK_URL: ${{ startsWith(matrix.name, 'windows') && vars.SVB_SDK_URL_WINDOWS || startsWith(matrix.name, 'linux') && vars.SVB_SDK_URL_LINUX || vars.SVB_SDK_URL_MACOS }}
         run: |
           set -euo pipefail
           if [ -z "${SDK_URL:-}" ]; then
             echo "::error::Repository variable for the SVBony SDK URL is not set."
-            echo "::error::Set SVB_SDK_URL_MACOS and SVB_SDK_URL_WINDOWS under Settings -> Secrets and variables -> Actions -> Variables."
+            echo "::error::Set SVB_SDK_URL_MACOS / SVB_SDK_URL_WINDOWS / SVB_SDK_URL_LINUX under Settings -> Secrets and variables -> Actions -> Variables."
             exit 1
           fi
           PY=$(command -v python3 || command -v python)
@@ -100,6 +122,7 @@ jobs:
           # Sanity-check that the only non-system dylib dependency is the bundled libusb.
           otool -L "$APP/Contents/MacOS/viewer" || true
           ditto -c -k --keepParent "$APP" dist/viewer-macos.zip
+          echo "ASSET=dist/viewer-macos.zip" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
         if: matrix.name == 'windows'
@@ -110,15 +133,32 @@ jobs:
           # Ship every DLL the SDK provides (SVBCameraSDK.dll plus any libusb).
           Copy-Item "$env:SVBCAMERA_SDK_PATH/lib/x64/*.dll" dist/viewer-windows/
           Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
+          "ASSET=dist/viewer-windows.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="viewer-${{ matrix.name }}"
+          mkdir -p "dist/$OUT"
+          cp target/release/viewer "dist/$OUT/viewer"
+          # The SDK is statically linked; only libusb is dynamic. Copy the
+          # versioned .so files + symlinks (-P preserves the symlinks) for the
+          # build's architecture. The `$ORIGIN` rpath makes them resolve.
+          cp -P "$SVBCAMERA_SDK_PATH/lib/${{ matrix.libdir }}"/libusb-1.0.so* "dist/$OUT/"
+          ldd "dist/$OUT/viewer" | grep -i usb || true
+          tar -czf "dist/$OUT.tar.gz" -C dist "$OUT"
+          echo "ASSET=dist/$OUT.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: viewer-${{ matrix.name }}
-          path: dist/viewer-${{ matrix.name }}.zip
+          path: ${{ env.ASSET }}
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/viewer-${{ matrix.name }}.zip
+          files: ${{ env.ASSET }}

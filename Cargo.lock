@@ -3695,9 +3695,9 @@ checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
 
 [[package]]
 name = "svbony"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1553aa8c0dc485e299d7d148ba2e3e2a3a352ba3659ef6b4082d83994251727"
+checksum = "dce819f58289730dae25bf9f9206f18cb28a88cf585e2cd45829bc0aa0c3a5f0"
 dependencies = [
  "image",
  "svbony-sys",

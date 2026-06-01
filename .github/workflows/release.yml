@@ -148,6 +148,7 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
           cp target/release/viewer "$APP/Contents/MacOS/viewer"
           cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          cp packaging/macos/AppIcon.icns "$APP/Contents/Resources/"
           cp "$SVBCAMERA_SDK_PATH/lib/arm64/libusb-1.0.0.dylib" "$APP/Contents/Frameworks/"
           cp catalog/gaia_merged.bin "$APP/Contents/Resources/"
           # Sanity-check that the only non-system dylib dependency is the bundled libusb.

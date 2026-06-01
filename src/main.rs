@@ -1,3 +1,6 @@
+// Hide the console window on Windows in release builds (keep it in debug for logs).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[cfg(feature = "starsolve")]
 mod bright_stars;
 mod colormaps;

@@ -180,6 +180,17 @@ struct ViewerApp {
     solver_db: Option<std::sync::Arc<tetra3::SolverDatabase>>,
     #[cfg(feature = "starsolve")]
     solver_db_path: Option<std::path::PathBuf>,
+    /// Bundled Gaia catalog the default database can be generated from, if found.
+    #[cfg(feature = "starsolve")]
+    solver_catalog_path: Option<std::path::PathBuf>,
+    /// Receiver for an in-progress background database generation.
+    #[cfg(feature = "starsolve")]
+    gen_rx: Option<Receiver<Result<tetra3::SolverDatabase, String>>>,
+    #[cfg(feature = "starsolve")]
+    gen_started: Option<Instant>,
+    /// Whether to show the one-time "build the database now?" prompt.
+    #[cfg(feature = "starsolve")]
+    show_build_prompt: bool,
     #[cfg(feature = "starsolve")]
     fov_estimate_deg: f32,
     #[cfg(feature = "starsolve")]
@@ -352,6 +363,14 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             solver_db_path: None,
             #[cfg(feature = "starsolve")]
+            solver_catalog_path: None,
+            #[cfg(feature = "starsolve")]
+            gen_rx: None,
+            #[cfg(feature = "starsolve")]
+            gen_started: None,
+            #[cfg(feature = "starsolve")]
+            show_build_prompt: false,
+            #[cfg(feature = "starsolve")]
             fov_estimate_deg: 15.0,
             #[cfg(feature = "starsolve")]
             solve_rx: None,
@@ -416,6 +435,30 @@ impl ViewerApp {
         }
     }
 
+    /// Gaia catalog bundled with packaged builds; the default database is
+    /// generated from it on first run.
+    #[cfg(feature = "starsolve")]
+    const GAIA_CATALOG_FILENAME: &'static str = "gaia_merged.bin";
+
+    /// Cached generated database filename. Encodes the generation parameters so
+    /// that changing them produces a new file (old one is simply ignored).
+    #[cfg(feature = "starsolve")]
+    const GENERATED_SOLVER_FILENAME: &'static str = "solver_fov5-50_mag85.bin";
+
+    /// Parameters used to generate the default database from the Gaia catalog.
+    #[cfg(feature = "starsolve")]
+    fn solver_gen_config() -> tetra3::GenerateDatabaseConfig {
+        tetra3::GenerateDatabaseConfig {
+            min_fov_deg: Some(5.0),
+            max_fov_deg: 50.0,
+            star_max_magnitude: Some(8.5),
+            epoch_proper_motion_year: Some(2026.0),
+            verification_stars_per_fov: 250,
+            patterns_per_lattice_field: 100,
+            ..Default::default()
+        }
+    }
+
     #[cfg(feature = "starsolve")]
     fn load_config(&mut self) {
         let config_path = Self::config_path();
@@ -433,20 +476,7 @@ impl ViewerApp {
                 self.centroid_config.matched_filter_sigma = cfg.matched_filter_sigma;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
-                    self.add_log(LogEntry::info(format!("Auto-loading database: {}", cfg.solver_db_path)));
-                    match tetra3::SolverDatabase::load_from_file(&cfg.solver_db_path) {
-                        Ok(db) => {
-                            self.add_log(LogEntry::info(format!(
-                                "Database loaded: {} patterns, {} stars",
-                                db.props.num_patterns, db.star_vectors.len(),
-                            )));
-                            self.solver_db_path = Some(std::path::PathBuf::from(&cfg.solver_db_path));
-                            self.solver_db = Some(std::sync::Arc::new(db));
-                        }
-                        Err(e) => {
-                            self.add_log(LogEntry::error(format!("Auto-load failed: {}", e)));
-                        }
-                    }
+                    self.load_solver_db(std::path::Path::new(&cfg.solver_db_path));
                 }
 
                 if !cfg.camera_model_path.is_empty() && std::path::Path::new(&cfg.camera_model_path).exists() {
@@ -465,6 +495,129 @@ impl ViewerApp {
                         }
                     }
                 }
+            }
+        }
+
+        // Provision a plate-solver database when the saved config didn't load
+        // one (first run, or a missing/relocated file). Prefer a previously
+        // generated cache; otherwise offer to build it from the bundled Gaia
+        // catalog. This keeps plate solving working fully offline.
+        if self.solver_db.is_none() {
+            let cache = Self::generated_solver_path();
+            if cache.exists() {
+                self.load_solver_db(&cache);
+            } else if let Some(catalog) = Self::default_catalog_path() {
+                self.solver_catalog_path = Some(catalog);
+                self.show_build_prompt = true;
+            }
+        }
+    }
+
+    /// Loads a solver database from `path`, logging the result and updating state.
+    #[cfg(feature = "starsolve")]
+    fn load_solver_db(&mut self, path: &std::path::Path) {
+        self.add_log(LogEntry::info(format!("Auto-loading database: {}", path.display())));
+        match tetra3::SolverDatabase::load_from_file(path.to_str().unwrap_or("")) {
+            Ok(db) => {
+                self.add_log(LogEntry::info(format!(
+                    "Database loaded: {} patterns, {} stars",
+                    db.props.num_patterns,
+                    db.star_vectors.len(),
+                )));
+                self.solver_db_path = Some(path.to_path_buf());
+                self.solver_db = Some(std::sync::Arc::new(db));
+            }
+            Err(e) => self.add_log(LogEntry::error(format!("Auto-load failed: {}", e))),
+        }
+    }
+
+    /// Locates the Gaia catalog bundled alongside the executable, if present.
+    /// Checks next to the binary (Windows/Linux packages) and the macOS app
+    /// bundle's `Resources` directory.
+    #[cfg(feature = "starsolve")]
+    fn default_catalog_path() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        [
+            dir.join(Self::GAIA_CATALOG_FILENAME),
+            dir.join("../Resources").join(Self::GAIA_CATALOG_FILENAME),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+    }
+
+    /// Path of the generated-and-cached default database in the app data dir.
+    #[cfg(feature = "starsolve")]
+    fn generated_solver_path() -> std::path::PathBuf {
+        let dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(Self::GENERATED_SOLVER_FILENAME)
+    }
+
+    /// Kicks off background generation of the default database from the bundled
+    /// catalog. Result is polled by [`Self::poll_solver_generation`].
+    #[cfg(feature = "starsolve")]
+    fn start_solver_generation(&mut self) {
+        if self.gen_rx.is_some() {
+            return; // already running
+        }
+        let Some(catalog) = self.solver_catalog_path.clone() else {
+            return;
+        };
+        self.show_build_prompt = false;
+        let cache = Self::generated_solver_path();
+        let (tx, rx) = bounded(1);
+        self.gen_rx = Some(rx);
+        self.gen_started = Some(Instant::now());
+        self.add_log(LogEntry::info("Building star database from catalog…".to_string()));
+        thread::spawn(move || {
+            let config = Self::solver_gen_config();
+            let result = tetra3::SolverDatabase::generate_from_gaia(
+                catalog.to_str().unwrap_or(""),
+                &config,
+            )
+            .map_err(|e| e.to_string());
+            // Cache to disk so subsequent launches load instantly.
+            if let Ok(db) = &result {
+                let _ = db.save_to_file(cache.to_str().unwrap_or(""));
+            }
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Polls the background generation thread and installs the database on
+    /// completion. No-op when no generation is in flight.
+    #[cfg(feature = "starsolve")]
+    fn poll_solver_generation(&mut self) {
+        let Some(rx) = self.gen_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.gen_rx = None;
+                let elapsed = self.gen_started.take().map_or(0.0, |t| t.elapsed().as_secs_f32());
+                match result {
+                    Ok(db) => {
+                        self.add_log(LogEntry::info(format!(
+                            "Star database built in {:.1}s: {} patterns, {} stars",
+                            elapsed,
+                            db.props.num_patterns,
+                            db.star_vectors.len(),
+                        )));
+                        self.solver_db_path = Some(Self::generated_solver_path());
+                        self.solver_db = Some(std::sync::Arc::new(db));
+                    }
+                    Err(e) => self.add_log(LogEntry::error(format!("Database build failed: {}", e))),
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                // Worker died without sending (shouldn't happen) — reset state.
+                self.gen_rx = None;
+                self.gen_started = None;
+                self.add_log(LogEntry::error("Database build thread stopped unexpectedly".to_string()));
             }
         }
     }
@@ -1469,7 +1622,12 @@ impl ViewerApp {
         // ── Top bar: database + FOV + status + reset ────────────────────────
         ui.horizontal(|ui| {
             // Database
-            if self.solver_db.is_none() {
+            if self.gen_rx.is_some() {
+                ui.add(egui::Spinner::new().size(14.0));
+                let secs = self.gen_started.map_or(0.0, |t| t.elapsed().as_secs_f32());
+                ui.label(egui::RichText::new(format!("Building star database… {:.0}s", secs))
+                    .color(egui::Color32::from_rgb(217, 119, 6)));
+            } else if self.solver_db.is_none() {
                 if widgets::styled_button(ui, "Load Database...", &pal) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Database", &["bin"])
@@ -1489,6 +1647,12 @@ impl ViewerApp {
                             Err(e) => self.add_log(LogEntry::error(format!("Load failed: {}", e))),
                         }
                     }
+                }
+                // Offer to build the default database from the bundled catalog.
+                if self.solver_catalog_path.is_some()
+                    && widgets::styled_button(ui, "Build default DB", &pal)
+                {
+                    self.start_solver_generation();
                 }
             } else {
                 ui.label(egui::RichText::new("DB").color(egui::Color32::from_rgb(34, 197, 94)));
@@ -1565,6 +1729,61 @@ impl ViewerApp {
                 }
             });
         });
+
+        // ── Loaded database details ─────────────────────────────────────────
+        if let Some(db) = self.solver_db.as_ref() {
+            let p = &db.props;
+            let name = self
+                .solver_db_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "database".to_string());
+
+            ui.add_space(3.0);
+            egui::Frame::new()
+                .fill(pal.bg_surface)
+                .stroke(egui::Stroke::new(1.0, pal.section_border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let dim = |ui: &mut egui::Ui, s: String| {
+                        ui.label(egui::RichText::new(s).size(12.0).color(pal.text_secondary));
+                    };
+                    let sep = |ui: &mut egui::Ui| {
+                        ui.label(egui::RichText::new("•").size(12.0).color(pal.border));
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&name).size(12.0).strong().color(pal.text_primary));
+                        sep(ui);
+                        dim(ui, format!("{} patterns", p.num_patterns));
+                        sep(ui);
+                        dim(ui, format!("{} stars", db.star_vectors.len()));
+                        sep(ui);
+                        dim(ui, format!("FOV {:.1}–{:.1}°", p.min_fov_rad.to_degrees(), p.max_fov_rad.to_degrees()));
+                        sep(ui);
+                        dim(ui, format!("mag ≤ {:.1}", p.star_max_magnitude));
+                        sep(ui);
+                        dim(ui, format!("err {:.4} / {} bins", p.pattern_max_error, p.pattern_bins));
+                        sep(ui);
+                        dim(ui, format!("verify {}/FOV", p.verification_stars_per_fov));
+                        sep(ui);
+                        dim(ui, format!("epoch {} · PM {:.0}", p.epoch_equinox, p.epoch_proper_motion_year));
+                    });
+                    if let Some(cam) = self.camera_model.as_ref() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("calib").size(12.0).strong().color(pal.text_primary));
+                            sep(ui);
+                            dim(ui, format!("f = {:.1} px", cam.focal_length_px));
+                            sep(ui);
+                            dim(ui, format!("{}×{}", cam.image_width, cam.image_height));
+                            sep(ui);
+                            dim(ui, format!("FOV {:.2}°", cam.fov_deg()));
+                        });
+                    }
+                });
+        }
 
         // ── Centroid parameters (compact horizontal grid) ───────────────────
         ui.add_space(2.0);
@@ -1804,11 +2023,44 @@ impl eframe::App for ViewerApp {
         self.poll_log();
         self.poll_fits_load();
         self.poll_bg();
+        #[cfg(feature = "starsolve")]
+        self.poll_solver_generation();
         self.apply_theme(&ctx);
 
         if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        // Keep repainting while the database builds so the elapsed timer ticks
+        // and completion is detected promptly.
+        #[cfg(feature = "starsolve")]
+        if self.gen_rx.is_some() { ctx.request_repaint(); }
 
         let pal = self.pal();
+
+        // One-time prompt offering to build the default database on first run.
+        #[cfg(feature = "starsolve")]
+        if self.show_build_prompt {
+            let (mut build, mut later) = (false, false);
+            egui::Window::new("Star database")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.label("No star database found.");
+                    ui.label("Build it now from the bundled catalog?");
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Takes ~10 s to a few minutes (one time). Cached afterward.")
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if widgets::styled_button(ui, "Build now", &pal) { build = true; }
+                        if widgets::styled_button(ui, "Later", &pal) { later = true; }
+                    });
+                });
+            if build { self.start_solver_generation(); }
+            if later { self.show_build_prompt = false; }
+        }
 
         // Keyboard shortcuts
         if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command && !i.modifiers.ctrl) {

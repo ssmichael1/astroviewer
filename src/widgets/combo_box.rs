@@ -42,7 +42,7 @@ fn combo_box_inner<T: PartialEq + Copy>(
     let popup_id = ui.make_persistent_id(id);
     let is_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
 
-    let desired_width = ui.available_width().min(160.0).max(80.0);
+    let desired_width = ui.available_width().clamp(80.0, 160.0);
     let height = 28.0;
 
     let border_color = if is_open { pal.combo_border_open } else { pal.combo_border };

@@ -171,10 +171,8 @@ impl ImageViewer {
             }
 
             // ROI selection (right-click drag)
-            if resp.dragged_by(egui::PointerButton::Secondary) {
-                if self.roi_start.is_none() {
-                    self.roi_start = resp.hover_pos();
-                }
+            if resp.dragged_by(egui::PointerButton::Secondary) && self.roi_start.is_none() {
+                self.roi_start = resp.hover_pos();
             }
             if resp.drag_stopped_by(egui::PointerButton::Secondary) {
                 if let (Some(start), Some(end)) = (self.roi_start, resp.hover_pos()) {

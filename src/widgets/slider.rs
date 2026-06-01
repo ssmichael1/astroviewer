@@ -30,7 +30,7 @@ fn slider_core(
             // No value text — fill available width
             avail.max(40.0)
         } else {
-            avail.min(150.0).max(60.0) - 50.0
+            avail.clamp(60.0, 150.0) - 50.0
         };
         let handle_r = 7.0;
         let height = 20.0;

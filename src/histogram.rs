@@ -1,5 +1,4 @@
 /// Histogram computation for mono image data.
-
 pub struct Histogram {
     pub edges: Vec<f32>,
     pub counts: Vec<u64>,

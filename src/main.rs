@@ -185,6 +185,9 @@ impl LogEntry {
 
 // ── App ─────────────────────────────────────────────────────────────────────
 
+/// Result of an async FITS load: the path, the loaded source, and an optional precomputed background.
+type FitsLoadResult = Result<(std::path::PathBuf, fits_source::FitsSource, Option<Vec<f32>>), String>;
+
 struct ViewerApp {
     frame_tx: Sender<FrameData>,
     frame_rx: Receiver<FrameData>,
@@ -268,7 +271,7 @@ struct ViewerApp {
     // Async file dialog result
     pending_fits_path: Option<Receiver<Option<std::path::PathBuf>>>,
     // Async FITS loading result (path, source, optional background)
-    pending_fits_load: Option<Receiver<Result<(std::path::PathBuf, fits_source::FitsSource, Option<Vec<f32>>), String>>>,
+    pending_fits_load: Option<Receiver<FitsLoadResult>>,
 
     #[cfg(feature = "svbony")]
     discovered_cameras: Vec<svbony::CameraInfo>,
@@ -316,8 +319,7 @@ impl ViewerApp {
         let (frame_tx, frame_rx) = bounded(2);
         let (log_tx, log_rx) = bounded(64);
 
-        let mut log = Vec::new();
-        log.push(LogEntry::info("Viewer started".to_string()));
+        let log = vec![LogEntry::info("Viewer started".to_string())];
 
         // Try to start with an SVBony camera if available
         #[cfg(feature = "svbony")]
@@ -1815,7 +1817,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
             ui.painter().text(
                 egui::pos2(header_rect.min.x + 10.0, header_rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                &title.to_uppercase(),
+                title.to_uppercase(),
                 egui::FontId::new(11.0, egui::FontFamily::Proportional),
                 pal.section_header_text,
             );

@@ -19,17 +19,15 @@ serde_json = "1"
 fitskit = "0.1"
 rfd = "0.17.2"
 svbony = { version = "0.1", features = ["image"], optional = true }
-tetra3 = { version = "0.7.2", path = "../tetra3rs", features = [
+tetra3 = { version = "0.7.3", features = [
     "image",
 ], optional = true }
 # tetra3 = { version = "0.7.2", features = ["image"], optional = true }
-cpu-time = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
 
 [features]
 default = []
 svbony = ["dep:svbony"]
-starsolve = ["dep:tetra3", "dep:cpu-time", "dep:libc"]
+starsolve = ["dep:tetra3"]
 
 [profile.test]
 opt-level = 3

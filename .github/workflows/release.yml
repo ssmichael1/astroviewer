@@ -1,0 +1,124 @@
+name: Build & Release
+
+# Builds packaged binaries for macOS (Apple Silicon) and Windows (x64),
+# bundling the SVBony runtime libraries. Uploads a zip artifact on every
+# push/PR, and attaches the zips to a GitHub Release when a `v*` tag is pushed.
+#
+# Requires two repository variables (Settings -> Secrets and variables ->
+# Actions -> Variables) pointing at hosted SVBony SDK zips:
+#   SVB_SDK_URL_MACOS    - URL of the macOS SDK zip (contains lib/arm64/...)
+#   SVB_SDK_URL_WINDOWS  - URL of the Windows SDK zip (contains lib/x64/...)
+# The download is cached; bump SDK_CACHE_VERSION below if the SDK contents change.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  FEATURES: "svbony,starsolve"
+  SDK_CACHE_VERSION: "v1"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # needed for the release upload on tags
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-14
+          - name: windows
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache SVBony SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          key: ${{ matrix.name }}-svbsdk-${{ env.SDK_CACHE_VERSION }}
+
+      - name: Download SVBony SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          SDK_URL: ${{ matrix.name == 'windows' && vars.SVB_SDK_URL_WINDOWS || vars.SVB_SDK_URL_MACOS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SDK_URL:-}" ]; then
+            echo "::error::Repository variable for the SVBony SDK URL is not set."
+            echo "::error::Set SVB_SDK_URL_MACOS and SVB_SDK_URL_WINDOWS under Settings -> Secrets and variables -> Actions -> Variables."
+            exit 1
+          fi
+          PY=$(command -v python3 || command -v python)
+          curl -fL "$SDK_URL" -o sdk.zip
+          mkdir -p sdk
+          "$PY" -c "import zipfile; zipfile.ZipFile('sdk.zip').extractall('sdk')"
+
+      - name: Locate SDK root
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          LIBDIR=$(find sdk -type d -name lib | head -n1)
+          if [ -z "$LIBDIR" ]; then
+            echo "::error::Could not find a 'lib' directory inside the extracted SDK."
+            exit 1
+          fi
+          ROOT=$(dirname "$LIBDIR")
+          ABS=$("$PY" -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$ROOT")
+          echo "SVBCAMERA_SDK_PATH=$ABS" >> "$GITHUB_ENV"
+          echo "Using SVBCAMERA_SDK_PATH=$ABS"
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --features "$FEATURES"
+
+      - name: Package (macOS)
+        if: matrix.name == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="dist/Viewer.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+          cp target/release/viewer "$APP/Contents/MacOS/viewer"
+          cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          cp "$SVBCAMERA_SDK_PATH/lib/arm64/libusb-1.0.0.dylib" "$APP/Contents/Frameworks/"
+          # Sanity-check that the only non-system dylib dependency is the bundled libusb.
+          otool -L "$APP/Contents/MacOS/viewer" || true
+          ditto -c -k --keepParent "$APP" dist/viewer-macos.zip
+
+      - name: Package (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/viewer-windows | Out-Null
+          Copy-Item target/release/viewer.exe dist/viewer-windows/
+          # Ship every DLL the SDK provides (SVBCameraSDK.dll plus any libusb).
+          Copy-Item "$env:SVBCAMERA_SDK_PATH/lib/x64/*.dll" dist/viewer-windows/
+          Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: viewer-${{ matrix.name }}
+          path: dist/viewer-${{ matrix.name }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/viewer-${{ matrix.name }}.zip

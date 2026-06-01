@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use fitskit::{FitsFile, HduData};
-use image::{DynamicImage, ImageBuffer, Luma};
 
 /// A FITS-file-based image source that cycles through frames.
 pub struct FitsSource {
@@ -105,19 +104,13 @@ impl FitsSource {
         bg
     }
 
-    /// Return the next frame as a DynamicImage, cycling back to the start.
-    pub fn next_frame(&mut self) -> DynamicImage {
+    /// Return the next frame's mono pixels as `f32`, cycling back to the start.
+    ///
+    /// Values are the BSCALE/BZERO-corrected physical values; they are *not*
+    /// clamped to a display bit depth here — display scaling happens downstream.
+    pub fn next_frame(&mut self) -> Vec<f32> {
         let mono = &self.frames[self.current];
         self.current = (self.current + 1) % self.frames.len();
-
-        if self.bit_depth <= 8 {
-            let pixels: Vec<u8> = mono.iter().map(|&v| v.clamp(0.0, 255.0) as u8).collect();
-            let buf = ImageBuffer::<Luma<u8>, _>::from_raw(self.width, self.height, pixels).unwrap();
-            DynamicImage::ImageLuma8(buf)
-        } else {
-            let pixels: Vec<u16> = mono.iter().map(|&v| v.clamp(0.0, 65535.0) as u16).collect();
-            let buf = ImageBuffer::<Luma<u16>, _>::from_raw(self.width, self.height, pixels).unwrap();
-            DynamicImage::ImageLuma16(buf)
-        }
+        mono.iter().map(|&v| v as f32).collect()
     }
 }

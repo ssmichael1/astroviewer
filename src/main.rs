@@ -13,6 +13,7 @@ mod camera;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
+#[cfg(feature = "svbony")]
 use image::DynamicImage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -92,6 +93,16 @@ struct FrameData {
     mean: f32,
     stddev: f32,
     bit_depth: u8,
+}
+
+impl FrameData {
+    /// Build a frame from raw mono `f32` pixels, computing the histogram and stats.
+    fn new(mono: Vec<f32>, width: u32, height: u32, bit_depth: u8) -> Self {
+        let range_max = ((1u64 << bit_depth) - 1) as f32;
+        let hist = compute_histogram(&mono, 256, 0.0, range_max);
+        let (mean, stddev) = compute_stats(&mono);
+        FrameData { mono, width, height, hist, mean, stddev, bit_depth }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2399,8 +2410,8 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
                 Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
-            let img = source.next_frame();
-            let frame_data = process_image(img, bit_depth);
+            let mono = source.next_frame();
+            let frame_data = FrameData::new(mono, source.width, source.height, bit_depth);
             if tx.try_send(frame_data).is_err() && tx.is_empty() { break; }
             let elapsed = t0.elapsed();
             if elapsed < frame_interval { thread::sleep(frame_interval - elapsed); }
@@ -2408,6 +2419,7 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
     });
 }
 
+#[cfg(feature = "svbony")]
 fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
     let width = img.width();
     let height = img.height();
@@ -2417,10 +2429,7 @@ fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
         DynamicImage::ImageRgb8(rgb) => rgb.pixels().map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect(),
         _ => { let gray = img.to_luma8(); gray.as_raw().iter().map(|&v| v as f32).collect() }
     };
-    let range_max = ((1u64 << bit_depth) - 1) as f32;
-    let hist = compute_histogram(&mono, 256, 0.0, range_max);
-    let (mean, stddev) = compute_stats(&mono);
-    FrameData { mono, width, height, hist, mean, stddev, bit_depth }
+    FrameData::new(mono, width, height, bit_depth)
 }
 
 /// Menu item with checkmark prefix for toggles.

@@ -2713,7 +2713,15 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 1000.0]).with_title("Viewer"),
+        // Setting an explicit (empty) icon suppresses eframe's default behavior of
+        // loading the bundled egui logo and calling setApplicationIconImage shortly
+        // after launch — which would overwrite the macOS Dock icon (and Windows
+        // taskbar icon) provided by the app bundle's .icns / the exe's embedded .ico.
+        // With IconData::default(), eframe leaves the OS-provided icon untouched.
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 1000.0])
+            .with_title("Viewer")
+            .with_icon(egui::IconData::default()),
         ..Default::default()
     };
     eframe::run_native("Viewer", options, Box::new(|cc| Ok(Box::new(ViewerApp::new(cc)))))

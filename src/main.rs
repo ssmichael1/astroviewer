@@ -688,11 +688,25 @@ impl ViewerApp {
         ctx.set_global_style(style);
     }
 
+    /// Absolute, writable directory for recordings. Using an absolute path under
+    /// the user's Documents folder (with fallbacks) matters for bundled apps:
+    /// a double-clicked macOS `.app` runs with the working directory set to `/`,
+    /// so a relative `data/` path is not creatable and recording silently fails.
+    fn recordings_dir() -> std::path::PathBuf {
+        dirs::document_dir()
+            .or_else(dirs::data_dir)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("AstroViewer")
+    }
+
     fn start_recording(&mut self) {
-        // Create data directory
-        let data_dir = std::path::PathBuf::from("data");
+        // Create recordings directory (absolute path — see recordings_dir docs)
+        let data_dir = Self::recordings_dir();
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            self.add_log(LogEntry::error(format!("Failed to create data/: {}", e)));
+            self.add_log(LogEntry::error(format!(
+                "Failed to create recordings dir {}: {}", data_dir.display(), e
+            )));
             return;
         }
 
@@ -701,7 +715,8 @@ impl ViewerApp {
 
         let (tx, rx) = bounded::<RecordMsg>(16);
         let log_tx = self.log_tx.clone();
-        let fname = filename.clone();
+        let full_path = filepath.display().to_string();
+        let fname = full_path.clone();
 
         thread::spawn(move || {
             use fitskit::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
@@ -758,7 +773,7 @@ impl ViewerApp {
         self.rec_filename = filename.clone();
         self.rec_frame_count = 0;
         self.recording = true;
-        self.add_log(LogEntry::info(format!("Recording started: {}", filename)));
+        self.add_log(LogEntry::info(format!("Recording started: {}", full_path)));
     }
 
     fn stop_recording(&mut self) {

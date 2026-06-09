@@ -112,7 +112,7 @@ fn main() -> anyhow::Result<()> {
     // Bind to 0.0.0.0 so we receive the unicast GVSP regardless of which local
     // address the OS associates it with.
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let socket = rt.block_on(nic::bind_udp(bind_ip, 0, Some(iface.clone()), None))?;
+    let socket = rt.block_on(nic::bind_udp(bind_ip, 0, Some(iface.clone()), Some(32 * 1024 * 1024)))?;
     let local_port = socket.local_addr()?.port();
     let params = rt.block_on(dev.negotiate_stream(0, &iface, local_port, None))?;
     let packet_payload = params.packet_size.saturating_sub(8).max(1) as usize;
@@ -166,25 +166,37 @@ fn main() -> anyhow::Result<()> {
     let mut first_pkt_ids: Vec<u32> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(listen_secs);
 
-    // Hole-punch: many EDR/VPN network filters drop *unsolicited* inbound UDP.
-    // The camera streams from a fixed source port (observed 1051), so by sending
-    // an outbound packet from our receive socket to camera:1051 we open a flow
-    // the stateful filter then treats the camera's stream as return traffic for.
-    const CAM_GVSP_SRC_PORT: u16 = 1051;
-    let punch_dst = SocketAddr::new(IpAddr::V4(ip), CAM_GVSP_SRC_PORT);
-
+    // Hole-punch: the host's network-extension filter allows inbound that
+    // corresponds to an outbound flow (that's why GVCP replies get through). The
+    // camera streams from a varying low source port (observed 1051, 1054…), so we
+    // spray a punch across the whole likely range from our receive socket; one of
+    // them matches the camera's actual source port and opens the allowed flow.
+    let mut known_port: Option<u16> = None;
     rt.block_on(async {
-        let _ = socket.send_to(&[0u8], punch_dst).await;
-        let mut last_punch = Instant::now();
-        while Instant::now() < deadline {
-            // Re-open the flow periodically in case the filter expires it.
-            if last_punch.elapsed() >= Duration::from_millis(500) {
-                let _ = socket.send_to(&[0u8], punch_dst).await;
-                last_punch = Instant::now();
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining.min(Duration::from_millis(500)), socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, _src))) => {
+        for p in 1024u16..=2048 {
+            let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await;
+        }
+        println!("(sprayed hole-punch to camera ports 1024-2048)");
+
+        let deadline_t = tokio::time::Instant::now() + Duration::from_secs(listen_secs);
+        let sleep = tokio::time::sleep_until(deadline_t);
+        tokio::pin!(sleep);
+        let mut punch_timer = tokio::time::interval(Duration::from_millis(20));
+        punch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            // biased: drain the socket before punching, so high packet rates aren't
+            // throttled by per-iteration timer overhead. Punch only fires when recv
+            // has nothing ready (i.e. the flow stalled and needs reopening).
+            tokio::select! {
+                biased;
+                _ = &mut sleep => break,
+                r = socket.recv_from(&mut buf) => {
+                    let (n, src) = match r { Ok(v) => v, Err(e) => { println!("recv error: {e}"); break; } };
+                    if known_port.is_none() {
+                        known_port = Some(src.port());
+                        println!("(camera GVSP source port = {})", src.port());
+                    }
                     pkts += 1;
                     match gvsp::parse_packet(&buf[..n]) {
                         Ok(GvspPacket::Leader { block_id, width, height, pixel_format, packet_id, .. }) => {
@@ -216,7 +228,7 @@ fn main() -> anyhow::Result<()> {
                                     match (a.finish(), geom) {
                                         (Some(payload), Some((w, h, pf))) => {
                                             frames += 1;
-                                            report_frame(&payload, w, h, pf);
+                                            if frames <= 5 { report_frame(&payload, w, h, pf); }
                                         }
                                         (None, _) => if trailers <= 3 { println!("  TRAILER block={block_id}: frame INCOMPLETE (missing packets)"); },
                                         _ => {}
@@ -227,8 +239,14 @@ fn main() -> anyhow::Result<()> {
                         Err(e) => if pkts <= 5 { println!("  parse error: {e:?} (len {n})"); },
                     }
                 }
-                Ok(Err(e)) => { println!("recv error: {e}"); break; }
-                Err(_) => {} // 500ms tick, keep waiting
+                _ = punch_timer.tick() => {
+                    match known_port {
+                        Some(p) => { let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await; }
+                        None => for p in 1024u16..=2048 {
+                            let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await;
+                        }
+                    }
+                }
             }
         }
     });

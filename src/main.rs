@@ -1011,6 +1011,13 @@ impl ViewerApp {
     }
 
     fn poll_frame(&mut self) {
+        // Refresh GigE control snapshots (updated values/writability after edits).
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state {
+            while let Ok(snap) = handle.controls_rx.try_recv() {
+                *controls = snap;
+            }
+        }
         let mut latest = None;
         loop {
             match self.frame_rx.try_recv() {
@@ -1630,63 +1637,109 @@ impl ViewerApp {
         });
     }
 
-    /// Render the GigE camera's GenICam-derived controls. Floats use a log slider
-    /// (good for exposure), integers a linear slider; commands a button; read-only
-    /// values as text. Edits are sent to the capture thread via `GevCmd`.
+    /// Render the GigE camera's GenICam-derived controls, grouped by category.
+    /// Floats → log slider, ints → slider, enums → combo, bools → checkbox,
+    /// commands → button, read-only → text. Controls disabled by an `Auto` mode
+    /// re-enable automatically once the capture thread pushes a fresh snapshot.
     #[cfg(feature = "gev")]
     fn gev_controls_content(&mut self, ui: &mut egui::Ui) {
+        use gev_camera::{GevCmd, GevControlKind};
         let pal = self.pal();
         let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state else { return };
-        egui::Grid::new("gev_controls")
-            .num_columns(3)
-            .spacing([10.0, 8.0])
-            .show(ui, |ui| {
-                for c in controls.iter_mut() {
-                    ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
-                    match &c.kind {
-                        gev_camera::GevControlKind::Float => {
-                            let old = c.fvalue;
-                            let mut v = c.fvalue;
-                            let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
-                            ui.add_enabled(c.writable, egui::Slider::new(&mut v, range).logarithmic(true));
-                            let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
-                            ui.label(egui::RichText::new(format!("{:.3}{}", v, unit)).monospace());
-                            if c.writable && (v - old).abs() > f64::EPSILON {
-                                c.fvalue = v;
-                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::SetFloat(c.name.clone(), v));
+
+        // Categories in first-seen order.
+        let mut cats: Vec<String> = Vec::new();
+        for c in controls.iter() {
+            if !cats.contains(&c.category) { cats.push(c.category.clone()); }
+        }
+
+        for cat in &cats {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(cat).strong().color(pal.accent));
+            egui::Grid::new(format!("gev_ctrl_{cat}"))
+                .num_columns(3)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    for c in controls.iter_mut().filter(|c| &c.category == cat) {
+                        let lbl = ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
+                        if c.needs_restart {
+                            lbl.on_hover_text("Changing this briefly stops and restarts the stream");
+                        }
+                        let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
+                        match &c.kind {
+                            GevControlKind::Float => {
+                                let old = c.fvalue;
+                                let mut v = c.fvalue;
+                                let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
+                                ui.add_enabled(c.writable, egui::Slider::new(&mut v, range).logarithmic(true));
+                                ui.label(egui::RichText::new(format!("{:.3}{unit}", v)).monospace());
+                                if c.writable && (v - old).abs() > f64::EPSILON {
+                                    c.fvalue = v;
+                                    let _ = handle.cmd_tx.send(GevCmd::SetFloat(c.name.clone(), v));
+                                }
+                            }
+                            GevControlKind::Integer => {
+                                let old = c.value;
+                                let mut v = c.value;
+                                ui.add_enabled(c.writable, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                                ui.label(egui::RichText::new(format!("{v}{unit}")).monospace());
+                                if c.writable && v != old {
+                                    c.value = v;
+                                    let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                                }
+                            }
+                            GevControlKind::Enumeration(_) => {
+                                let opts: Vec<String> = match &c.kind {
+                                    GevControlKind::Enumeration(o) => o.clone(),
+                                    _ => Vec::new(),
+                                };
+                                let idx = c.value as usize;
+                                let cur = opts.get(idx).cloned().unwrap_or_default();
+                                let mut pick: Option<(usize, String)> = None;
+                                ui.add_enabled_ui(c.writable, |ui| {
+                                    egui::ComboBox::from_id_salt(&c.name)
+                                        .selected_text(cur)
+                                        .show_ui(ui, |ui| {
+                                            for (i, o) in opts.iter().enumerate() {
+                                                if ui.selectable_label(i == idx, o).clicked() {
+                                                    pick = Some((i, o.clone()));
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.label("");
+                                if c.writable {
+                                    if let Some((i, sym)) = pick {
+                                        c.value = i as i64;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetEnum(c.name.clone(), sym));
+                                    }
+                                }
+                            }
+                            GevControlKind::Boolean => {
+                                let mut on = c.value != 0;
+                                let resp = ui.add_enabled(c.writable, egui::Checkbox::new(&mut on, ""));
+                                ui.label("");
+                                if c.writable && resp.changed() {
+                                    c.value = on as i64;
+                                    let _ = handle.cmd_tx.send(GevCmd::SetBool(c.name.clone(), on));
+                                }
+                            }
+                            GevControlKind::Command => {
+                                if ui.button("Execute").clicked() {
+                                    let _ = handle.cmd_tx.send(GevCmd::Execute(c.name.clone()));
+                                }
+                                ui.label("");
+                            }
+                            GevControlKind::ReadOnly => {
+                                ui.label(egui::RichText::new(format!("{:.3}{unit}", c.fvalue))
+                                    .monospace().color(pal.text_secondary));
+                                ui.label("");
                             }
                         }
-                        gev_camera::GevControlKind::Integer => {
-                            let old = c.value;
-                            let mut v = c.value;
-                            ui.add_enabled(c.writable, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
-                            ui.label(egui::RichText::new(format!("{}", v)).monospace());
-                            if c.writable && v != old {
-                                c.value = v;
-                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::SetInt(c.name.clone(), v));
-                            }
-                        }
-                        gev_camera::GevControlKind::Enumeration(_entries) => {
-                            // Enumerations (e.g. PixelFormat) are configured at open
-                            // time; shown read-only for now.
-                            ui.label(egui::RichText::new(format!("{}", c.value)).monospace());
-                            ui.label("");
-                        }
-                        gev_camera::GevControlKind::Command => {
-                            if ui.button("Execute").clicked() {
-                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::Execute(c.name.clone()));
-                            }
-                            ui.label("");
-                        }
-                        gev_camera::GevControlKind::ReadOnly => {
-                            let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
-                            ui.label(egui::RichText::new(format!("{:.3}{}", c.fvalue, unit)).monospace().color(pal.text_secondary));
-                            ui.label("");
-                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
+                });
+        }
     }
 
     #[cfg(feature = "svbony")]

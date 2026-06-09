@@ -69,30 +69,31 @@ impl GevDeviceInfo {
 }
 
 /// What kind of GenICam feature a control maps to, controlling how the UI renders it.
-// `Enumeration`/`Command` are rendered by the UI but not yet emitted by
-// `build_controls` (PixelFormat is configured at open time); kept as intended surface.
-#[allow(dead_code)]
+/// How a GenICam feature maps to a UI widget.
 #[derive(Clone, PartialEq)]
 pub enum GevControlKind {
-    /// Integer feature with [min, max].
+    /// Integer feature with [min, max] (in `value`/`min`/`max`).
     Integer,
-    /// Float feature with [min, max]; `value`/`min`/`max` carry the float bits via `f64`.
+    /// Float feature with [min, max] (in `fvalue`/`fmin`/`fmax`).
     Float,
-    /// Enumeration: list of (symbolic name) entries; `value` is the selected index.
+    /// Enumeration: symbolic options; `value` is the selected index.
     Enumeration(Vec<String>),
+    /// Boolean feature; `value` is 0/1.
+    Boolean,
     /// Command (button); ignores value.
     Command,
-    /// Read-only display value (e.g. DeviceTemperature).
+    /// Read-only float display (e.g. DeviceTemperature) — no editable range.
     ReadOnly,
 }
 
-/// A UI-facing control descriptor, analogous to svbony's `ControlCaps`. Floats are
-/// carried in `fvalue`/`fmin`/`fmax`; integers/enums in `value`/`min`/`max`.
+/// A UI-facing control descriptor built from the camera's GenICam feature tree.
 #[derive(Clone)]
 pub struct GevControl {
     /// GenICam feature node name (used to set the value back on the camera).
     pub name: String,
     pub display: String,
+    /// GenICam category (used to group controls in the UI).
+    pub category: String,
     pub kind: GevControlKind,
     pub unit: String,
     pub value: i64,
@@ -102,14 +103,21 @@ pub struct GevControl {
     pub fmin: f64,
     pub fmax: f64,
     pub writable: bool,
+    /// Changing this feature requires stopping/restarting acquisition (e.g.
+    /// PixelFormat, Width/Height, binning).
+    pub needs_restart: bool,
 }
 
 /// Commands from the UI thread to the capture thread.
 pub enum GevCmd {
-    /// Set an integer/enum feature by node name.
+    /// Set an integer feature by node name.
     SetInt(String, i64),
     /// Set a float feature by node name.
     SetFloat(String, f64),
+    /// Set an enumeration feature by node name to a symbolic value.
+    SetEnum(String, String),
+    /// Set a boolean feature by node name.
+    SetBool(String, bool),
     /// Execute a command feature by node name.
     Execute(String),
     Stop,
@@ -119,6 +127,9 @@ pub enum GevCmd {
 pub struct GevHandle {
     pub controls: Vec<GevControl>,
     pub cmd_tx: Sender<GevCmd>,
+    /// Refreshed control snapshots pushed by the capture thread (so flipping an
+    /// `Auto` toggle live-unlocks its companion value control in the UI).
+    pub controls_rx: Receiver<Vec<GevControl>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -218,17 +229,58 @@ impl<'a> cameleon_genapi::Device for DeviceBridge<'a> {
     }
 }
 
-/// SFNC feature names we surface as controls, in display order. Optional ones are
-/// skipped silently if the camera's XML does not define them.
-const CONTROL_FEATURES: &[&str] = &[
-    "ExposureTime",
-    "Gain",
-    "AcquisitionFrameRate",
-    "BlackLevel",
-    "Gamma",
+/// A control we try to surface from the camera's GenICam tree.
+struct Spec {
+    name: &'static str,
+    category: &'static str,
+    /// Changing it requires stopping/restarting acquisition.
+    restart: bool,
+}
+
+/// Curated, imaging-relevant controls in display order. Each is skipped silently
+/// if the camera's XML doesn't define it. `Auto` toggles precede the value they
+/// gate, so manual mode unlocks the value control. Kind (int/float/enum/bool/
+/// command) and writability are read live from the node, not hardcoded.
+const CONTROLS: &[Spec] = &[
+    // Exposure & gain — the Auto enums gate ExposureTime/Gain writability.
+    Spec { name: "ExposureAuto", category: "Acquisition", restart: false },
+    Spec { name: "ExposureTime", category: "Acquisition", restart: false },
+    Spec { name: "GainAuto", category: "Acquisition", restart: false },
+    Spec { name: "Gain", category: "Acquisition", restart: false },
+    Spec { name: "AcquisitionFrameRateAuto", category: "Acquisition", restart: false },
+    Spec { name: "AcquisitionFrameRateEnabled", category: "Acquisition", restart: false },
+    Spec { name: "AcquisitionFrameRate", category: "Acquisition", restart: false },
+    Spec { name: "TriggerMode", category: "Acquisition", restart: false },
+    // Analog / tone.
+    Spec { name: "BlackLevel", category: "Analog", restart: false },
+    Spec { name: "GammaEnabled", category: "Analog", restart: false },
+    Spec { name: "Gamma", category: "Analog", restart: false },
+    Spec { name: "SharpnessAuto", category: "Analog", restart: false },
+    Spec { name: "Sharpness", category: "Analog", restart: false },
+    // Image format — these change frame geometry, so acquisition must restart.
+    Spec { name: "PixelFormat", category: "Image Format", restart: true },
+    Spec { name: "Width", category: "Image Format", restart: true },
+    Spec { name: "Height", category: "Image Format", restart: true },
+    Spec { name: "OffsetX", category: "Image Format", restart: true },
+    Spec { name: "OffsetY", category: "Image Format", restart: true },
+    Spec { name: "BinningVertical", category: "Image Format", restart: true },
+    Spec { name: "BinningHorizontal", category: "Image Format", restart: true },
+    Spec { name: "ReverseX", category: "Image Format", restart: false },
+    Spec { name: "TestPattern", category: "Image Format", restart: false },
+    // Read-only telemetry.
+    Spec { name: "DeviceTemperature", category: "Device", restart: false },
 ];
-/// Read-only features displayed as text if present.
-const READONLY_FEATURES: &[&str] = &["DeviceTemperature"];
+
+/// Whether changing a feature requires an acquisition stop/restart.
+fn needs_restart(name: &str) -> bool {
+    CONTROLS.iter().any(|s| s.name == name && s.restart)
+}
+
+/// A float range is usable for a slider only if finite and not absurdly wide
+/// (some GenICam floats report ±1e308 when unbounded).
+fn sane_range(lo: f64, hi: f64) -> bool {
+    lo.is_finite() && hi.is_finite() && hi > lo && (hi - lo) < 1e12
+}
 
 // ── Start ────────────────────────────────────────────────────────────────--
 
@@ -293,6 +345,7 @@ pub fn start_camera(
     // Acquisition is started inside the capture thread once everything is wired.
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
+    let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
     let packet_payload = stream_params.packet_size.saturating_sub(8).max(1) as usize;
     let cam_name = info.display_name();
 
@@ -300,13 +353,14 @@ pub fn start_camera(
         .name("gev-capture".into())
         .spawn(move || {
             capture_loop(
-                rt, dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, log_tx,
+                rt, dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx, log_tx,
             );
         })?;
 
     Ok(GevHandle {
         controls,
         cmd_tx,
+        controls_rx,
         join_handle: Some(join_handle),
     })
 }
@@ -432,60 +486,66 @@ fn configure_acquisition(
     }
 }
 
-/// Build the UI control list from the curated SFNC feature set.
+/// Build the UI control list by reading each curated feature live from the
+/// camera's GenICam tree (type, value, range, writability, enum options).
 fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime) -> Vec<GevControl> {
     let mut out = Vec::new();
-    let mut bridge = DeviceBridge { rt, dev };
+    let mut b = DeviceBridge { rt, dev };
 
-    for &name in CONTROL_FEATURES {
-        let Some(nid) = g.store.id_by_name(name) else { continue };
-        if let Some(f) = nid.as_ifloat_kind(&g.store) {
-            let value = f.value(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let fmin = f.min(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let fmax = f.max(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let writable = f.is_writable(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(false);
+    for spec in CONTROLS {
+        let Some(nid) = g.store.id_by_name(spec.name) else { continue };
+        let base = |kind, unit: String| GevControl {
+            name: spec.name.to_string(),
+            display: spec.name.to_string(),
+            category: spec.category.to_string(),
+            kind,
+            unit,
+            value: 0, min: 0, max: 0,
+            fvalue: 0.0, fmin: 0.0, fmax: 0.0,
+            writable: false,
+            needs_restart: spec.restart,
+        };
+
+        // Order matters: boolean/enumeration before integer, since some are both.
+        if let Some(bn) = nid.as_iboolean_kind(&g.store) {
+            let writable = bn.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
+            let v = bn.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
+            let mut c = base(GevControlKind::Boolean, String::new());
+            c.value = v as i64; c.writable = writable;
+            out.push(c);
+        } else if let Some(en) = nid.as_ienumeration_kind(&g.store) {
+            let writable = en.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
+            let opts: Vec<String> = en.entries(&g.store).iter()
+                .filter_map(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()))
+                .collect();
+            let cur = en.current_entry(&mut b, &g.store, &mut g.ctxt).ok()
+                .and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()));
+            let idx = cur.as_ref().and_then(|s| opts.iter().position(|o| o == s)).unwrap_or(0);
+            let mut c = base(GevControlKind::Enumeration(opts), String::new());
+            c.value = idx as i64; c.writable = writable;
+            out.push(c);
+        } else if let Some(f) = nid.as_ifloat_kind(&g.store) {
             let unit = f.unit(&g.store).unwrap_or("").to_string();
-            out.push(GevControl {
-                name: name.to_string(),
-                display: name.to_string(),
-                kind: GevControlKind::Float,
-                unit,
-                value: 0, min: 0, max: 0,
-                fvalue: value, fmin, fmax,
-                writable,
-            });
+            let value = f.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+            let fmin = f.min(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+            let fmax = f.max(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+            let writable = f.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
+            // Unbounded floats (e.g. DeviceTemperature) → read-only display.
+            let kind = if sane_range(fmin, fmax) { GevControlKind::Float } else { GevControlKind::ReadOnly };
+            let mut c = base(kind, unit);
+            c.fvalue = value; c.fmin = fmin; c.fmax = fmax; c.writable = writable;
+            out.push(c);
         } else if let Some(i) = nid.as_iinteger_kind(&g.store) {
-            let value = i.value(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0);
-            let min = i.min(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0);
-            let max = i.max(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0);
-            let writable = i.is_writable(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(false);
             let unit = i.unit(&g.store).unwrap_or("").to_string();
-            out.push(GevControl {
-                name: name.to_string(),
-                display: name.to_string(),
-                kind: GevControlKind::Integer,
-                unit,
-                value, min, max,
-                fvalue: 0.0, fmin: 0.0, fmax: 0.0,
-                writable,
-            });
-        }
-    }
-
-    for &name in READONLY_FEATURES {
-        let Some(nid) = g.store.id_by_name(name) else { continue };
-        if let Some(f) = nid.as_ifloat_kind(&g.store) {
-            let value = f.value(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let unit = f.unit(&g.store).unwrap_or("").to_string();
-            out.push(GevControl {
-                name: name.to_string(),
-                display: name.to_string(),
-                kind: GevControlKind::ReadOnly,
-                unit,
-                value: 0, min: 0, max: 0,
-                fvalue: value, fmin: 0.0, fmax: 0.0,
-                writable: false,
-            });
+            let value = i.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
+            let min = i.min(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
+            let max = i.max(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
+            let writable = i.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
+            let mut c = base(GevControlKind::Integer, unit);
+            c.value = value; c.min = min; c.max = max; c.writable = writable;
+            out.push(c);
+        } else if nid.as_icommand_kind(&g.store).is_some() {
+            out.push(base(GevControlKind::Command, String::new()));
         }
     }
 
@@ -504,6 +564,7 @@ fn capture_loop(
     cam_name: &str,
     frame_tx: Sender<FrameData>,
     cmd_rx: Receiver<GevCmd>,
+    controls_tx: Sender<Vec<GevControl>>,
     log_tx: Sender<LogEntry>,
 ) {
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
@@ -521,24 +582,24 @@ fn capture_loop(
     loop {
         // 1. Service pending commands (sync GenICam access, not inside block_on).
         let mut stop = false;
+        let mut changed = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 GevCmd::Stop => { stop = true; break; }
-                GevCmd::SetInt(name, v) => {
+                other => {
                     if let Some(g) = genapi.as_mut() {
-                        set_int_feature(g, &mut dev, &rt, &name, v, &log_tx);
+                        apply_set(g, &mut dev, &rt, other, &log_tx);
+                        changed = true;
                     }
                 }
-                GevCmd::SetFloat(name, v) => {
-                    if let Some(g) = genapi.as_mut() {
-                        set_float_feature(g, &mut dev, &rt, &name, v, &log_tx);
-                    }
-                }
-                GevCmd::Execute(name) => {
-                    if let Some(g) = genapi.as_mut() {
-                        execute_command(g, &mut dev, &rt, &name, &log_tx);
-                    }
-                }
+            }
+        }
+        // After any change, push a fresh control snapshot so the UI reflects new
+        // values and writability (e.g. ExposureAuto=Off unlocks ExposureTime).
+        if changed {
+            if let Some(g) = genapi.as_mut() {
+                let snap = build_controls(g, &mut dev, &rt);
+                let _ = controls_tx.try_send(snap);
             }
         }
         if stop {
@@ -614,8 +675,7 @@ async fn receive_until_frame(
         match packet {
             GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
                 *geom = Some(FrameGeometry { width, height, pixel_format });
-                let bytes_per_pixel = bytes_per_pixel(pixel_format).max(1);
-                let total_bytes = width as usize * height as usize * bytes_per_pixel;
+                let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
                 let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
                 let pool = BytesMut::zeroed(expected_packets * packet_payload);
                 let dl = Instant::now() + FRAME_DEADLINE;
@@ -645,16 +705,14 @@ async fn receive_until_frame(
 
 // ── Pixel decode ─────────────────────────────────────────────────────────--
 
-/// GVSP pixel format codes (GenICam PFNC). Only mono formats are handled.
-fn bytes_per_pixel(pixel_format: u32) -> usize {
+/// Total GVSP payload bytes for a frame, given the pixel format and pixel count.
+/// Packed formats use fractional bytes/pixel.
+fn frame_payload_bytes(pixel_format: u32, npix: usize) -> usize {
     match pixel_format {
-        // Mono8
-        0x01080001 => 1,
-        // Mono10/12/14/16 (unpacked, 16-bit container)
-        0x01100003 | 0x01100005 | 0x01100025 | 0x01100007 => 2,
-        // Mono10p / Mono12p (packed) — handled specially; report 0 to signal packed
-        0x010A0046 | 0x010C0047 => 0,
-        _ => 2,
+        0x01080001 => npix,                            // Mono8
+        0x010C0006 | 0x010C0047 => npix * 3 / 2,       // Mono12Packed / Mono12p
+        0x010A0046 => npix * 5 / 4,                     // Mono10p
+        _ => npix * 2,                                  // 16-bit container (Mono10/12/14/16)
     }
 }
 
@@ -686,7 +744,7 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
             };
             Some((mono, g.width, g.height, bit_depth))
         }
-        // Mono12p packed: 2 pixels per 3 bytes.
+        // Mono12p packed: 2 pixels per 3 bytes (little-endian nibble order).
         0x010C0047 => {
             let needed = npix * 3 / 2;
             if payload.len() < needed { return None; }
@@ -694,6 +752,20 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x0F) as u16) << 8);
                 let p1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
+                mono.push(p0 as f32);
+                mono.push(p1 as f32);
+            }
+            mono.truncate(npix);
+            Some((mono, g.width, g.height, 12))
+        }
+        // Mono12Packed (GEV 1.x / FLIR): 2 pixels per 3 bytes, high byte first.
+        0x010C0006 => {
+            let needed = npix * 3 / 2;
+            if payload.len() < needed { return None; }
+            let mut mono = Vec::with_capacity(npix);
+            for chunk in payload[..needed].chunks_exact(3) {
+                let p0 = ((chunk[0] as u16) << 4) | ((chunk[1] & 0x0F) as u16);
+                let p1 = ((chunk[2] as u16) << 4) | ((chunk[1] >> 4) as u16);
                 mono.push(p0 as f32);
                 mono.push(p1 as f32);
             }
@@ -743,6 +815,28 @@ fn set_int_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &st
     }
 }
 
+fn set_enum_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, sym: &str, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { rt, dev };
+    if let Some(nid) = g.store.id_by_name(name) {
+        if let Some(en) = nid.as_ienumeration_kind(&g.store) {
+            if let Err(e) = en.set_entry_by_symbolic(sym, &mut bridge, &g.store, &mut g.ctxt) {
+                let _ = log_tx.try_send(LogEntry::error(format!("GigE set {name}={sym}: {e}")));
+            }
+        }
+    }
+}
+
+fn set_bool_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, v: bool, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { rt, dev };
+    if let Some(nid) = g.store.id_by_name(name) {
+        if let Some(bn) = nid.as_iboolean_kind(&g.store) {
+            if let Err(e) = bn.set_value(v, &mut bridge, &g.store, &mut g.ctxt) {
+                let _ = log_tx.try_send(LogEntry::error(format!("GigE set {name}={v}: {e}")));
+            }
+        }
+    }
+}
+
 fn execute_command(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, log_tx: &Sender<LogEntry>) {
     let mut bridge = DeviceBridge { rt, dev };
     if let Some(nid) = g.store.id_by_name(name) {
@@ -751,6 +845,32 @@ fn execute_command(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &st
                 let _ = log_tx.try_send(LogEntry::error(format!("GigE execute {name}: {e}")));
             }
         }
+    }
+}
+
+/// Apply a Set* / Execute command. Features that change frame geometry
+/// (PixelFormat, Width/Height, binning) can't be written while streaming, so for
+/// those we stop acquisition, apply, and restart.
+fn apply_set(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, cmd: GevCmd, log_tx: &Sender<LogEntry>) {
+    let restart = match &cmd {
+        GevCmd::SetInt(n, _) | GevCmd::SetFloat(n, _) | GevCmd::SetEnum(n, _) | GevCmd::SetBool(n, _) => needs_restart(n),
+        _ => false,
+    };
+    if restart {
+        execute_command(g, dev, rt, "AcquisitionStop", log_tx);
+        set_int_feature(g, dev, rt, "TLParamsLocked", 0, log_tx);
+    }
+    match cmd {
+        GevCmd::SetInt(n, v) => set_int_feature(g, dev, rt, &n, v, log_tx),
+        GevCmd::SetFloat(n, v) => set_float_feature(g, dev, rt, &n, v, log_tx),
+        GevCmd::SetEnum(n, s) => set_enum_feature(g, dev, rt, &n, &s, log_tx),
+        GevCmd::SetBool(n, v) => set_bool_feature(g, dev, rt, &n, v, log_tx),
+        GevCmd::Execute(n) => execute_command(g, dev, rt, &n, log_tx),
+        GevCmd::Stop => {}
+    }
+    if restart {
+        set_int_feature(g, dev, rt, "TLParamsLocked", 1, log_tx);
+        execute_command(g, dev, rt, "AcquisitionStart", log_tx);
     }
 }
 
@@ -771,4 +891,4 @@ fn local_ipv4_towards(target: Ipv4Addr) -> Ipv4Addr {
 }
 
 // Trait imports needed for the `*Kind` method calls above.
-use cameleon_genapi::interface::{ICommand, IEnumeration, IFloat, IInteger};
+use cameleon_genapi::interface::{IBoolean, ICommand, IEnumeration, IFloat, IInteger};

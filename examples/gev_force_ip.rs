@@ -63,32 +63,28 @@ async fn main() -> anyhow::Result<()> {
     let iface_ip = iface.ipv4().ok_or_else(|| anyhow::anyhow!("interface {} has no IPv4 address", iface.name()))?;
     println!("Using interface {} (ip {})", iface.name(), iface_ip);
 
-    // Limited-broadcast discovery — reaches a camera on any subnet. A DHCP-first
-    // camera (e.g. FLIR/Point Grey Blackfly) on a network with no DHCP server can
-    // take up to ~60 s to fall back to a link-local 169.254.x.x address before it
-    // answers, so optionally keep retrying for `--wait` seconds.
-    let wait_secs: u64 = args.get("wait").map_or(Ok(0), |s| s.parse())?;
-    println!("Discovering via 255.255.255.255 on {}…", iface.name());
-    let found = discover_until(iface_ip, wait_secs).await?;
-    if found.is_empty() {
-        println!(
-            "no cameras answered. If this is a DHCP-first camera with no DHCP server here, give it \
-             time to fall back to a 169.254.x.x link-local address — re-run with `--wait 90` to poll \
-             for up to 90 s. Otherwise check the link light, that {host_ip} is assigned to the \
-             adapter, and that the camera has power. Re-run with --verbose for the raw trace."
-        );
-        return Ok(());
-    }
-    for d in &found {
-        println!("  • {} @ {} (mac {})", describe(d), d.ip, fmt_mac(d.mac));
-    }
-
-    // Pick the target camera.
-    let cam = match want_mac {
-        Some(mac) => found.iter().find(|d| d.mac == mac).cloned().ok_or_else(|| {
-            anyhow::anyhow!("no discovered camera with MAC {}", fmt_mac(mac))
-        })?,
-        None => found[0].clone(),
+    // If a MAC is given explicitly, FORCEIP it directly — no discovery needed
+    // (FORCEIP is a MAC-targeted broadcast; the camera need not be reachable yet).
+    // Otherwise, limited-broadcast discovery finds it.
+    let cam = if let Some(mac) = want_mac {
+        println!("Targeting camera by MAC {} directly (skipping discovery).", fmt_mac(mac));
+        Found { mac, ip: Ipv4Addr::UNSPECIFIED, manufacturer: String::new(), model: String::new() }
+    } else {
+        let wait_secs: u64 = args.get("wait").map_or(Ok(0), |s| s.parse())?;
+        println!("Discovering via 255.255.255.255 on {}…", iface.name());
+        let found = discover_until(iface_ip, wait_secs).await?;
+        if found.is_empty() {
+            println!(
+                "no cameras answered. If this is a DHCP-first camera with no DHCP server here, give it \
+                 time to fall back to a 169.254.x.x link-local address — re-run with `--wait 90` to poll \
+                 for up to 90 s, or pass --mac <addr> to force it directly. Re-run with --verbose for the raw trace."
+            );
+            return Ok(());
+        }
+        for d in &found {
+            println!("  • {} @ {} (mac {})", describe(d), d.ip, fmt_mac(d.mac));
+        }
+        found[0].clone()
     };
 
     if args.contains_key("discover-only") {
@@ -101,18 +97,27 @@ async fn main() -> anyhow::Result<()> {
         describe(&cam), fmt_mac(cam.mac), cam.ip, target_ip, subnet, gateway
     );
     gvcp::force_ip(cam.mac, target_ip, subnet, gateway, Some(&iface)).await?;
-    println!("FORCEIP acknowledged.");
+    println!("FORCEIP acknowledged. Camera should now be at {target_ip} (temporary — reverts to its");
+    println!("persistent IP on power-cycle).");
 
-    // Verify by re-discovering and checking the new address.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    println!("\nRe-discovering to verify…");
-    let after = discover_limited(iface_ip, Duration::from_millis(1500)).await?;
-    match after.iter().find(|d| d.mac == cam.mac) {
-        Some(d) if d.ip == target_ip => {
-            println!("✓ camera now at {} — you can open it in the viewer.", d.ip);
+    // If the new IP is on this host's subnet we can verify; otherwise (the usual
+    // cross-subnet case) the host must move to the new subnet first.
+    let same_subnet = on_same_24(iface_ip, target_ip);
+    if same_subnet {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        println!("\nVerifying…");
+        let after = discover_limited(iface_ip, Duration::from_millis(1500)).await?;
+        match after.iter().find(|d| d.mac == cam.mac) {
+            Some(d) if d.ip == target_ip => println!("✓ camera now at {}.", d.ip),
+            Some(d) => println!("camera reports {} (expected {target_ip}); may still be settling.", d.ip),
+            None => println!("camera didn't answer the verify scan; try pinging {target_ip}."),
         }
-        Some(d) => println!("camera reports {} (expected {target_ip}); it may still be settling.", d.ip),
-        None => println!("camera did not answer the verification scan; try the viewer's Refresh GigE."),
+    } else {
+        println!(
+            "\nNew IP {target_ip} is on a different subnet than this host ({iface_ip}), so it can't be \
+             verified from here. Now change this computer's IP onto the {} subnet, then `ping {target_ip}`.",
+            subnet_label(target_ip, subnet)
+        );
     }
     Ok(())
 }
@@ -239,6 +244,16 @@ fn parse_mac(s: &str) -> anyhow::Result<[u8; 6]> {
 
 fn fmt_mac(mac: [u8; 6]) -> String {
     mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+fn on_same_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
+    a.octets()[..3] == b.octets()[..3]
+}
+
+fn subnet_label(ip: Ipv4Addr, mask: Ipv4Addr) -> String {
+    let net: Vec<u8> = ip.octets().iter().zip(mask.octets()).map(|(i, m)| i & m).collect();
+    let bits = mask.octets().iter().map(|b| b.count_ones()).sum::<u32>();
+    format!("{}.{}.{}.{}/{}", net[0], net[1], net[2], net[3], bits)
 }
 
 fn describe(d: &Found) -> String {

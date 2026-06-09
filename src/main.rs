@@ -13,6 +13,9 @@ mod widgets;
 #[cfg(feature = "svbony")]
 mod camera;
 
+#[cfg(feature = "gev")]
+mod gev_camera;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
@@ -70,6 +73,8 @@ enum CameraSource {
     FitsFile(std::path::PathBuf),
     #[cfg(feature = "svbony")]
     SVBony(i32),
+    #[cfg(feature = "gev")]
+    Gev(String),
 }
 
 enum CaptureState {
@@ -78,6 +83,11 @@ enum CaptureState {
     SVBony {
         handle: camera::CameraHandle,
         control_values: Vec<(svbony::ControlType, i64, bool)>,
+    },
+    #[cfg(feature = "gev")]
+    Gev {
+        handle: gev_camera::GevHandle,
+        controls: Vec<gev_camera::GevControl>,
     },
     Stopped,
 }
@@ -237,7 +247,11 @@ struct ViewerApp {
 
     #[cfg(feature = "svbony")]
     discovered_cameras: Vec<svbony::CameraInfo>,
-    #[cfg(feature = "svbony")]
+    #[cfg(feature = "gev")]
+    discovered_gev: Vec<gev_camera::GevDeviceInfo>,
+    #[cfg(feature = "gev")]
+    gev_manual_ip: String,
+    #[cfg(any(feature = "svbony", feature = "gev"))]
     camera_error: Option<String>,
 }
 
@@ -288,7 +302,11 @@ impl ViewerApp {
         #[cfg(feature = "svbony")]
         let discovered_cameras = camera::enumerate();
 
-        #[cfg(feature = "svbony")]
+        #[cfg(feature = "gev")]
+        let discovered_gev = gev_camera::enumerate();
+
+        #[cfg(any(feature = "svbony", feature = "gev"))]
+        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
         let mut camera_error: Option<String> = None;
 
         let (camera_source, capture_state, capture_running);
@@ -399,7 +417,11 @@ impl ViewerApp {
             pending_fits_load: None,
             #[cfg(feature = "svbony")]
             discovered_cameras,
-            #[cfg(feature = "svbony")]
+            #[cfg(feature = "gev")]
+            discovered_gev,
+            #[cfg(feature = "gev")]
+            gev_manual_ip: String::new(),
+            #[cfg(any(feature = "svbony", feature = "gev"))]
             camera_error,
         };
 
@@ -789,19 +811,23 @@ impl ViewerApp {
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
             // Estimate exposure time from camera controls (microseconds)
-            let exposure_us: f64 = {
-                #[cfg(feature = "svbony")]
-                {
-                    if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
-                        control_values.iter()
-                            .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
-                            .map(|(_, v, _)| *v as f64)
-                            .unwrap_or(0.0)
-                    } else { 0.0 }
-                }
-                #[cfg(not(feature = "svbony"))]
-                { 0.0 }
-            };
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev")), allow(unused_mut))]
+            let mut exposure_us: f64 = 0.0;
+            #[cfg(feature = "svbony")]
+            if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
+                exposure_us = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
+                    .map(|(_, v, _)| *v as f64)
+                    .unwrap_or(0.0);
+            }
+            #[cfg(feature = "gev")]
+            if let CaptureState::Gev { ref controls, .. } = self.capture_state {
+                // GenICam ExposureTime is reported in microseconds.
+                exposure_us = controls.iter()
+                    .find(|c| c.name == "ExposureTime")
+                    .map(|c| c.fvalue)
+                    .unwrap_or(0.0);
+            }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
             let mid = chrono::Utc::now() - chrono::Duration::microseconds((exposure_us / 2.0) as i64);
@@ -836,6 +862,10 @@ impl ViewerApp {
                 if let Some(jh) = handle.join_handle.take() {
                     let _ = jh.join();
                 }
+            }
+            #[cfg(feature = "gev")]
+            CaptureState::Gev { mut handle, .. } => {
+                handle.stop();
             }
             CaptureState::Stopped => {}
         }
@@ -952,6 +982,28 @@ impl ViewerApp {
             }
             Err(e) => {
                 let msg = format!("Failed to open camera: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
+    #[cfg(feature = "gev")]
+    fn start_gev(&mut self, info: &gev_camera::GevDeviceInfo) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        match gev_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok(handle) => {
+                let controls = handle.controls.clone();
+                self.add_log(LogEntry::info(format!("GigE camera opened: {}", info.display_name())));
+                let id = info.id.clone();
+                self.capture_state = CaptureState::Gev { handle, controls };
+                self.camera_source = CameraSource::Gev(id);
+                self.capture_running = true;
+            }
+            Err(e) => {
+                let msg = format!("Failed to open GigE camera: {}", e);
                 self.camera_error = Some(msg.clone());
                 self.add_log(LogEntry::error(msg));
             }
@@ -1146,10 +1198,17 @@ impl ViewerApp {
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| format!("Camera {}", cam_id))
                 }
+                #[cfg(feature = "gev")]
+                CameraSource::Gev(id) => {
+                    self.discovered_gev.iter()
+                        .find(|c| c.id == *id)
+                        .map(|c| c.display_name())
+                        .unwrap_or_else(|| format!("GigE {}", id))
+                }
             };
             ui.label(egui::RichText::new(source_label).size(13.0).color(pal.accent));
 
-            #[cfg(feature = "svbony")]
+            #[cfg(any(feature = "svbony", feature = "gev"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
@@ -1166,6 +1225,38 @@ impl ViewerApp {
                 }
                 #[cfg(feature = "svbony")]
                 CameraSource::SVBony(_) => {}
+                #[cfg(feature = "gev")]
+                CameraSource::Gev(_) => {}
+            }
+
+            // GigE: connect directly by IP (needed when a camera is reachable by
+            // unicast but doesn't answer broadcast discovery).
+            #[cfg(feature = "gev")]
+            {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("GigE IP:");
+                    ui.add(egui::TextEdit::singleline(&mut self.gev_manual_ip)
+                        .hint_text("192.168.0.2").desired_width(120.0));
+                });
+                if widgets::styled_button(ui, "Connect to IP", &pal) {
+                    match self.gev_manual_ip.trim().parse::<std::net::Ipv4Addr>() {
+                        Ok(ip) => {
+                            let info = gev_camera::GevDeviceInfo {
+                                ip,
+                                model: String::new(),
+                                manufacturer: String::new(),
+                                id: ip.to_string(),
+                            };
+                            self.start_gev(&info);
+                        }
+                        Err(_) => {
+                            self.camera_error = Some(format!(
+                                "Invalid IP: '{}'", self.gev_manual_ip.trim()
+                            ));
+                        }
+                    }
+                }
             }
 
             // Open FITS shortcut
@@ -1494,39 +1585,108 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(feature = "svbony")]
+    #[cfg(any(feature = "svbony", feature = "gev"))]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
-        let pal = self.pal();
-        if let CaptureState::SVBony { ref handle, ref mut control_values } = self.capture_state {
-            let n = handle.controls.len();
-            let mid = (n + 1) / 2;
-            let label_w = 120.0_f32;
-            let value_w = 80.0_f32;
-            let auto_w = 65.0_f32;
-
-            // Two-column layout
-            ui.columns(2, |cols| {
-                let col_w = cols[0].available_width();
-                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
-                cols[0].spacing_mut().item_spacing.y = 8.0;
-                for idx in 0..mid {
-                    Self::draw_control(&mut cols[0], &handle.controls[idx], &mut control_values[idx],
-                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
-                }
-                let col_w = cols[1].available_width();
-                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
-                cols[1].spacing_mut().item_spacing.y = 8.0;
-                for idx in mid..n {
-                    Self::draw_control(&mut cols[1], &handle.controls[idx], &mut control_values[idx],
-                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
-                }
-            });
-        } else {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
-            });
+        #[cfg(feature = "gev")]
+        if matches!(self.capture_state, CaptureState::Gev { .. }) {
+            self.gev_controls_content(ui);
+            return;
         }
+        #[cfg(feature = "svbony")]
+        {
+            let pal = self.pal();
+            if let CaptureState::SVBony { ref handle, ref mut control_values } = self.capture_state {
+                let n = handle.controls.len();
+                let mid = (n + 1) / 2;
+                let label_w = 120.0_f32;
+                let value_w = 80.0_f32;
+                let auto_w = 65.0_f32;
+
+                // Two-column layout
+                ui.columns(2, |cols| {
+                    let col_w = cols[0].available_width();
+                    let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                    cols[0].spacing_mut().item_spacing.y = 8.0;
+                    for idx in 0..mid {
+                        Self::draw_control(&mut cols[0], &handle.controls[idx], &mut control_values[idx],
+                            &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                    }
+                    let col_w = cols[1].available_width();
+                    let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                    cols[1].spacing_mut().item_spacing.y = 8.0;
+                    for idx in mid..n {
+                        Self::draw_control(&mut cols[1], &handle.controls[idx], &mut control_values[idx],
+                            &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                    }
+                });
+                return;
+            }
+        }
+        // No camera connected (or non-SVBony build).
+        let pal = self.pal();
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
+        });
+    }
+
+    /// Render the GigE camera's GenICam-derived controls. Floats use a log slider
+    /// (good for exposure), integers a linear slider; commands a button; read-only
+    /// values as text. Edits are sent to the capture thread via `GevCmd`.
+    #[cfg(feature = "gev")]
+    fn gev_controls_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state else { return };
+        egui::Grid::new("gev_controls")
+            .num_columns(3)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                for c in controls.iter_mut() {
+                    ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
+                    match &c.kind {
+                        gev_camera::GevControlKind::Float => {
+                            let old = c.fvalue;
+                            let mut v = c.fvalue;
+                            let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
+                            ui.add_enabled(c.writable, egui::Slider::new(&mut v, range).logarithmic(true));
+                            let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
+                            ui.label(egui::RichText::new(format!("{:.3}{}", v, unit)).monospace());
+                            if c.writable && (v - old).abs() > f64::EPSILON {
+                                c.fvalue = v;
+                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::SetFloat(c.name.clone(), v));
+                            }
+                        }
+                        gev_camera::GevControlKind::Integer => {
+                            let old = c.value;
+                            let mut v = c.value;
+                            ui.add_enabled(c.writable, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                            ui.label(egui::RichText::new(format!("{}", v)).monospace());
+                            if c.writable && v != old {
+                                c.value = v;
+                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::SetInt(c.name.clone(), v));
+                            }
+                        }
+                        gev_camera::GevControlKind::Enumeration(_entries) => {
+                            // Enumerations (e.g. PixelFormat) are configured at open
+                            // time; shown read-only for now.
+                            ui.label(egui::RichText::new(format!("{}", c.value)).monospace());
+                            ui.label("");
+                        }
+                        gev_camera::GevControlKind::Command => {
+                            if ui.button("Execute").clicked() {
+                                let _ = handle.cmd_tx.send(gev_camera::GevCmd::Execute(c.name.clone()));
+                            }
+                            ui.label("");
+                        }
+                        gev_camera::GevControlKind::ReadOnly => {
+                            let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
+                            ui.label(egui::RichText::new(format!("{:.3}{}", c.fvalue, unit)).monospace().color(pal.text_secondary));
+                            ui.label("");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
     }
 
     #[cfg(feature = "svbony")]
@@ -2200,6 +2360,13 @@ impl eframe::App for ViewerApp {
                                             self.start_svbony(&info);
                                         }
                                     }
+                                    #[cfg(feature = "gev")]
+                                    CameraSource::Gev(id) => {
+                                        let id = id.clone();
+                                        if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
+                                            self.start_gev(&info);
+                                        }
+                                    }
                                 }
                                 ui.close();
                             }
@@ -2215,6 +2382,24 @@ impl eframe::App for ViewerApp {
                                 let label = format!("{} ({})", cam_info.name, cam_info.serial);
                                 if menu_radio(ui, is_this, &label) && !is_this {
                                     self.start_svbony(cam_info);
+                                    ui.close();
+                                }
+                            }
+                        }
+                        #[cfg(feature = "gev")]
+                        {
+                            ui.separator();
+                            // To connect by IP, use the "GigE IP" field in the
+                            // side-panel Camera section (text entry inside a menu
+                            // is unreliable in egui).
+                            if ui.button("Refresh GigE Cameras").clicked() {
+                                self.discovered_gev = gev_camera::enumerate();
+                            }
+                            for gev_info in &self.discovered_gev.clone() {
+                                let is_this = matches!(&self.camera_source, CameraSource::Gev(id) if *id == gev_info.id);
+                                let label = format!("{} ({})", gev_info.display_name(), gev_info.ip);
+                                if menu_radio(ui, is_this, &label) && !is_this {
+                                    self.start_gev(gev_info);
                                     ui.close();
                                 }
                             }
@@ -2270,6 +2455,13 @@ impl eframe::App for ViewerApp {
                                 let cam_id = *cam_id;
                                 if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
                                     self.start_svbony(&info);
+                                }
+                            }
+                            #[cfg(feature = "gev")]
+                            CameraSource::Gev(id) => {
+                                let id = id.clone();
+                                if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
+                                    self.start_gev(&info);
                                 }
                             }
                         }
@@ -2363,13 +2555,13 @@ impl eframe::App for ViewerApp {
                         match self.bottom_tab {
                             BottomTab::Histogram => self.histogram_content(ui),
                             BottomTab::Controls => {
-                                #[cfg(feature = "svbony")]
+                                #[cfg(any(feature = "svbony", feature = "gev"))]
                                 {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
                                         self.controls_content(ui);
                                     });
                                 }
-                                #[cfg(not(feature = "svbony"))]
+                                #[cfg(not(any(feature = "svbony", feature = "gev")))]
                                 ui.label("Camera support not compiled in");
                             }
                             #[cfg(feature = "starsolve")]

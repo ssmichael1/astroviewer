@@ -1666,14 +1666,18 @@ impl ViewerApp {
                             lbl.on_hover_text("Changing this briefly stops and restarts the stream");
                         }
                         let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
+                        // `needs_restart` controls (PixelFormat, Width/Height, binning)
+                        // read as read-only *while acquiring*, but we apply them by
+                        // stopping/restarting the stream — so keep them editable.
+                        let enabled = c.writable || c.needs_restart;
                         match &c.kind {
                             GevControlKind::Float => {
                                 let old = c.fvalue;
                                 let mut v = c.fvalue;
                                 let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
-                                ui.add_enabled(c.writable, egui::Slider::new(&mut v, range).logarithmic(true));
+                                ui.add_enabled(enabled, egui::Slider::new(&mut v, range).logarithmic(true));
                                 ui.label(egui::RichText::new(format!("{:.3}{unit}", v)).monospace());
-                                if c.writable && (v - old).abs() > f64::EPSILON {
+                                if enabled && (v - old).abs() > f64::EPSILON {
                                     c.fvalue = v;
                                     let _ = handle.cmd_tx.send(GevCmd::SetFloat(c.name.clone(), v));
                                 }
@@ -1681,9 +1685,9 @@ impl ViewerApp {
                             GevControlKind::Integer => {
                                 let old = c.value;
                                 let mut v = c.value;
-                                ui.add_enabled(c.writable, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                                ui.add_enabled(enabled, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
                                 ui.label(egui::RichText::new(format!("{v}{unit}")).monospace());
-                                if c.writable && v != old {
+                                if enabled && v != old {
                                     c.value = v;
                                     let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
                                 }
@@ -1696,7 +1700,7 @@ impl ViewerApp {
                                 let idx = c.value as usize;
                                 let cur = opts.get(idx).cloned().unwrap_or_default();
                                 let mut pick: Option<(usize, String)> = None;
-                                ui.add_enabled_ui(c.writable, |ui| {
+                                ui.add_enabled_ui(enabled, |ui| {
                                     egui::ComboBox::from_id_salt(&c.name)
                                         .selected_text(cur)
                                         .show_ui(ui, |ui| {
@@ -1708,7 +1712,7 @@ impl ViewerApp {
                                         });
                                 });
                                 ui.label("");
-                                if c.writable {
+                                if enabled {
                                     if let Some((i, sym)) = pick {
                                         c.value = i as i64;
                                         let _ = handle.cmd_tx.send(GevCmd::SetEnum(c.name.clone(), sym));
@@ -1717,9 +1721,9 @@ impl ViewerApp {
                             }
                             GevControlKind::Boolean => {
                                 let mut on = c.value != 0;
-                                let resp = ui.add_enabled(c.writable, egui::Checkbox::new(&mut on, ""));
+                                let resp = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, ""));
                                 ui.label("");
-                                if c.writable && resp.changed() {
+                                if enabled && resp.changed() {
                                     c.value = on as i64;
                                     let _ = handle.cmd_tx.send(GevCmd::SetBool(c.name.clone(), on));
                                 }

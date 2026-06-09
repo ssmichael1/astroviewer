@@ -155,6 +155,25 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Optional: test the GUI's set-PixelFormat-while-acquiring path.
+    // GEV_SETPF=Mono12Packed cargo run --example gev_stream ...
+    if let Ok(want) = std::env::var("GEV_SETPF") {
+        let mut b = Bridge { rt: &rt, dev: &mut dev };
+        let pf = g.store.id_by_name("PixelFormat").unwrap();
+        let before_w = pf.as_ienumeration_kind(&g.store).unwrap().is_writable(&mut b, &g.store, &mut g.ctxt);
+        println!("\nPixelFormat writable while acquiring? {before_w:?}  (expect Ok(false))");
+        // stop -> unlock -> set -> relock -> start
+        g.store.id_by_name("AcquisitionStop").unwrap().as_icommand_kind(&g.store).unwrap().execute(&mut b, &g.store, &mut g.ctxt).ok();
+        g.store.id_by_name("TLParamsLocked").unwrap().as_iinteger_kind(&g.store).unwrap().set_value(0, &mut b, &g.store, &mut g.ctxt).ok();
+        let set = pf.as_ienumeration_kind(&g.store).unwrap().set_entry_by_symbolic(&want, &mut b, &g.store, &mut g.ctxt);
+        println!("set PixelFormat = {want} -> {:?}", set.map(|_| "ok"));
+        g.store.id_by_name("TLParamsLocked").unwrap().as_iinteger_kind(&g.store).unwrap().set_value(1, &mut b, &g.store, &mut g.ctxt).ok();
+        g.store.id_by_name("AcquisitionStart").unwrap().as_icommand_kind(&g.store).unwrap().execute(&mut b, &g.store, &mut g.ctxt).ok();
+        let after = pf.as_ienumeration_kind(&g.store).unwrap().current_entry(&mut b, &g.store, &mut g.ctxt)
+            .ok().and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()));
+        println!("PixelFormat now reads = {after:?}");
+    }
+
     // Receive window (seconds) — optional 2nd arg, default 8.
     let listen_secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     println!("\nlistening for GVSP packets for {listen_secs} s…");

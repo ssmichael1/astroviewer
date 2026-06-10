@@ -7,7 +7,7 @@
 //! feature nodes; its register reads/writes are bridged onto `viva-gige`'s
 //! async control channel via a small synchronous [`Device`] adapter.
 //!
-//! Architecture mirrors `flicr_camera.rs`: this module owns a self-contained
+//! This module owns a self-contained
 //! capture thread that produces [`FrameData`] over the shared `frame_tx`
 //! channel and accepts control changes over a command channel. Because
 //! `viva-gige` is async (tokio) while the rest of the app is sync threads +

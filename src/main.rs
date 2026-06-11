@@ -251,6 +251,9 @@ struct ViewerApp {
     discovered_gev: Vec<gev_camera::GevDeviceInfo>,
     #[cfg(feature = "gev")]
     gev_manual_ip: String,
+    /// Substring filter for the GigE controls panel.
+    #[cfg(feature = "gev")]
+    gev_filter: String,
     #[cfg(any(feature = "svbony", feature = "gev"))]
     camera_error: Option<String>,
 }
@@ -421,6 +424,8 @@ impl ViewerApp {
             discovered_gev,
             #[cfg(feature = "gev")]
             gev_manual_ip: String::new(),
+            #[cfg(feature = "gev")]
+            gev_filter: String::new(),
             #[cfg(any(feature = "svbony", feature = "gev"))]
             camera_error,
         };
@@ -1637,70 +1642,117 @@ impl ViewerApp {
         });
     }
 
-    /// Render the GigE camera's GenICam-derived controls, grouped by category.
-    /// Floats → log slider, ints → slider, enums → combo, bools → checkbox,
-    /// commands → button, read-only → text. Controls disabled by an `Auto` mode
-    /// re-enable automatically once the capture thread pushes a fresh snapshot.
+    /// Render the GigE camera's GenICam-derived controls, grouped by the
+    /// camera's own categories in collapsible sections, with a substring
+    /// filter. Writable floats/ints → sliders, enums → combo, bools →
+    /// checkbox, commands → button; read-only features render as telemetry
+    /// text. Controls disabled by an `Auto` mode re-enable automatically once
+    /// the capture thread pushes a fresh snapshot.
     #[cfg(feature = "gev")]
     fn gev_controls_content(&mut self, ui: &mut egui::Ui) {
         use gev_camera::{GevCmd, GevControlKind};
         let pal = self.pal();
+        if !matches!(self.capture_state, CaptureState::Gev { .. }) { return }
+
+        // Filter box — the full GenICam tree can run to hundreds of features.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.gev_filter)
+                    .hint_text("Filter features…")
+                    .desired_width(180.0),
+            );
+            if !self.gev_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.gev_filter.clear();
+            }
+        });
+        let filter = self.gev_filter.trim().to_lowercase();
+        let filtering = !filter.is_empty();
+        let matches = |c: &gev_camera::GevControl| {
+            !filtering
+                || c.display.to_lowercase().contains(&filter)
+                || c.name.to_lowercase().contains(&filter)
+        };
+
         let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state else { return };
 
-        // Categories in first-seen order.
+        // Categories in first-seen (XML tree) order.
         let mut cats: Vec<String> = Vec::new();
         for c in controls.iter() {
             if !cats.contains(&c.category) { cats.push(c.category.clone()); }
         }
 
         for cat in &cats {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(cat).strong().color(pal.accent));
-            egui::Grid::new(format!("gev_ctrl_{cat}"))
-                .num_columns(3)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    for c in controls.iter_mut().filter(|c| &c.category == cat) {
-                        let lbl = ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
-                        if c.needs_restart {
-                            lbl.on_hover_text("Changing this briefly stops and restarts the stream");
-                        }
-                        let unit = if c.unit.is_empty() { String::new() } else { format!(" {}", c.unit) };
-                        // `needs_restart` controls (PixelFormat, Width/Height, binning)
-                        // read as read-only *while acquiring*, but we apply them by
-                        // stopping/restarting the stream — so keep them editable.
-                        let enabled = c.writable || c.needs_restart;
-                        match &c.kind {
-                            GevControlKind::Float => {
-                                let old = c.fvalue;
-                                let mut v = c.fvalue;
-                                let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
-                                ui.add_enabled(enabled, egui::Slider::new(&mut v, range).logarithmic(true));
-                                ui.label(egui::RichText::new(format!("{:.3}{unit}", v)).monospace());
-                                if enabled && (v - old).abs() > f64::EPSILON {
-                                    c.fvalue = v;
-                                    let _ = handle.cmd_tx.send(GevCmd::SetFloat(c.name.clone(), v));
-                                }
+            if !controls.iter().any(|c| &c.category == cat && matches(c)) {
+                continue;
+            }
+            ui.add_space(2.0);
+            let mut header = egui::CollapsingHeader::new(
+                egui::RichText::new(cat).strong().color(pal.accent),
+            )
+            .default_open(gev_category_default_open(cat));
+            if filtering {
+                header = header.open(Some(true)); // reveal matches; reverts when cleared
+            }
+            header.show(ui, |ui| {
+                ui.spacing_mut().slider_width = 120.0;
+                egui::Grid::new(format!("gev_ctrl_{cat}"))
+                    .num_columns(3)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        for c in controls.iter_mut().filter(|c| &c.category == cat && matches(c)) {
+                            let lbl = ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
+                            let mut hover = c.name.clone();
+                            if c.needs_restart {
+                                hover.push_str("\nChanging this briefly stops and restarts the stream");
                             }
-                            GevControlKind::Integer => {
-                                let old = c.value;
-                                let mut v = c.value;
-                                ui.add_enabled(enabled, egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
-                                ui.label(egui::RichText::new(format!("{v}{unit}")).monospace());
-                                if enabled && v != old {
-                                    c.value = v;
-                                    let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                            lbl.on_hover_text(hover);
+                            let unit = c.unit.clone();
+                            let unit_lbl = move |ui: &mut egui::Ui| {
+                                ui.label(egui::RichText::new(unit).small().color(pal.text_secondary));
+                            };
+                            let ro_text = |ui: &mut egui::Ui, text: String| {
+                                ui.label(egui::RichText::new(text).monospace().color(pal.text_primary));
+                            };
+                            // `needs_restart` controls (PixelFormat, Width/Height, binning)
+                            // read as read-only *while acquiring*, but we apply them by
+                            // stopping/restarting the stream — so keep them editable.
+                            let enabled = c.writable || c.needs_restart;
+                            match &c.kind {
+                                GevControlKind::Float if enabled => {
+                                    let old = c.fvalue;
+                                    let mut v = c.fvalue;
+                                    let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
+                                    ui.add(egui::Slider::new(&mut v, range).logarithmic(true));
+                                    unit_lbl(ui);
+                                    if (v - old).abs() > f64::EPSILON {
+                                        c.fvalue = v;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetFloat(c.name.clone(), v));
+                                    }
                                 }
-                            }
-                            GevControlKind::Enumeration(_) => {
-                                let opts: Vec<String> = match &c.kind {
-                                    GevControlKind::Enumeration(o) => o.clone(),
-                                    _ => Vec::new(),
-                                };
-                                let idx = c.value as usize;
-                                let cur = opts.get(idx).cloned().unwrap_or_default();
-                                let mut pick: Option<(usize, String)> = None;
-                                ui.add_enabled_ui(enabled, |ui| {
+                                GevControlKind::Float | GevControlKind::ReadOnly => {
+                                    ro_text(ui, fmt_gev_float(c.fvalue));
+                                    unit_lbl(ui);
+                                }
+                                GevControlKind::Integer if enabled => {
+                                    let old = c.value;
+                                    let mut v = c.value;
+                                    ui.add(egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                                    unit_lbl(ui);
+                                    if v != old {
+                                        c.value = v;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                                    }
+                                }
+                                GevControlKind::Integer => {
+                                    ro_text(ui, c.value.to_string());
+                                    unit_lbl(ui);
+                                }
+                                GevControlKind::Enumeration(opts) if enabled => {
+                                    let opts = opts.clone();
+                                    let idx = c.value as usize;
+                                    let cur = opts.get(idx).cloned().unwrap_or_default();
+                                    let mut pick: Option<(usize, String)> = None;
                                     egui::ComboBox::from_id_salt(&c.name)
                                         .selected_text(cur)
                                         .show_ui(ui, |ui| {
@@ -1710,39 +1762,41 @@ impl ViewerApp {
                                                 }
                                             }
                                         });
-                                });
-                                ui.label("");
-                                if enabled {
+                                    ui.label("");
                                     if let Some((i, sym)) = pick {
                                         c.value = i as i64;
                                         let _ = handle.cmd_tx.send(GevCmd::SetEnum(c.name.clone(), sym));
                                     }
                                 }
-                            }
-                            GevControlKind::Boolean => {
-                                let mut on = c.value != 0;
-                                let resp = ui.add_enabled(enabled, egui::Checkbox::new(&mut on, ""));
-                                ui.label("");
-                                if enabled && resp.changed() {
-                                    c.value = on as i64;
-                                    let _ = handle.cmd_tx.send(GevCmd::SetBool(c.name.clone(), on));
+                                GevControlKind::Enumeration(opts) => {
+                                    let cur = opts.get(c.value as usize).cloned().unwrap_or_default();
+                                    ro_text(ui, cur);
+                                    ui.label("");
+                                }
+                                GevControlKind::Boolean if enabled => {
+                                    let mut on = c.value != 0;
+                                    let resp = ui.add(egui::Checkbox::new(&mut on, ""));
+                                    ui.label("");
+                                    if resp.changed() {
+                                        c.value = on as i64;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetBool(c.name.clone(), on));
+                                    }
+                                }
+                                GevControlKind::Boolean => {
+                                    ro_text(ui, if c.value != 0 { "On".into() } else { "Off".into() });
+                                    ui.label("");
+                                }
+                                GevControlKind::Command => {
+                                    if ui.button("Execute").clicked() {
+                                        let _ = handle.cmd_tx.send(GevCmd::Execute(c.name.clone()));
+                                    }
+                                    ui.label("");
                                 }
                             }
-                            GevControlKind::Command => {
-                                if ui.button("Execute").clicked() {
-                                    let _ = handle.cmd_tx.send(GevCmd::Execute(c.name.clone()));
-                                }
-                                ui.label("");
-                            }
-                            GevControlKind::ReadOnly => {
-                                ui.label(egui::RichText::new(format!("{:.3}{unit}", c.fvalue))
-                                    .monospace().color(pal.text_secondary));
-                                ui.label("");
-                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                    }
-                });
+                    });
+            });
         }
     }
 
@@ -2178,6 +2232,30 @@ impl ViewerApp {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Categories worth showing expanded by default; the rest (device info,
+/// transport layer, …) start collapsed.
+#[cfg(feature = "gev")]
+fn gev_category_default_open(cat: &str) -> bool {
+    let c = cat.to_ascii_lowercase();
+    c.contains("acquisition") || c.contains("image") || c.contains("analog") || c.contains("gain")
+}
+
+/// Format a GenICam float for telemetry display: integers plain, otherwise
+/// precision scaled to magnitude.
+#[cfg(feature = "gev")]
+fn fmt_gev_float(v: f64) -> String {
+    let a = v.abs();
+    if v == v.trunc() && a < 1e7 {
+        format!("{v:.0}")
+    } else if a >= 1000.0 {
+        format!("{v:.1}")
+    } else if a >= 1.0 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.5}")
+    }
+}
 
 #[cfg(feature = "svbony")]
 fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {

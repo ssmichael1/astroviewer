@@ -41,6 +41,9 @@ const CCP_REGISTER: u32 = 0x0a00;
 const FIRST_URL_REGISTER: u64 = 0x0200;
 /// Heartbeat period. GigE devices default to a ~3 s heartbeat timeout.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
+/// How often to re-read non-writable (telemetry) feature values so the UI
+/// shows live temperature, status, etc.
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Stream channel index (single-channel cameras use 0).
 const STREAM_CHANNEL: u32 = 0;
 /// How long to wait for stream packets before returning to service commands.
@@ -316,11 +319,13 @@ pub fn start_camera(
     let packet_payload = stream_params.packet_size.saturating_sub(8).max(1) as usize;
     let cam_name = info.display_name();
 
+    let snapshot = controls.clone();
     let join_handle = std::thread::Builder::new()
         .name("gev-capture".into())
         .spawn(move || {
             capture_loop(
-                rt, dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx, log_tx,
+                rt, dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
+                snapshot, log_tx,
             );
         })?;
 
@@ -607,6 +612,50 @@ fn control_from_node(
     }
 }
 
+/// Re-read the current values of non-writable (telemetry) controls in place.
+/// Returns true if any value changed. Much cheaper than `build_controls`:
+/// skips ranges, writability, and all writable features.
+fn refresh_telemetry(
+    g: &mut GenApi,
+    dev: &mut GigeDevice,
+    rt: &Runtime,
+    controls: &mut [GevControl],
+) -> bool {
+    enum Upd { I(i64), F(f64) }
+    let mut b = DeviceBridge { rt, dev };
+    let mut changed = false;
+    for c in controls.iter_mut().filter(|c| !c.writable) {
+        let Some(nid) = g.store.id_by_name(&c.name) else { continue };
+        let upd = match &c.kind {
+            GevControlKind::Float | GevControlKind::ReadOnly => nid
+                .as_ifloat_kind(&g.store)
+                .and_then(|f| f.value(&mut b, &g.store, &mut g.ctxt).ok())
+                .map(Upd::F),
+            GevControlKind::Integer => nid
+                .as_iinteger_kind(&g.store)
+                .and_then(|i| i.value(&mut b, &g.store, &mut g.ctxt).ok())
+                .map(Upd::I),
+            GevControlKind::Boolean => nid
+                .as_iboolean_kind(&g.store)
+                .and_then(|bn| bn.value(&mut b, &g.store, &mut g.ctxt).ok())
+                .map(|v| Upd::I(v as i64)),
+            GevControlKind::Enumeration(opts) => nid
+                .as_ienumeration_kind(&g.store)
+                .and_then(|en| en.current_entry(&mut b, &g.store, &mut g.ctxt).ok())
+                .and_then(|e| e.expect_enum_entry(&g.store).ok())
+                .and_then(|x| opts.iter().position(|o| o == x.symbolic()))
+                .map(|i| Upd::I(i as i64)),
+            GevControlKind::Command => None,
+        };
+        match upd {
+            Some(Upd::F(v)) if v != c.fvalue => { c.fvalue = v; changed = true; }
+            Some(Upd::I(v)) if v != c.value => { c.value = v; changed = true; }
+            _ => {}
+        }
+    }
+    changed
+}
+
 // ── Capture loop ─────────────────────────────────────────────────────────--
 
 #[allow(clippy::too_many_arguments)]
@@ -620,6 +669,7 @@ fn capture_loop(
     frame_tx: Sender<FrameData>,
     cmd_rx: Receiver<GevCmd>,
     controls_tx: Sender<Vec<GevControl>>,
+    mut snapshot: Vec<GevControl>,
     log_tx: Sender<LogEntry>,
 ) {
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
@@ -630,6 +680,7 @@ fn capture_loop(
     }
 
     let mut last_heartbeat = Instant::now();
+    let mut last_telemetry = Instant::now();
     let mut assembly: Option<FrameAssembly> = None;
     let mut geom: Option<FrameGeometry> = None;
     let mut buf = vec![0u8; 65536];
@@ -653,8 +704,8 @@ fn capture_loop(
         // values and writability (e.g. ExposureAuto=Off unlocks ExposureTime).
         if changed {
             if let Some(g) = genapi.as_mut() {
-                let snap = build_controls(g, &mut dev, &rt);
-                let _ = controls_tx.try_send(snap);
+                snapshot = build_controls(g, &mut dev, &rt);
+                let _ = controls_tx.try_send(snapshot.clone());
             }
         }
         if stop {
@@ -673,6 +724,17 @@ fn capture_loop(
                 return;
             }
             last_heartbeat = Instant::now();
+        }
+
+        // 2b. Telemetry: re-read non-writable feature values periodically so
+        // the UI shows live temperature/status without a full rebuild.
+        if last_telemetry.elapsed() >= TELEMETRY_INTERVAL {
+            last_telemetry = Instant::now();
+            if let Some(g) = genapi.as_mut() {
+                if refresh_telemetry(g, &mut dev, &rt, &mut snapshot) {
+                    let _ = controls_tx.try_send(snapshot.clone());
+                }
+            }
         }
 
         // 3. Receive GVSP packets until a frame completes or the poll window expires.

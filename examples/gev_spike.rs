@@ -51,8 +51,9 @@ async fn main() -> anyhow::Result<()> {
 
     // First-URL bootstrap register → GenICam XML location.
     let raw = dev.read_mem(0x0200, 512).await?;
-    let url = String::from_utf8_lossy(&raw);
-    let url = url.trim_end_matches(['\0', ' ', '\r', '\n']).trim();
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len()); // cut at NUL; tail may be garbage
+    let url = String::from_utf8_lossy(&raw[..end]);
+    let url = url.trim();
     println!("GenICam URL: {url}");
 
     // Negotiate a stream channel toward our interface and bind a receive socket.

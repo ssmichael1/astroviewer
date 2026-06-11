@@ -19,16 +19,20 @@
 //!   cargo run --example gev_force_ip --features gev
 //!   cargo run --example gev_force_ip --features gev -- --ip 192.168.0.20
 //!   cargo run --example gev_force_ip --features gev -- --mac 00:11:1c:aa:bb:cc
+//!   cargo run --example gev_force_ip --features gev -- --ip 192.168.0.2 --persist
 //!
-//! The assigned IP is temporary (does not survive a camera power-cycle). For a
-//! permanent address use the camera's persistent-IP registers.
+//! The forced IP is temporary (does not survive a camera power-cycle) unless
+//! --persist is given, which additionally writes the camera's persistent-IP
+//! registers so it boots at the target address from then on. --persist requires
+//! the target IP to be on this host's subnet (we must open the camera to write
+//! the registers).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use viva_gige::gvcp;
+use viva_gige::gvcp::{self, consts, GigeDevice};
 use viva_gige::nic::Iface;
 
 /// A camera found via limited-broadcast discovery.
@@ -96,13 +100,22 @@ async fn main() -> anyhow::Result<()> {
         "\nForcing {} (mac {}) from {} → {}  mask {}  gw {}",
         describe(&cam), fmt_mac(cam.mac), cam.ip, target_ip, subnet, gateway
     );
-    gvcp::force_ip(cam.mac, target_ip, subnet, gateway, Some(&iface)).await?;
-    println!("FORCEIP acknowledged. Camera should now be at {target_ip} (temporary — reverts to its");
-    println!("persistent IP on power-cycle).");
+    match gvcp::force_ip(cam.mac, target_ip, subnet, gateway, Some(&iface)).await {
+        Ok(()) => println!("FORCEIP acknowledged."),
+        Err(e) => println!("FORCEIP not acknowledged ({e}); some cameras apply it silently — continuing."),
+    }
 
-    // If the new IP is on this host's subnet we can verify; otherwise (the usual
-    // cross-subnet case) the host must move to the new subnet first.
+    // If the new IP is on this host's subnet we can verify (and persist);
+    // otherwise (the usual cross-subnet case) the host must move there first.
     let same_subnet = on_same_24(iface_ip, target_ip);
+    if args.contains_key("persist") {
+        anyhow::ensure!(
+            same_subnet,
+            "--persist must open the camera at {target_ip}, which is unreachable from this host \
+             ({iface_ip}); move the host onto the target subnet first"
+        );
+        return persist_ip(target_ip, subnet, gateway).await;
+    }
     if same_subnet {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         println!("\nVerifying…");
@@ -112,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
             Some(d) => println!("camera reports {} (expected {target_ip}); may still be settling.", d.ip),
             None => println!("camera didn't answer the verify scan; try pinging {target_ip}."),
         }
+        println!("This address is temporary (lost on power-cycle); re-run with --persist to make it stick.");
     } else {
         println!(
             "\nNew IP {target_ip} is on a different subnet than this host ({iface_ip}), so it can't be \
@@ -120,6 +134,49 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Open the camera at its (just-forced) address, write the persistent-IP
+/// registers, and enable persistent-IP mode so the address survives
+/// power-cycles. Retries the open for a while — the camera may still be
+/// applying the FORCEIP.
+async fn persist_ip(ip: Ipv4Addr, subnet: Ipv4Addr, gateway: Ipv4Addr) -> anyhow::Result<()> {
+    println!("\nOpening {ip} to write persistent-IP registers…");
+    let addr = SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut dev = loop {
+        match open_and_claim(addr).await {
+            Ok(dev) => break dev,
+            Err(e) if Instant::now() < deadline => {
+                println!("  …not reachable yet ({e}), retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => anyhow::bail!("camera at {ip} never became reachable: {e}"),
+        }
+    };
+
+    dev.write_persistent_ip(ip, subnet, gateway).await?;
+
+    // Enable persistent-IP in the interface-configuration register. The GigE
+    // Vision spec puts PersistentIP at bit 0 and DHCP at bit 1, but some
+    // implementations document the reverse — set both; at boot, persistent IP
+    // takes precedence over DHCP either way.
+    let cfg = dev.read_register(consts::CURRENT_IP_CONFIG as u32).await?;
+    dev.write_register(consts::CURRENT_IP_CONFIG as u32, cfg | 0x3).await?;
+
+    let (pip, psub, pgw) = dev.read_persistent_ip().await?;
+    let cfg_after = dev.read_register(consts::CURRENT_IP_CONFIG as u32).await?;
+    let _ = dev.release_control().await;
+    println!("✓ persistent IP {pip}  mask {psub}  gw {pgw}  (IP-config register now {cfg_after:#06x})");
+    anyhow::ensure!(pip == ip, "read-back persistent IP {pip} != requested {ip}");
+    println!("The camera will boot at {pip} from its next power-cycle on.");
+    Ok(())
+}
+
+async fn open_and_claim(addr: SocketAddr) -> anyhow::Result<GigeDevice> {
+    let mut dev = GigeDevice::open(addr).await?;
+    dev.claim_control().await?;
+    Ok(dev)
 }
 
 /// Run limited-broadcast discovery, retrying every ~2 s until a camera answers

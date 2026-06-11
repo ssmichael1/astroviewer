@@ -24,7 +24,9 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 
-use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeStore};
+use cameleon_genapi::elem_type::Visibility;
+use cameleon_genapi::interface::ICategoryKind;
+use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::ValueCtxt;
 use viva_gige::gvcp::{self, DeviceInfo, GigeDevice};
 use viva_gige::gvsp::{self, FrameAssembly, GvspPacket};
@@ -229,51 +231,16 @@ impl<'a> cameleon_genapi::Device for DeviceBridge<'a> {
     }
 }
 
-/// A control we try to surface from the camera's GenICam tree.
-struct Spec {
-    name: &'static str,
-    category: &'static str,
-    /// Changing it requires stopping/restarting acquisition.
-    restart: bool,
-}
-
-/// Curated, imaging-relevant controls in display order. Each is skipped silently
-/// if the camera's XML doesn't define it. `Auto` toggles precede the value they
-/// gate, so manual mode unlocks the value control. Kind (int/float/enum/bool/
-/// command) and writability are read live from the node, not hardcoded.
-const CONTROLS: &[Spec] = &[
-    // Exposure & gain — the Auto enums gate ExposureTime/Gain writability.
-    Spec { name: "ExposureAuto", category: "Acquisition", restart: false },
-    Spec { name: "ExposureTime", category: "Acquisition", restart: false },
-    Spec { name: "GainAuto", category: "Acquisition", restart: false },
-    Spec { name: "Gain", category: "Acquisition", restart: false },
-    Spec { name: "AcquisitionFrameRateAuto", category: "Acquisition", restart: false },
-    Spec { name: "AcquisitionFrameRateEnabled", category: "Acquisition", restart: false },
-    Spec { name: "AcquisitionFrameRate", category: "Acquisition", restart: false },
-    Spec { name: "TriggerMode", category: "Acquisition", restart: false },
-    // Analog / tone.
-    Spec { name: "BlackLevel", category: "Analog", restart: false },
-    Spec { name: "GammaEnabled", category: "Analog", restart: false },
-    Spec { name: "Gamma", category: "Analog", restart: false },
-    Spec { name: "SharpnessAuto", category: "Analog", restart: false },
-    Spec { name: "Sharpness", category: "Analog", restart: false },
-    // Image format — these change frame geometry, so acquisition must restart.
-    Spec { name: "PixelFormat", category: "Image Format", restart: true },
-    Spec { name: "Width", category: "Image Format", restart: true },
-    Spec { name: "Height", category: "Image Format", restart: true },
-    Spec { name: "OffsetX", category: "Image Format", restart: true },
-    Spec { name: "OffsetY", category: "Image Format", restart: true },
-    Spec { name: "BinningVertical", category: "Image Format", restart: true },
-    Spec { name: "BinningHorizontal", category: "Image Format", restart: true },
-    Spec { name: "ReverseX", category: "Image Format", restart: false },
-    Spec { name: "TestPattern", category: "Image Format", restart: false },
-    // Read-only telemetry.
-    Spec { name: "DeviceTemperature", category: "Device", restart: false },
+/// Features whose change alters frame geometry or encoding, so acquisition
+/// must stop/restart for the new GVSP leader to take effect.
+const RESTART_FEATURES: &[&str] = &[
+    "PixelFormat", "Width", "Height", "OffsetX", "OffsetY",
+    "BinningVertical", "BinningHorizontal",
 ];
 
 /// Whether changing a feature requires an acquisition stop/restart.
 fn needs_restart(name: &str) -> bool {
-    CONTROLS.iter().any(|s| s.name == name && s.restart)
+    RESTART_FEATURES.contains(&name)
 }
 
 /// A float range is usable for a slider only if finite and not absurdly wide
@@ -369,18 +336,23 @@ pub fn start_camera(
 /// parse it into a GenICam model.
 fn load_genapi(rt: &Runtime, dev: &mut GigeDevice) -> anyhow::Result<GenApi> {
     let raw = rt.block_on(dev.read_mem(FIRST_URL_REGISTER, 512))?;
-    let url = String::from_utf8_lossy(&raw);
-    let url = url.trim_end_matches(['\0', ' ', '\r', '\n']).trim();
+    // The register is NUL-terminated; bytes past the terminator are undefined
+    // (some cameras pad with 0xFF garbage), so cut at the first NUL.
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let url = String::from_utf8_lossy(&raw[..end]);
+    let url = url.trim();
 
-    // Expected form: "Local:<filename>;<hex addr>;<hex length>"
-    let rest = url
+    // Expected form: "Local:<filename>;<hex addr>;<hex length>", optionally with
+    // a "?SchemaVersion=x.y.z" query suffix (GigE Vision 2.x).
+    let url_no_query = url.split('?').next().unwrap_or(url);
+    let rest = url_no_query
         .strip_prefix("Local:")
-        .or_else(|| url.strip_prefix("local:"))
+        .or_else(|| url_no_query.strip_prefix("local:"))
         .ok_or_else(|| anyhow::anyhow!("unsupported GenICam URL scheme: {url}"))?;
     let mut parts = rest.split(';');
-    let filename = parts.next().unwrap_or_default().to_string();
-    let addr = u64::from_str_radix(parts.next().unwrap_or("0").trim_start_matches("0x"), 16)?;
-    let len = usize::from_str_radix(parts.next().unwrap_or("0").trim_start_matches("0x"), 16)?;
+    let filename = parts.next().unwrap_or_default().trim().to_string();
+    let addr = parse_hex_field(parts.next(), "address", url)?;
+    let len = parse_hex_field(parts.next(), "length", url)? as usize;
     anyhow::ensure!(len > 0 && len < 16 * 1024 * 1024, "implausible GenICam XML length {len}");
 
     let bytes = read_mem_chunked(rt, dev, addr, len)?;
@@ -400,6 +372,15 @@ fn load_genapi(rt: &Runtime, dev: &mut GigeDevice) -> anyhow::Result<GenApi> {
         .build(&xml)
         .map_err(|e| anyhow::anyhow!("GenICam XML parse failed: {e}"))?;
     Ok(GenApi { store, ctxt })
+}
+
+/// Parse one hex field of a GenICam "Local:" URL, naming the field and quoting
+/// the whole URL on failure so a camera's odd format shows up in the log.
+fn parse_hex_field(part: Option<&str>, what: &str, url: &str) -> anyhow::Result<u64> {
+    let s = part.unwrap_or("0").trim();
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    u64::from_str_radix(s, 16)
+        .map_err(|e| anyhow::anyhow!("bad {what} field in GenICam URL {url:?}: {e}"))
 }
 
 /// Inflate a zipped GenICam description. Per the GenICam standard the blob is a
@@ -429,10 +410,15 @@ fn read_mem_chunked(
     let mut out = Vec::with_capacity(len);
     let mut off = 0usize;
     while off < len {
-        let this = CHUNK.min(len - off);
-        let part = rt.block_on(dev.read_mem(addr + off as u64, this))?;
-        out.extend_from_slice(&part);
-        off += this;
+        let want = CHUNK.min(len - off);
+        // GVCP READMEM requires a 4-byte-aligned count; round up, then keep
+        // only the bytes we actually need.
+        let req = (want + 3) & !3;
+        let part = rt
+            .block_on(dev.read_mem(addr + off as u64, req))
+            .map_err(|e| anyhow::anyhow!("READMEM {req} B @ {:#x}: {e}", addr + off as u64))?;
+        out.extend_from_slice(&part[..want.min(part.len())]);
+        off += want;
     }
     Ok(out)
 }
@@ -486,70 +472,139 @@ fn configure_acquisition(
     }
 }
 
-/// Build the UI control list by reading each curated feature live from the
-/// camera's GenICam tree (type, value, range, writability, enum options).
+/// Build the UI control list by walking the camera's own GenICam category tree
+/// from `Root`, reading each feature live (type, value, range, writability,
+/// enum options). Invisible nodes and non-value kinds (ports, registers,
+/// plain strings) are skipped; nested categories are flattened under their
+/// own display name.
 fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime) -> Vec<GevControl> {
     let mut out = Vec::new();
     let mut b = DeviceBridge { rt, dev };
+    let Some(root) = g.store.id_by_name("Root") else { return out };
+    walk_category(g, &mut b, root, None, &mut out);
+    out
+}
 
-    for spec in CONTROLS {
-        let Some(nid) = g.store.id_by_name(spec.name) else { continue };
-        let base = |kind, unit: String| GevControl {
-            name: spec.name.to_string(),
-            display: spec.name.to_string(),
-            category: spec.category.to_string(),
-            kind,
-            unit,
-            value: 0, min: 0, max: 0,
-            fvalue: 0.0, fmin: 0.0, fmax: 0.0,
-            writable: false,
-            needs_restart: spec.restart,
-        };
-
-        // Order matters: boolean/enumeration before integer, since some are both.
-        if let Some(bn) = nid.as_iboolean_kind(&g.store) {
-            let writable = bn.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
-            let v = bn.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
-            let mut c = base(GevControlKind::Boolean, String::new());
-            c.value = v as i64; c.writable = writable;
+/// Recurse through a category node, appending controls for its features.
+fn walk_category(
+    g: &mut GenApi,
+    b: &mut DeviceBridge<'_>,
+    cat: NodeId,
+    label: Option<&str>,
+    out: &mut Vec<GevControl>,
+) {
+    let Some(ICategoryKind::Category(n)) = cat.as_icategory_kind(&g.store) else { return };
+    let children: Vec<NodeId> = n.p_features().to_vec();
+    for nid in children {
+        if nid.as_icategory_kind(&g.store).is_some() {
+            let name = node_display(g, nid);
+            walk_category(g, b, nid, Some(&name), out);
+        } else if let Some(c) = control_from_node(g, b, nid, label.unwrap_or("Features")) {
             out.push(c);
-        } else if let Some(en) = nid.as_ienumeration_kind(&g.store) {
-            let writable = en.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
-            let opts: Vec<String> = en.entries(&g.store).iter()
-                .filter_map(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()))
-                .collect();
-            let cur = en.current_entry(&mut b, &g.store, &mut g.ctxt).ok()
-                .and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()));
-            let idx = cur.as_ref().and_then(|s| opts.iter().position(|o| o == s)).unwrap_or(0);
-            let mut c = base(GevControlKind::Enumeration(opts), String::new());
-            c.value = idx as i64; c.writable = writable;
-            out.push(c);
-        } else if let Some(f) = nid.as_ifloat_kind(&g.store) {
-            let unit = f.unit(&g.store).unwrap_or("").to_string();
-            let value = f.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let fmin = f.min(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let fmax = f.max(&mut b, &g.store, &mut g.ctxt).unwrap_or(0.0);
-            let writable = f.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
-            // Unbounded floats (e.g. DeviceTemperature) → read-only display.
-            let kind = if sane_range(fmin, fmax) { GevControlKind::Float } else { GevControlKind::ReadOnly };
-            let mut c = base(kind, unit);
-            c.fvalue = value; c.fmin = fmin; c.fmax = fmax; c.writable = writable;
-            out.push(c);
-        } else if let Some(i) = nid.as_iinteger_kind(&g.store) {
-            let unit = i.unit(&g.store).unwrap_or("").to_string();
-            let value = i.value(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
-            let min = i.min(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
-            let max = i.max(&mut b, &g.store, &mut g.ctxt).unwrap_or(0);
-            let writable = i.is_writable(&mut b, &g.store, &mut g.ctxt).unwrap_or(false);
-            let mut c = base(GevControlKind::Integer, unit);
-            c.value = value; c.min = min; c.max = max; c.writable = writable;
-            out.push(c);
-        } else if nid.as_icommand_kind(&g.store).is_some() {
-            out.push(base(GevControlKind::Command, String::new()));
         }
     }
+}
 
-    out
+/// The node's display name, falling back to its raw feature name.
+fn node_display(g: &GenApi, nid: NodeId) -> String {
+    g.store
+        .node_opt(nid)
+        .and_then(|n| n.node_base().display_name())
+        .unwrap_or_else(|| nid.name(&g.store))
+        .to_string()
+}
+
+/// Build one UI control from a feature node by reading its live state. Returns
+/// None for non-value kinds, invisible features, and features that are neither
+/// readable nor writable (not implemented / not available).
+fn control_from_node(
+    g: &mut GenApi,
+    b: &mut DeviceBridge<'_>,
+    nid: NodeId,
+    category: &str,
+) -> Option<GevControl> {
+    // Gate node_base() (panics on kinds it doesn't cover, e.g. EnumEntry) on the
+    // node being one of the value kinds we render.
+    let is_value_kind = nid.as_iboolean_kind(&g.store).is_some()
+        || nid.as_ienumeration_kind(&g.store).is_some()
+        || nid.as_ifloat_kind(&g.store).is_some()
+        || nid.as_iinteger_kind(&g.store).is_some()
+        || nid.as_icommand_kind(&g.store).is_some();
+    if !is_value_kind {
+        return None;
+    }
+    let nb = g.store.node_opt(nid)?.node_base();
+    if nb.visibility() == Visibility::Invisible {
+        return None;
+    }
+    let name = nid.name(&g.store).to_string();
+    let display = nb.display_name().unwrap_or(&name).to_string();
+
+    let base = |kind, unit: String, writable: bool| GevControl {
+        name: name.clone(),
+        display: display.clone(),
+        category: category.to_string(),
+        kind,
+        unit,
+        value: 0, min: 0, max: 0,
+        fvalue: 0.0, fmin: 0.0, fmax: 0.0,
+        writable,
+        needs_restart: needs_restart(&name),
+    };
+
+    // Order matters: boolean/enumeration before integer, since some are both.
+    if let Some(bn) = nid.as_iboolean_kind(&g.store) {
+        let readable = bn.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let writable = bn.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        if !readable && !writable { return None; }
+        let v = bn.value(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let mut c = base(GevControlKind::Boolean, String::new(), writable);
+        c.value = v as i64;
+        Some(c)
+    } else if let Some(en) = nid.as_ienumeration_kind(&g.store) {
+        let readable = en.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let writable = en.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        if !readable && !writable { return None; }
+        let opts: Vec<String> = en.entries(&g.store).iter()
+            .filter_map(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()))
+            .collect();
+        let cur = en.current_entry(b, &g.store, &mut g.ctxt).ok()
+            .and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()));
+        let idx = cur.as_ref().and_then(|s| opts.iter().position(|o| o == s)).unwrap_or(0);
+        let mut c = base(GevControlKind::Enumeration(opts), String::new(), writable);
+        c.value = idx as i64;
+        Some(c)
+    } else if let Some(f) = nid.as_ifloat_kind(&g.store) {
+        let readable = f.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let writable = f.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        if !readable && !writable { return None; }
+        let unit = f.unit(&g.store).unwrap_or("").to_string();
+        let value = f.value(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+        let fmin = f.min(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+        let fmax = f.max(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+        // Unbounded floats (e.g. DeviceTemperature) → read-only display.
+        let kind = if writable && sane_range(fmin, fmax) { GevControlKind::Float } else { GevControlKind::ReadOnly };
+        let mut c = base(kind, unit, writable);
+        c.fvalue = value; c.fmin = fmin; c.fmax = fmax;
+        Some(c)
+    } else if let Some(i) = nid.as_iinteger_kind(&g.store) {
+        let readable = i.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let writable = i.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        if !readable && !writable { return None; }
+        let unit = i.unit(&g.store).unwrap_or("").to_string();
+        let value = i.value(b, &g.store, &mut g.ctxt).unwrap_or(0);
+        let min = i.min(b, &g.store, &mut g.ctxt).unwrap_or(0);
+        let max = i.max(b, &g.store, &mut g.ctxt).unwrap_or(0);
+        let mut c = base(GevControlKind::Integer, unit, writable);
+        c.value = value; c.min = min; c.max = max;
+        Some(c)
+    } else if let Some(cn) = nid.as_icommand_kind(&g.store) {
+        let writable = cn.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        if !writable { return None; }
+        Some(base(GevControlKind::Command, String::new(), writable))
+    } else {
+        None
+    }
 }
 
 // ── Capture loop ─────────────────────────────────────────────────────────--

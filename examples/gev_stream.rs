@@ -314,22 +314,26 @@ fn bytes_per_pixel(pf: u32) -> usize {
 
 fn load_genapi(rt: &Runtime, dev: &mut GigeDevice) -> anyhow::Result<GenApi> {
     let raw = rt.block_on(dev.read_mem(0x0200, 512))?;
-    let url = String::from_utf8_lossy(&raw);
-    let url = url.trim_end_matches(['\0', ' ', '\r', '\n']).trim();
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len()); // cut at NUL; tail may be garbage
+    let url = String::from_utf8_lossy(&raw[..end]);
+    let url = url.trim();
     println!("GenICam URL: {url}");
+    let url = url.split('?').next().unwrap_or(url); // drop "?SchemaVersion=…"
     let rest = url.strip_prefix("Local:").or_else(|| url.strip_prefix("local:"))
         .ok_or_else(|| anyhow::anyhow!("unsupported URL scheme: {url}"))?;
     let mut parts = rest.split(';');
-    let filename = parts.next().unwrap_or_default().to_string();
-    let addr = u64::from_str_radix(parts.next().unwrap_or("0").trim_start_matches("0x"), 16)?;
-    let len = usize::from_str_radix(parts.next().unwrap_or("0").trim_start_matches("0x"), 16)?;
+    let filename = parts.next().unwrap_or_default().trim().to_string();
+    let addr = u64::from_str_radix(parts.next().unwrap_or("0").trim().trim_start_matches("0x"), 16)?;
+    let len = usize::from_str_radix(parts.next().unwrap_or("0").trim().trim_start_matches("0x"), 16)?;
 
     let mut bytes = Vec::with_capacity(len);
     let mut off = 0;
     while off < len {
-        let this = 512.min(len - off);
-        bytes.extend_from_slice(&rt.block_on(dev.read_mem(addr + off as u64, this))?);
-        off += this;
+        let want = 512.min(len - off);
+        let req = (want + 3) & !3; // GVCP READMEM count must be 4-byte aligned
+        let part = rt.block_on(dev.read_mem(addr + off as u64, req))?;
+        bytes.extend_from_slice(&part[..want.min(part.len())]);
+        off += want;
     }
 
     let xml = if filename.to_ascii_lowercase().ends_with(".zip") {

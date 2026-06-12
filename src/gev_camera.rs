@@ -117,6 +117,10 @@ pub struct GevControl {
     /// Changing this feature requires stopping/restarting acquisition (e.g.
     /// PixelFormat, Width/Height, binning).
     pub needs_restart: bool,
+    /// For IpV4/MacAddr kinds: the camera reports the address byte-swapped
+    /// relative to the GigE convention (first octet in the most significant
+    /// byte), so the UI must reverse byte order when displaying/composing.
+    pub ip_swapped: bool,
 }
 
 /// Commands from the UI thread to the capture thread.
@@ -293,7 +297,7 @@ pub fn start_camera(
     if let Some(g) = genapi.as_mut() {
         // best-effort configuration; ignore individual feature failures.
         configure_acquisition(g, &mut dev, &rt, &log_tx);
-        controls = build_controls(g, &mut dev, &rt);
+        controls = build_controls(g, &mut dev, &rt, ip);
     }
 
     // Negotiate the GVSP stream channel against our receiving interface.
@@ -488,12 +492,40 @@ fn configure_acquisition(
 /// enum options). Invisible nodes and non-value kinds (ports, registers,
 /// plain strings) are skipped; nested categories are flattened under their
 /// own display name.
-fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime) -> Vec<GevControl> {
+fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, cam_ip: Ipv4Addr) -> Vec<GevControl> {
     let mut out = Vec::new();
     let mut b = DeviceBridge { rt, dev };
     let Some(root) = g.store.id_by_name("Root") else { return out };
     walk_category(g, &mut b, root, None, &mut out);
+    orient_addresses(&mut out, cam_ip);
     out
+}
+
+/// The GigE convention stores an IPv4 address as a 32-bit integer with the
+/// first octet in the most significant byte, but some cameras' XMLs read the
+/// address registers with the opposite endianness (the Raptor Hawk does).
+/// Detect the orientation by comparing what GevCurrentIPAddress reports with
+/// the address we are actually talking to, and mark every address-valued
+/// control so the UI can compensate.
+fn orient_addresses(controls: &mut [GevControl], cam_ip: Ipv4Addr) {
+    if cam_ip == Ipv4Addr::UNSPECIFIED {
+        return;
+    }
+    let canonical = u32::from(cam_ip);
+    let Some(cur) = controls
+        .iter()
+        .find(|c| c.kind == GevControlKind::IpV4 && c.name.contains("CurrentIPAddress"))
+    else {
+        return;
+    };
+    let raw = cur.value as u32;
+    if raw.swap_bytes() == canonical && raw != canonical {
+        for c in controls.iter_mut() {
+            if matches!(c.kind, GevControlKind::IpV4 | GevControlKind::MacAddr) {
+                c.ip_swapped = true;
+            }
+        }
+    }
 }
 
 /// Recurse through a category node, appending controls for its features.
@@ -561,6 +593,7 @@ fn control_from_node(
         fvalue: 0.0, fmin: 0.0, fmax: 0.0,
         writable,
         needs_restart: needs_restart(&name),
+        ip_swapped: false,
     };
 
     // Order matters: boolean/enumeration before integer, since some are both.
@@ -697,6 +730,10 @@ fn capture_loop(
         execute_command(g, &mut dev, &rt, "AcquisitionStart", &log_tx);
     }
 
+    let cam_ip = match dev.remote_addr().ip() {
+        IpAddr::V4(ip) => ip,
+        _ => Ipv4Addr::UNSPECIFIED,
+    };
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry = Instant::now();
     let mut assembly: Option<FrameAssembly> = None;
@@ -722,7 +759,7 @@ fn capture_loop(
         // values and writability (e.g. ExposureAuto=Off unlocks ExposureTime).
         if changed {
             if let Some(g) = genapi.as_mut() {
-                snapshot = build_controls(g, &mut dev, &rt);
+                snapshot = build_controls(g, &mut dev, &rt, cam_ip);
                 let _ = controls_tx.try_send(snapshot.clone());
             }
         }

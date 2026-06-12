@@ -1749,36 +1749,65 @@ impl ViewerApp {
                                     unit_lbl(ui);
                                 }
                                 GevControlKind::IpV4 if enabled => {
-                                    let mut oct = (c.value as u32).to_be_bytes();
+                                    // Octets in human order; `ip_swapped` says how the
+                                    // camera packs them into the integer.
+                                    let mut oct = if c.ip_swapped {
+                                        (c.value as u32).to_le_bytes()
+                                    } else {
+                                        (c.value as u32).to_be_bytes()
+                                    };
                                     let mut edited = false;
+                                    let mut active = false;
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 2.0;
                                         for (k, o) in oct.iter_mut().enumerate() {
                                             if k > 0 {
                                                 ui.label(egui::RichText::new(".").monospace());
                                             }
-                                            if ui.add(egui::DragValue::new(o).speed(1)).changed() {
-                                                edited = true;
-                                            }
+                                            let r = ui.add(egui::DragValue::new(o).speed(1));
+                                            edited |= r.changed();
+                                            active |= r.has_focus() || r.dragged();
                                         }
                                     });
                                     ui.label("");
                                     if edited {
-                                        let v = u32::from_be_bytes(oct) as i64;
-                                        c.value = v;
-                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                                        c.value = if c.ip_swapped {
+                                            u32::from_le_bytes(oct)
+                                        } else {
+                                            u32::from_be_bytes(oct)
+                                        } as i64;
                                     }
+                                    // Write only once the user is done editing — sending
+                                    // per keystroke would set half-typed addresses.
+                                    let dirty_id = egui::Id::new(("gev_ip_dirty", &c.name));
+                                    let mut dirty: bool =
+                                        ui.data(|d| d.get_temp(dirty_id)).unwrap_or(false);
+                                    dirty |= edited;
+                                    if dirty && !active {
+                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), c.value));
+                                        dirty = false;
+                                    }
+                                    ui.data_mut(|d| d.insert_temp(dirty_id, dirty));
                                 }
                                 GevControlKind::IpV4 => {
-                                    let o = (c.value as u32).to_be_bytes();
+                                    let o = if c.ip_swapped {
+                                        (c.value as u32).to_le_bytes()
+                                    } else {
+                                        (c.value as u32).to_be_bytes()
+                                    };
                                     ro_text(ui, format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]));
                                     ui.label("");
                                 }
                                 GevControlKind::MacAddr => {
                                     let b = (c.value as u64).to_be_bytes();
+                                    let m: [u8; 6] = if c.ip_swapped {
+                                        [b[7], b[6], b[5], b[4], b[3], b[2]]
+                                    } else {
+                                        [b[2], b[3], b[4], b[5], b[6], b[7]]
+                                    };
                                     ro_text(ui, format!(
                                         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                        b[2], b[3], b[4], b[5], b[6], b[7]
+                                        m[0], m[1], m[2], m[3], m[4], m[5]
                                     ));
                                     ui.label("");
                                 }

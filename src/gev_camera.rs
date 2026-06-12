@@ -24,7 +24,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 
-use cameleon_genapi::elem_type::Visibility;
+use cameleon_genapi::elem_type::{IntegerRepresentation, Visibility};
 use cameleon_genapi::interface::ICategoryKind;
 use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::ValueCtxt;
@@ -79,6 +79,12 @@ impl GevDeviceInfo {
 pub enum GevControlKind {
     /// Integer feature with [min, max] (in `value`/`min`/`max`).
     Integer,
+    /// Integer feature representing an IPv4 address (network byte order in
+    /// `value`); rendered as four octet boxes.
+    IpV4,
+    /// Integer feature representing a MAC address (lower 48 bits of `value`);
+    /// rendered as hex text.
+    MacAddr,
     /// Float feature with [min, max] (in `fvalue`/`fmin`/`fmax`).
     Float,
     /// Enumeration: symbolic options; `value` is the selected index.
@@ -600,7 +606,19 @@ fn control_from_node(
         let value = i.value(b, &g.store, &mut g.ctxt).unwrap_or(0);
         let min = i.min(b, &g.store, &mut g.ctxt).unwrap_or(0);
         let max = i.max(b, &g.store, &mut g.ctxt).unwrap_or(0);
-        let mut c = base(GevControlKind::Integer, unit, writable);
+        // Address-valued integers get dedicated rendering. Trust the XML's
+        // Representation, with a name heuristic for XMLs that omit it.
+        let repr = i.representation(&g.store);
+        let kind = if repr == IntegerRepresentation::IpV4Address
+            || name.contains("IPAddress") || name.contains("SubnetMask") || name.contains("DefaultGateway")
+        {
+            GevControlKind::IpV4
+        } else if repr == IntegerRepresentation::MacAddress || name.contains("MACAddress") {
+            GevControlKind::MacAddr
+        } else {
+            GevControlKind::Integer
+        };
+        let mut c = base(kind, unit, writable);
         c.value = value; c.min = min; c.max = max;
         Some(c)
     } else if let Some(cn) = nid.as_icommand_kind(&g.store) {
@@ -631,7 +649,7 @@ fn refresh_telemetry(
                 .as_ifloat_kind(&g.store)
                 .and_then(|f| f.value(&mut b, &g.store, &mut g.ctxt).ok())
                 .map(Upd::F),
-            GevControlKind::Integer => nid
+            GevControlKind::Integer | GevControlKind::IpV4 | GevControlKind::MacAddr => nid
                 .as_iinteger_kind(&g.store)
                 .and_then(|i| i.value(&mut b, &g.store, &mut g.ctxt).ok())
                 .map(Upd::I),

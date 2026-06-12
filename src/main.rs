@@ -1748,6 +1748,40 @@ impl ViewerApp {
                                     ro_text(ui, c.value.to_string());
                                     unit_lbl(ui);
                                 }
+                                GevControlKind::IpV4 if enabled => {
+                                    let mut oct = (c.value as u32).to_be_bytes();
+                                    let mut edited = false;
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        for (k, o) in oct.iter_mut().enumerate() {
+                                            if k > 0 {
+                                                ui.label(egui::RichText::new(".").monospace());
+                                            }
+                                            if ui.add(egui::DragValue::new(o).speed(1)).changed() {
+                                                edited = true;
+                                            }
+                                        }
+                                    });
+                                    ui.label("");
+                                    if edited {
+                                        let v = u32::from_be_bytes(oct) as i64;
+                                        c.value = v;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                                    }
+                                }
+                                GevControlKind::IpV4 => {
+                                    let o = (c.value as u32).to_be_bytes();
+                                    ro_text(ui, format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]));
+                                    ui.label("");
+                                }
+                                GevControlKind::MacAddr => {
+                                    let b = (c.value as u64).to_be_bytes();
+                                    ro_text(ui, format!(
+                                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                        b[2], b[3], b[4], b[5], b[6], b[7]
+                                    ));
+                                    ui.label("");
+                                }
                                 GevControlKind::Enumeration(opts) if enabled => {
                                     let opts = opts.clone();
                                     let idx = c.value as usize;

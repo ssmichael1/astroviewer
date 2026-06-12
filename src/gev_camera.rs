@@ -44,6 +44,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 /// How often to re-read non-writable (telemetry) feature values so the UI
 /// shows live temperature, status, etc.
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// How often to log GVSP receive statistics (packet-arrival diagnostics).
+const RX_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// Stream channel index (single-channel cameras use 0).
 const STREAM_CHANNEL: u32 = 0;
 /// How long to wait for stream packets before returning to service commands.
@@ -767,6 +769,8 @@ fn capture_loop(
     };
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry = Instant::now();
+    let mut last_rx_report = Instant::now();
+    let mut rx = RxStats::default();
     let mut assembly: Option<FrameAssembly> = None;
     let mut geom: Option<FrameGeometry> = None;
     let mut buf = vec![0u8; 65536];
@@ -823,9 +827,20 @@ fn capture_loop(
             }
         }
 
+        // 2c. Stream diagnostics: report what the GVSP socket is actually
+        // receiving every ~3 s. The decisive signal for a VPN/EDR drop is
+        // "0 packets" here while tcpdump shows the camera's packets at the NIC.
+        if last_rx_report.elapsed() >= RX_REPORT_INTERVAL {
+            last_rx_report = Instant::now();
+            let _ = log_tx.try_send(LogEntry::info(format!(
+                "GigE stream rx: {} pkts / {} KB, {} leaders, {} payloads, {} trailers, {} frames, {} parse-err",
+                rx.packets, rx.bytes / 1024, rx.leaders, rx.payloads, rx.trailers, rx.frames, rx.parse_errors
+            )));
+        }
+
         // 3. Receive GVSP packets until a frame completes or the poll window expires.
         let completed = rt.block_on(receive_until_frame(
-            &socket, &mut buf, &mut assembly, &mut geom, packet_payload,
+            &socket, &mut buf, &mut assembly, &mut geom, packet_payload, &mut rx,
         ));
 
         if let Some((payload, g)) = completed {
@@ -853,6 +868,19 @@ struct FrameGeometry {
     pixel_format: u32,
 }
 
+/// Running counts of what the GVSP socket has received, for diagnosing the
+/// "no frames" case (e.g. corporate VPN/EDR silently dropping the stream).
+#[derive(Default, Clone, Copy)]
+struct RxStats {
+    packets: u64,
+    bytes: u64,
+    leaders: u64,
+    payloads: u64,
+    trailers: u64,
+    parse_errors: u64,
+    frames: u64,
+}
+
 /// Drain GVSP packets, assembling the current frame. Returns the finished
 /// payload + geometry when a Trailer completes a frame, or `None` if the poll
 /// window elapses first.
@@ -862,6 +890,7 @@ async fn receive_until_frame(
     assembly: &mut Option<FrameAssembly>,
     geom: &mut Option<FrameGeometry>,
     packet_payload: usize,
+    stats: &mut RxStats,
 ) -> Option<(bytes::Bytes, FrameGeometry)> {
     let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     loop {
@@ -871,12 +900,15 @@ async fn receive_until_frame(
             Ok(Err(_)) => return None,
             Err(_) => return None, // poll window elapsed
         };
+        stats.packets += 1;
+        stats.bytes += n as u64;
         let packet = match gvsp::parse_packet(&buf[..n]) {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(_) => { stats.parse_errors += 1; continue; }
         };
         match packet {
             GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
+                stats.leaders += 1;
                 *geom = Some(FrameGeometry { width, height, pixel_format });
                 let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
                 let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
@@ -885,6 +917,7 @@ async fn receive_until_frame(
                 *assembly = Some(FrameAssembly::new(block_id, expected_packets, packet_payload, pool, dl));
             }
             GvspPacket::Payload { block_id, packet_id, data } => {
+                stats.payloads += 1;
                 if let Some(a) = assembly.as_mut() {
                     if a.block_id() == block_id {
                         // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
@@ -893,10 +926,12 @@ async fn receive_until_frame(
                 }
             }
             GvspPacket::Trailer { block_id, .. } => {
+                stats.trailers += 1;
                 if let Some(a) = assembly.as_ref() {
                     if a.block_id() == block_id {
                         let a = assembly.take().unwrap();
                         if let (Some(payload), Some(g)) = (a.finish(), *geom) {
+                            stats.frames += 1;
                             return Some((payload, g));
                         }
                     }

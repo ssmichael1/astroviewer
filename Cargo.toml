@@ -31,6 +31,12 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], opt
 bytes = { version = "1", optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
 
+# Raw setsockopt(IP_BOUND_IF) for the GigE stream socket on macOS — pins the
+# socket to the camera's NIC so a VPN (GlobalProtect) can't steal the inbound
+# UDP stream. See the `netfix` module in src/gev_camera.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 svbony = ["dep:svbony"]

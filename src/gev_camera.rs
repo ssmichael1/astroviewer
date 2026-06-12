@@ -274,6 +274,15 @@ pub fn start_camera(
     let rt = build_runtime()?;
     let ip = info.ip;
 
+    // Corporate-network workarounds (GlobalProtect/SentinelOne). The optional
+    // explicit route must be installed before we open the control channel.
+    let netfix = netfix::plan();
+    if netfix.route {
+        if let Ok(iface) = Iface::from_ipv4(local_ipv4_towards(ip)) {
+            netfix::add_host_route(ip, &iface, &log_tx);
+        }
+    }
+
     // Connect + claim exclusive control.
     let mut dev = rt.block_on(GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)))?;
     rt.block_on(dev.claim_control())?;
@@ -309,6 +318,17 @@ pub fn start_camera(
         .map(IpAddr::V4)
         .unwrap_or(nic::default_bind_addr());
     let socket = rt.block_on(nic::bind_udp(bind_ip, 0, iface.clone(), None))?;
+    // Pin the GVSP receive socket to the camera's NIC so a VPN tunnel can't
+    // scope the inbound stream away from it (viva-gige only does this on Linux).
+    if netfix.pin {
+        if let Some(i) = iface.as_ref() {
+            netfix::pin_socket(&socket, i, &log_tx);
+        } else {
+            let _ = log_tx.try_send(LogEntry::warn(
+                "GigE netfix: no interface resolved for camera; cannot pin stream socket".into(),
+            ));
+        }
+    }
     let local_port = socket.local_addr()?.port();
 
     let stream_params = rt.block_on(dev.negotiate_stream(
@@ -1075,3 +1095,162 @@ fn local_ipv4_towards(target: Ipv4Addr) -> Ipv4Addr {
 
 // Trait imports needed for the `*Kind` method calls above.
 use cameleon_genapi::interface::{IBoolean, ICommand, IEnumeration, IFloat, IInteger};
+
+// ── Corporate-network workarounds (GlobalProtect / SentinelOne) ─────────────
+//
+// On a managed laptop, GlobalProtect installs a default route through its
+// tunnel and SentinelOne filters packets. GVCP control still works because the
+// camera's /24 is directly connected (a more-specific route than the VPN
+// default), but the inbound GVSP *stream* can be silently swallowed: the
+// receive socket is bound only to the NIC's IP, not pinned to the interface,
+// so the OS may scope it to the tunnel.
+//
+// These are escalating, opt-out/opt-in workarounds, selected by the GEV_NETFIX
+// env var (comma-separated tokens, evaluated once at stream start):
+//   pin    – setsockopt(IP_BOUND_IF) the GVSP socket to the camera's NIC
+//            (macOS) / SO_BINDTODEVICE (Linux). ON by default.
+//   route  – add an explicit host route to the camera via the NIC before
+//            connecting (needs admin; logged, best-effort). OFF by default.
+//   off    – disable all of the above (baseline, to confirm the failure).
+mod netfix {
+    use super::{Iface, LogEntry, Sender};
+    use std::net::Ipv4Addr;
+    use tokio::net::UdpSocket;
+
+    #[derive(Clone, Copy)]
+    pub struct Plan {
+        pub pin: bool,
+        pub route: bool,
+    }
+
+    /// Parse GEV_NETFIX once. Default: pin on, route off.
+    pub fn plan() -> Plan {
+        match std::env::var("GEV_NETFIX") {
+            Ok(v) => {
+                let v = v.to_ascii_lowercase();
+                if v.split(',').any(|t| t.trim() == "off") {
+                    return Plan { pin: false, route: false };
+                }
+                let has = |name: &str| v.split(',').any(|t| t.trim() == name);
+                Plan { pin: has("pin"), route: has("route") }
+            }
+            Err(_) => Plan { pin: true, route: false },
+        }
+    }
+
+    /// Pin a bound UDP socket to a specific interface so VPN routing can't
+    /// scope it elsewhere. macOS: IP_BOUND_IF; Linux: SO_BINDTODEVICE.
+    /// No-op (logged) on other platforms.
+    pub fn pin_socket(sock: &UdpSocket, iface: &Iface, log: &Sender<LogEntry>) {
+        match pin_socket_impl(sock, iface) {
+            Ok(()) => {
+                let _ = log.try_send(LogEntry::info(format!(
+                    "GigE netfix: pinned stream socket to {} (idx {})",
+                    iface.name(), iface.index()
+                )));
+            }
+            Err(e) => {
+                let _ = log.try_send(LogEntry::warn(format!(
+                    "GigE netfix: could not pin stream socket to {}: {e}",
+                    iface.name()
+                )));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pin_socket_impl(sock: &UdpSocket, iface: &Iface) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        // <netinet/in.h>: IP_BOUND_IF = 25. libc exposes it on Apple targets.
+        let idx: libc::c_uint = iface.index();
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_BOUND_IF,
+                std::ptr::addr_of!(idx).cast(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pin_socket_impl(sock: &UdpSocket, iface: &Iface) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let name = iface.name();
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.len() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn pin_socket_impl(_sock: &UdpSocket, _iface: &Iface) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "interface pinning not implemented on this platform",
+        ))
+    }
+
+    /// Best-effort: add an explicit host route to the camera via the NIC so its
+    /// traffic bypasses the VPN tunnel. Requires admin; failures are logged,
+    /// not fatal. The directly-connected /24 route usually already covers this,
+    /// so this is an escalation for when it doesn't.
+    pub fn add_host_route(cam: Ipv4Addr, iface: &Iface, log: &Sender<LogEntry>) {
+        let name = iface.name();
+        #[cfg(target_os = "macos")]
+        let args: Vec<String> = vec![
+            "-n".into(), "add".into(), "-host".into(), cam.to_string(),
+            "-interface".into(), name.to_string(),
+        ];
+        #[cfg(target_os = "linux")]
+        let args: Vec<String> = vec![
+            "add".into(), cam.to_string(), "dev".into(), name.to_string(),
+        ];
+        #[cfg(target_os = "macos")]
+        let cmd = "route";
+        #[cfg(target_os = "linux")]
+        let cmd = "ip";
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (cam, name);
+            let _ = log.try_send(LogEntry::warn(
+                "GigE netfix: route add not supported on this platform".into(),
+            ));
+            return;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        match std::process::Command::new(cmd).args(&args).output() {
+            Ok(out) if out.status.success() => {
+                let _ = log.try_send(LogEntry::info(format!(
+                    "GigE netfix: added host route {cam} via {name}"
+                )));
+            }
+            Ok(out) => {
+                let msg = String::from_utf8_lossy(&out.stderr);
+                let _ = log.try_send(LogEntry::warn(format!(
+                    "GigE netfix: `route add {cam}` failed (needs admin?): {}",
+                    msg.trim()
+                )));
+            }
+            Err(e) => {
+                let _ = log.try_send(LogEntry::warn(format!(
+                    "GigE netfix: could not run route command: {e}"
+                )));
+            }
+        }
+    }
+}

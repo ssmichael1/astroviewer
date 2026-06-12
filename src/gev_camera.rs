@@ -351,13 +351,29 @@ pub fn start_camera(
     let packet_payload = stream_params.packet_size.saturating_sub(8).max(1) as usize;
     let cam_name = info.display_name();
 
+    // When the BPF workaround is requested, hand the capture thread what it
+    // needs to open a datalink capture (interface name, camera IP, stream port).
+    let bpf_cfg = if netfix.bpf {
+        match iface.as_ref().map(|i| i.name().to_string()) {
+            Some(name) => Some((name, ip, local_port)),
+            None => {
+                let _ = log_tx.try_send(LogEntry::warn(
+                    "GigE netfix: bpf requested but no interface resolved; falling back to UDP socket".into(),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let snapshot = controls.clone();
     let join_handle = std::thread::Builder::new()
         .name("gev-capture".into())
         .spawn(move || {
             capture_loop(
                 rt, dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
-                snapshot, log_tx,
+                snapshot, bpf_cfg, log_tx,
             );
         })?;
 
@@ -754,8 +770,31 @@ fn capture_loop(
     cmd_rx: Receiver<GevCmd>,
     controls_tx: Sender<Vec<GevControl>>,
     mut snapshot: Vec<GevControl>,
+    bpf_cfg: Option<(String, Ipv4Addr, u16)>,
     log_tx: Sender<LogEntry>,
 ) {
+    // Optionally open a datalink (BPF) capture as the stream source, below the
+    // EDR/VPN filter that drops the UDP stream at the socket. If it fails (e.g.
+    // /dev/bpf not readable), log and fall back to the UDP socket.
+    let mut bpf = match bpf_cfg {
+        Some((ref name, cam, port)) => match open_bpf_capture(name, cam, port) {
+            Ok(cap) => {
+                let _ = log_tx.try_send(LogEntry::info(format!(
+                    "GigE netfix: capturing stream via BPF on {name} (udp src {cam} dst port {port})"
+                )));
+                Some(cap)
+            }
+            Err(e) => {
+                let _ = log_tx.try_send(LogEntry::error(format!(
+                    "GigE netfix: BPF capture failed ({e}); is /dev/bpf readable? \
+                     try `sudo chmod o+rw /dev/bpf*`. Falling back to UDP socket."
+                )));
+                None
+            }
+        },
+        None => None,
+    };
+
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
     // the stream transport — required by FLIR/Point Grey before frames flow.
     if let Some(g) = genapi.as_mut() {
@@ -838,10 +877,15 @@ fn capture_loop(
             )));
         }
 
-        // 3. Receive GVSP packets until a frame completes or the poll window expires.
-        let completed = rt.block_on(receive_until_frame(
-            &socket, &mut buf, &mut assembly, &mut geom, packet_payload, &mut rx,
-        ));
+        // 3. Receive GVSP packets until a frame completes or the poll window
+        // expires — from the BPF capture when active, else the UDP socket.
+        let completed = if let Some(cap) = bpf.as_mut() {
+            receive_until_frame_bpf(cap, &mut assembly, &mut geom, packet_payload, &mut rx)
+        } else {
+            rt.block_on(receive_until_frame(
+                &socket, &mut buf, &mut assembly, &mut geom, packet_payload, &mut rx,
+            ))
+        };
 
         if let Some((payload, g)) = completed {
             if let Some((mono, w, h, bit_depth)) = decode_payload(&payload, &g) {
@@ -881,9 +925,57 @@ struct RxStats {
     frames: u64,
 }
 
-/// Drain GVSP packets, assembling the current frame. Returns the finished
-/// payload + geometry when a Trailer completes a frame, or `None` if the poll
-/// window elapses first.
+/// Handle one parsed GVSP packet: update geometry on a Leader, ingest a
+/// Payload, and finish the frame on a matching Trailer. Returns the completed
+/// payload + geometry when a Trailer closes the frame, else None. Shared by the
+/// UDP-socket and BPF capture paths.
+fn ingest_gvsp(
+    packet: GvspPacket,
+    assembly: &mut Option<FrameAssembly>,
+    geom: &mut Option<FrameGeometry>,
+    packet_payload: usize,
+    stats: &mut RxStats,
+) -> Option<(bytes::Bytes, FrameGeometry)> {
+    match packet {
+        GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
+            stats.leaders += 1;
+            *geom = Some(FrameGeometry { width, height, pixel_format });
+            let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
+            let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
+            let pool = BytesMut::zeroed(expected_packets * packet_payload);
+            let dl = Instant::now() + FRAME_DEADLINE;
+            *assembly = Some(FrameAssembly::new(block_id, expected_packets, packet_payload, pool, dl));
+            None
+        }
+        GvspPacket::Payload { block_id, packet_id, data } => {
+            stats.payloads += 1;
+            if let Some(a) = assembly.as_mut() {
+                if a.block_id() == block_id {
+                    // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
+                    a.ingest(packet_id.saturating_sub(1) as usize, &data);
+                }
+            }
+            None
+        }
+        GvspPacket::Trailer { block_id, .. } => {
+            stats.trailers += 1;
+            if let Some(a) = assembly.as_ref() {
+                if a.block_id() == block_id {
+                    let a = assembly.take().unwrap();
+                    if let (Some(payload), Some(g)) = (a.finish(), *geom) {
+                        stats.frames += 1;
+                        return Some((payload, g));
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Drain GVSP packets from the UDP socket, assembling the current frame.
+/// Returns the finished payload + geometry when a Trailer completes a frame, or
+/// `None` if the poll window elapses first.
 async fn receive_until_frame(
     socket: &UdpSocket,
     buf: &mut [u8],
@@ -906,39 +998,97 @@ async fn receive_until_frame(
             Ok(p) => p,
             Err(_) => { stats.parse_errors += 1; continue; }
         };
-        match packet {
-            GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
-                stats.leaders += 1;
-                *geom = Some(FrameGeometry { width, height, pixel_format });
-                let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
-                let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
-                let pool = BytesMut::zeroed(expected_packets * packet_payload);
-                let dl = Instant::now() + FRAME_DEADLINE;
-                *assembly = Some(FrameAssembly::new(block_id, expected_packets, packet_payload, pool, dl));
-            }
-            GvspPacket::Payload { block_id, packet_id, data } => {
-                stats.payloads += 1;
-                if let Some(a) = assembly.as_mut() {
-                    if a.block_id() == block_id {
-                        // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
-                        a.ingest(packet_id.saturating_sub(1) as usize, &data);
-                    }
-                }
-            }
-            GvspPacket::Trailer { block_id, .. } => {
-                stats.trailers += 1;
-                if let Some(a) = assembly.as_ref() {
-                    if a.block_id() == block_id {
-                        let a = assembly.take().unwrap();
-                        if let (Some(payload), Some(g)) = (a.finish(), *geom) {
-                            stats.frames += 1;
-                            return Some((payload, g));
-                        }
-                    }
-                }
-            }
+        if let Some(done) = ingest_gvsp(packet, assembly, geom, packet_payload, stats) {
+            return Some(done);
         }
     }
+}
+
+/// Drain GVSP packets from a BPF/libpcap capture (the datalink tap, below the
+/// EDR/VPN packet filter that swallows them at the socket). Strips the
+/// Ethernet/IP/UDP headers off each captured frame and feeds the GVSP payload
+/// through the same assembly path. Returns a finished frame or `None` when the
+/// poll window elapses.
+fn receive_until_frame_bpf(
+    cap: &mut pcap::Capture<pcap::Active>,
+    assembly: &mut Option<FrameAssembly>,
+    geom: &mut Option<FrameGeometry>,
+    packet_payload: usize,
+    stats: &mut RxStats,
+) -> Option<(bytes::Bytes, FrameGeometry)> {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let frame = match cap.next_packet() {
+            Ok(p) => p,
+            Err(pcap::Error::TimeoutExpired) => return None,
+            Err(_) => return None,
+        };
+        let Some(udp) = udp_payload(frame.data) else { continue };
+        stats.packets += 1;
+        stats.bytes += udp.len() as u64;
+        let packet = match gvsp::parse_packet(udp) {
+            Ok(p) => p,
+            Err(_) => { stats.parse_errors += 1; continue; }
+        };
+        if let Some(done) = ingest_gvsp(packet, assembly, geom, packet_payload, stats) {
+            return Some(done);
+        }
+    }
+}
+
+/// Extract the UDP payload from a captured Ethernet frame (DLT_EN10MB),
+/// skipping the Ethernet header (with optional 802.1Q VLAN tag), the IPv4
+/// header (variable length), and the 8-byte UDP header. Returns None for
+/// non-IPv4/non-UDP or truncated frames.
+fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let mut l3 = 14;
+    let mut ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype == 0x8100 {
+        // 802.1Q VLAN tag: 4 extra bytes, real ethertype follows.
+        if frame.len() < 18 {
+            return None;
+        }
+        ethertype = u16::from_be_bytes([frame[16], frame[17]]);
+        l3 = 18;
+    }
+    if ethertype != 0x0800 {
+        return None; // not IPv4
+    }
+    if frame.len() < l3 + 20 {
+        return None;
+    }
+    let ihl = (frame[l3] & 0x0f) as usize * 4;
+    if ihl < 20 || frame[l3 + 9] != 17 {
+        return None; // bad IHL or not UDP
+    }
+    let udp = l3 + ihl;
+    let payload = udp + 8;
+    if frame.len() < payload {
+        return None;
+    }
+    Some(&frame[payload..])
+}
+
+/// Open a BPF/libpcap capture on the camera's NIC, filtered to just this
+/// camera's GVSP stream (its source IP → our stream port). Immediate mode +
+/// a short read timeout keep the capture responsive so the loop can still
+/// service commands and the heartbeat.
+fn open_bpf_capture(if_name: &str, cam_ip: Ipv4Addr, local_port: u16) -> anyhow::Result<pcap::Capture<pcap::Active>> {
+    let mut cap = pcap::Capture::from_device(if_name)?
+        .immediate_mode(true)
+        .snaplen(65536)
+        .timeout(POLL_TIMEOUT.as_millis() as i32)
+        .open()?;
+    // Only this camera's stream packets, to keep the per-packet rate down.
+    let filter = format!("udp and src host {cam_ip} and dst port {local_port}");
+    cap.filter(&filter, true)?;
+    Ok(cap)
 }
 
 // ── Pixel decode ─────────────────────────────────────────────────────────--
@@ -1156,20 +1306,23 @@ mod netfix {
     pub struct Plan {
         pub pin: bool,
         pub route: bool,
+        /// Capture the GVSP stream off the datalink (BPF) instead of the UDP
+        /// socket, bypassing an EDR/VPN filter that drops it at the socket.
+        pub bpf: bool,
     }
 
-    /// Parse GEV_NETFIX once. Default: pin on, route off.
+    /// Parse GEV_NETFIX once. Default: pin on, route off, bpf off.
     pub fn plan() -> Plan {
         match std::env::var("GEV_NETFIX") {
             Ok(v) => {
                 let v = v.to_ascii_lowercase();
                 if v.split(',').any(|t| t.trim() == "off") {
-                    return Plan { pin: false, route: false };
+                    return Plan { pin: false, route: false, bpf: false };
                 }
                 let has = |name: &str| v.split(',').any(|t| t.trim() == name);
-                Plan { pin: has("pin"), route: has("route") }
+                Plan { pin: has("pin"), route: has("route"), bpf: has("bpf") }
             }
-            Err(_) => Plan { pin: true, route: false },
+            Err(_) => Plan { pin: true, route: false, bpf: false },
         }
     }
 

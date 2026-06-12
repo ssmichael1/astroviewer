@@ -33,9 +33,12 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"], opt
 
 # Raw setsockopt(IP_BOUND_IF) for the GigE stream socket on macOS — pins the
 # socket to the camera's NIC so a VPN (GlobalProtect) can't steal the inbound
-# UDP stream. See the `netfix` module in src/gev_camera.rs.
+# UDP stream. `pcap` lets us capture the GVSP stream off the datalink (BPF),
+# below the EDR/VPN packet filter that drops it at the socket layer.
+# See the `netfix` module in src/gev_camera.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+pcap = "2"
 
 [features]
 default = []

@@ -3101,7 +3101,16 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // cameleon_genapi logs an ERROR every time it constructs an error, even for
+    // ones we handle (e.g. probing chunk-backed features we then skip) — keep
+    // its internal logging out; failures we care about are reported by our code.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .add_directive("cameleon_genapi=off".parse().expect("valid directive")),
+        )
+        .init();
     let options = eframe::NativeOptions {
         // Setting an explicit (empty) icon suppresses eframe's default behavior of
         // loading the bundled egui logo and calling setApplicationIconImage shortly

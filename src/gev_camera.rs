@@ -27,7 +27,7 @@ use tokio::runtime::Runtime;
 use cameleon_genapi::elem_type::{IntegerRepresentation, Visibility};
 use cameleon_genapi::interface::ICategoryKind;
 use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
-use cameleon_genapi::ValueCtxt;
+use cameleon_genapi::{GenApiError, ValueCtxt};
 use viva_gige::gvcp::{self, DeviceInfo, GigeDevice};
 use viva_gige::gvsp::{self, FrameAssembly, GvspPacket};
 use viva_gige::nic::{self, Iface};
@@ -601,7 +601,10 @@ fn control_from_node(
         let readable = bn.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         let writable = bn.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         if !readable && !writable { return None; }
-        let v = bn.value(b, &g.store, &mut g.ctxt).unwrap_or(false);
+        let v = match bn.value(b, &g.store, &mut g.ctxt) {
+            Err(GenApiError::ChunkDataMissing) => return None, // chunk-backed
+            v => v.unwrap_or(false),
+        };
         let mut c = base(GevControlKind::Boolean, String::new(), writable);
         c.value = v as i64;
         Some(c)
@@ -612,8 +615,10 @@ fn control_from_node(
         let opts: Vec<String> = en.entries(&g.store).iter()
             .filter_map(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()))
             .collect();
-        let cur = en.current_entry(b, &g.store, &mut g.ctxt).ok()
-            .and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()));
+        let cur = match en.current_entry(b, &g.store, &mut g.ctxt) {
+            Err(GenApiError::ChunkDataMissing) => return None, // chunk-backed
+            e => e.ok().and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string())),
+        };
         let idx = cur.as_ref().and_then(|s| opts.iter().position(|o| o == s)).unwrap_or(0);
         let mut c = base(GevControlKind::Enumeration(opts), String::new(), writable);
         c.value = idx as i64;
@@ -623,7 +628,10 @@ fn control_from_node(
         let writable = f.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         if !readable && !writable { return None; }
         let unit = f.unit(&g.store).unwrap_or("").to_string();
-        let value = f.value(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
+        let value = match f.value(b, &g.store, &mut g.ctxt) {
+            Err(GenApiError::ChunkDataMissing) => return None, // chunk-backed
+            v => v.unwrap_or(0.0),
+        };
         let fmin = f.min(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
         let fmax = f.max(b, &g.store, &mut g.ctxt).unwrap_or(0.0);
         // Unbounded floats (e.g. DeviceTemperature) → read-only display.
@@ -636,7 +644,10 @@ fn control_from_node(
         let writable = i.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         if !readable && !writable { return None; }
         let unit = i.unit(&g.store).unwrap_or("").to_string();
-        let value = i.value(b, &g.store, &mut g.ctxt).unwrap_or(0);
+        let value = match i.value(b, &g.store, &mut g.ctxt) {
+            Err(GenApiError::ChunkDataMissing) => return None, // chunk-backed
+            v => v.unwrap_or(0),
+        };
         let min = i.min(b, &g.store, &mut g.ctxt).unwrap_or(0);
         let max = i.max(b, &g.store, &mut g.ctxt).unwrap_or(0);
         // Address-valued integers get dedicated rendering. Trust the XML's

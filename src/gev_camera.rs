@@ -937,18 +937,31 @@ fn ingest_gvsp(
     stats: &mut RxStats,
 ) -> Option<(bytes::Bytes, FrameGeometry)> {
     match packet {
-        GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
+        GvspPacket::Leader { width, height, pixel_format, .. } => {
             stats.leaders += 1;
             *geom = Some(FrameGeometry { width, height, pixel_format });
-            let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
-            let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
-            let pool = BytesMut::zeroed(expected_packets * packet_payload);
-            let dl = Instant::now() + FRAME_DEADLINE;
-            *assembly = Some(FrameAssembly::new(block_id, expected_packets, packet_payload, pool, dl));
+            // Defer assembly: the camera's real per-packet payload size isn't
+            // reliably derivable from the negotiated GevSCPSPacketSize (some
+            // cameras report it as the full IP datagram size), so learn it from
+            // the first data packet below instead of guessing here.
+            *assembly = None;
             None
         }
         GvspPacket::Payload { block_id, packet_id, data } => {
             stats.payloads += 1;
+            // Create the assembly on the first payload packet, sizing the
+            // stride from its actual length (all packets but the last are this
+            // size). This makes expected_packets match what the camera sends.
+            if assembly.is_none() {
+                if let Some(g) = *geom {
+                    let stride = if data.is_empty() { packet_payload } else { data.len() };
+                    let total_bytes = frame_payload_bytes(g.pixel_format, g.width as usize * g.height as usize);
+                    let expected_packets = total_bytes.div_ceil(stride).max(1);
+                    let pool = BytesMut::zeroed(expected_packets * stride);
+                    let dl = Instant::now() + FRAME_DEADLINE;
+                    *assembly = Some(FrameAssembly::new(block_id, expected_packets, stride, pool, dl));
+                }
+            }
             if let Some(a) = assembly.as_mut() {
                 if a.block_id() == block_id {
                     // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.

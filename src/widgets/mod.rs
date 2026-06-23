@@ -4,7 +4,7 @@ mod combo_box;
 mod slider;
 mod themes;
 
-pub use button::{primary_button, styled_button};
+pub use button::{icon_button, primary_button, styled_button};
 pub use checkbox::styled_checkbox;
 pub use combo_box::combo_box;
 #[allow(unused_imports)]

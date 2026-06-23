@@ -2774,16 +2774,31 @@ impl eframe::App for ViewerApp {
                         }
                     }
                     ui.separator();
+                    // The record/stop control. Red record semantics (filled
+                    // circle to start, filled square to stop) so idle vs.
+                    // recording is unmistakable; sized to match the other
+                    // transport buttons via the shared icon_button helper.
+                    let rec_red = egui::Color32::from_rgb(220, 60, 60);
                     if self.recording {
-                        let btn = ui.button(egui::RichText::new("Stop Rec").size(14.0).color(egui::Color32::from_rgb(239, 68, 68)));
-                        if btn.clicked() { self.stop_recording(); }
-                        let t = ui.input(|i| i.time);
-                        let alpha = ((t * 3.0).sin() * 0.5 + 0.5) as u8 * 200 + 55;
+                        // Blinking "armed" indicator to the left of the button.
+                        // Honor reduced-motion: hold the dot solid if requested.
+                        let reduced_motion = ui.style().animation_time <= 0.0;
+                        let alpha = if reduced_motion {
+                            255
+                        } else {
+                            let t = ui.input(|i| i.time);
+                            (((t * 3.0).sin() * 0.5 + 0.5) * 200.0) as u8 + 55
+                        };
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 26.0), egui::Sense::hover());
                         ui.painter().circle_filled(
-                            egui::pos2(btn.rect.min.x + 8.0, btn.rect.center().y),
-                            4.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, alpha),
+                            dot_rect.center(),
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(220, 40, 40, alpha),
                         );
-                    } else if ui.button(egui::RichText::new("Record").size(14.0)).clicked() {
+                        if widgets::icon_button(ui, "\u{25A0}", rec_red, "Stop", &pal) {
+                            self.stop_recording();
+                        }
+                    } else if widgets::icon_button(ui, "\u{25CF}", rec_red, "Record", &pal) {
                         self.start_recording();
                     }
                     // Display settings (colormap, scale, theme) live in the

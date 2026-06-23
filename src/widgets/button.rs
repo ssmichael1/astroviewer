@@ -49,6 +49,75 @@ pub fn styled_button(ui: &mut egui::Ui, label: &str, pal: &Palette) -> bool {
     response.clicked()
 }
 
+/// A styled push button with a colored glyph icon preceding the label.
+///
+/// Matches [`styled_button`] sizing (26px tall, same chrome) but draws `icon`
+/// in `icon_color` so the button's purpose reads at a glance — e.g. a red `●`
+/// for Record. The icon keeps its color on hover; the label tints to the accent
+/// like the plain styled button.
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    icon_color: egui::Color32,
+    label: &str,
+    pal: &Palette,
+) -> bool {
+    let height = 26.0;
+    let font = egui::FontId::proportional(12.0);
+    let gap = 6.0;
+    let icon_galley = ui.painter().layout_no_wrap(icon.to_string(), font.clone(), icon_color);
+    let label_galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), egui::Color32::BLACK);
+    let content_w = icon_galley.size().x + gap + label_galley.size().x;
+    let width = content_w + 24.0;
+
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+    let painter = ui.painter();
+    let hovered = response.hovered();
+    let pressed = response.is_pointer_button_down_on();
+
+    let bg = if pressed {
+        pal.button_bg_pressed
+    } else if hovered {
+        pal.button_bg_hover
+    } else {
+        pal.button_bg
+    };
+    let border_c = if hovered { pal.border_hover } else { pal.border };
+
+    painter.rect_filled(rect, egui::CornerRadius::same(6), bg);
+    painter.rect_stroke(rect, egui::CornerRadius::same(6), egui::Stroke::new(1.0, border_c), egui::StrokeKind::Inside);
+
+    if !pressed {
+        painter.hline(
+            rect.shrink2(egui::vec2(2.0, 0.0)).x_range(),
+            rect.max.y,
+            egui::Stroke::new(1.0, pal.button_shadow),
+        );
+        painter.hline(
+            rect.shrink2(egui::vec2(2.0, 0.0)).x_range(),
+            rect.min.y + 1.0,
+            egui::Stroke::new(1.0, pal.button_highlight),
+        );
+    }
+
+    // Lay out icon + label as a unit, centered in the button.
+    let mut x = rect.center().x - content_w / 2.0;
+    let cy = rect.center().y;
+    painter.text(
+        egui::pos2(x, cy),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        font.clone(),
+        icon_color,
+    );
+    x += icon_galley.size().x + gap;
+    let text_color = if hovered { pal.accent } else { pal.text_primary };
+    painter.text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, label, font, text_color);
+
+    response.clicked()
+}
+
 /// A filled, accent-colored button for the single primary action in a context
 /// (e.g. Play). It is the one bright control so the eye lands on it first.
 pub fn primary_button(ui: &mut egui::Ui, label: &str, pal: &Palette) -> bool {

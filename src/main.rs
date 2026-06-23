@@ -16,6 +16,9 @@ mod camera;
 #[cfg(feature = "gev")]
 mod gev_camera;
 
+#[cfg(feature = "indi")]
+mod indi_camera;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;

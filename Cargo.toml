@@ -31,11 +31,17 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], opt
 bytes = { version = "1", optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
 
+# INDI support (blocking client for the INDI XML protocol over TCP).
+quick-xml = { version = "0.37", optional = true }
+base64 = { version = "0.22", optional = true }
+flate2 = { version = "1", optional = true }
+
 [features]
 default = []
 svbony = ["dep:svbony"]
 starsolve = ["dep:tetra3"]
 gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
+indi = ["dep:quick-xml", "dep:base64", "dep:flate2"]
 
 [[example]]
 name = "gev_spike"

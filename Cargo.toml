@@ -10,7 +10,7 @@ egui_plot = "0.35"
 image = "0.25"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 chrono = "0.4"
 dirs = "6"
@@ -24,10 +24,34 @@ tetra3 = { version = "0.7.3", features = [
 ], optional = true }
 # tetra3 = { version = "0.7.2", features = ["image"], optional = true }
 
+# GigE Vision support (pure-Rust transport + GenICam XML interpreter).
+viva-gige = { version = "0.2", optional = true }
+cameleon-genapi = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
+bytes = { version = "1", optional = true }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
+
 [features]
 default = []
 svbony = ["dep:svbony"]
 starsolve = ["dep:tetra3"]
+gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
+
+[[example]]
+name = "gev_spike"
+required-features = ["gev"]
+
+[[example]]
+name = "gev_force_ip"
+required-features = ["gev"]
+
+[[example]]
+name = "gev_stream"
+required-features = ["gev"]
+
+[[example]]
+name = "gev_features"
+required-features = ["gev"]
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

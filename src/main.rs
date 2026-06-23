@@ -13,6 +13,9 @@ mod widgets;
 #[cfg(feature = "svbony")]
 mod camera;
 
+#[cfg(feature = "gev")]
+mod gev_camera;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
@@ -70,6 +73,8 @@ enum CameraSource {
     FitsFile(std::path::PathBuf),
     #[cfg(feature = "svbony")]
     SVBony(i32),
+    #[cfg(feature = "gev")]
+    Gev(String),
 }
 
 enum CaptureState {
@@ -78,6 +83,11 @@ enum CaptureState {
     SVBony {
         handle: camera::CameraHandle,
         control_values: Vec<(svbony::ControlType, i64, bool)>,
+    },
+    #[cfg(feature = "gev")]
+    Gev {
+        handle: gev_camera::GevHandle,
+        controls: Vec<gev_camera::GevControl>,
     },
     Stopped,
 }
@@ -237,7 +247,14 @@ struct ViewerApp {
 
     #[cfg(feature = "svbony")]
     discovered_cameras: Vec<svbony::CameraInfo>,
-    #[cfg(feature = "svbony")]
+    #[cfg(feature = "gev")]
+    discovered_gev: Vec<gev_camera::GevDeviceInfo>,
+    #[cfg(feature = "gev")]
+    gev_manual_ip: String,
+    /// Substring filter for the GigE controls panel.
+    #[cfg(feature = "gev")]
+    gev_filter: String,
+    #[cfg(any(feature = "svbony", feature = "gev"))]
     camera_error: Option<String>,
 }
 
@@ -366,7 +383,11 @@ impl ViewerApp {
         #[cfg(feature = "svbony")]
         let discovered_cameras = camera::enumerate();
 
-        #[cfg(feature = "svbony")]
+        #[cfg(feature = "gev")]
+        let discovered_gev = gev_camera::enumerate();
+
+        #[cfg(any(feature = "svbony", feature = "gev"))]
+        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
         let mut camera_error: Option<String> = None;
 
         let (camera_source, capture_state, capture_running);
@@ -477,7 +498,13 @@ impl ViewerApp {
             pending_fits_load: None,
             #[cfg(feature = "svbony")]
             discovered_cameras,
-            #[cfg(feature = "svbony")]
+            #[cfg(feature = "gev")]
+            discovered_gev,
+            #[cfg(feature = "gev")]
+            gev_manual_ip: String::new(),
+            #[cfg(feature = "gev")]
+            gev_filter: String::new(),
+            #[cfg(any(feature = "svbony", feature = "gev"))]
             camera_error,
         };
 
@@ -723,6 +750,13 @@ impl ViewerApp {
                 .find(|c| c.camera_id == *cam_id)
                 .map(|c| c.name.clone())
                 .unwrap_or_else(|| format!("Camera {}", cam_id)),
+            #[cfg(feature = "gev")]
+            CameraSource::Gev(id) => self
+                .discovered_gev
+                .iter()
+                .find(|c| c.id == *id)
+                .map(|c| c.display_name())
+                .unwrap_or_else(|| format!("GigE {}", id)),
         }
     }
 
@@ -891,19 +925,23 @@ impl ViewerApp {
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
             // Estimate exposure time from camera controls (microseconds)
-            let exposure_us: f64 = {
-                #[cfg(feature = "svbony")]
-                {
-                    if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
-                        control_values.iter()
-                            .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
-                            .map(|(_, v, _)| *v as f64)
-                            .unwrap_or(0.0)
-                    } else { 0.0 }
-                }
-                #[cfg(not(feature = "svbony"))]
-                { 0.0 }
-            };
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev")), allow(unused_mut))]
+            let mut exposure_us: f64 = 0.0;
+            #[cfg(feature = "svbony")]
+            if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
+                exposure_us = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
+                    .map(|(_, v, _)| *v as f64)
+                    .unwrap_or(0.0);
+            }
+            #[cfg(feature = "gev")]
+            if let CaptureState::Gev { ref controls, .. } = self.capture_state {
+                // GenICam ExposureTime is reported in microseconds.
+                exposure_us = controls.iter()
+                    .find(|c| c.name == "ExposureTime")
+                    .map(|c| c.fvalue)
+                    .unwrap_or(0.0);
+            }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
             let mid = chrono::Utc::now() - chrono::Duration::microseconds((exposure_us / 2.0) as i64);
@@ -938,6 +976,10 @@ impl ViewerApp {
                 if let Some(jh) = handle.join_handle.take() {
                     let _ = jh.join();
                 }
+            }
+            #[cfg(feature = "gev")]
+            CaptureState::Gev { mut handle, .. } => {
+                handle.stop();
             }
             CaptureState::Stopped => {}
         }
@@ -1060,7 +1102,36 @@ impl ViewerApp {
         }
     }
 
+    #[cfg(feature = "gev")]
+    fn start_gev(&mut self, info: &gev_camera::GevDeviceInfo) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        match gev_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok(handle) => {
+                let controls = handle.controls.clone();
+                self.add_log(LogEntry::info(format!("GigE camera opened: {}", info.display_name())));
+                let id = info.id.clone();
+                self.capture_state = CaptureState::Gev { handle, controls };
+                self.camera_source = CameraSource::Gev(id);
+                self.capture_running = true;
+            }
+            Err(e) => {
+                let msg = format!("Failed to open GigE camera: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
     fn poll_frame(&mut self) {
+        // Refresh GigE control snapshots (updated values/writability after edits).
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state {
+            while let Ok(snap) = handle.controls_rx.try_recv() {
+                *controls = snap;
+            }
+        }
         let mut latest = None;
         loop {
             match self.frame_rx.try_recv() {
@@ -1237,7 +1308,7 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(feature = "svbony")]
+            #[cfg(any(feature = "svbony", feature = "gev"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
@@ -1254,6 +1325,38 @@ impl ViewerApp {
                 }
                 #[cfg(feature = "svbony")]
                 CameraSource::SVBony(_) => {}
+                #[cfg(feature = "gev")]
+                CameraSource::Gev(_) => {}
+            }
+
+            // GigE: connect directly by IP (needed when a camera is reachable by
+            // unicast but doesn't answer broadcast discovery).
+            #[cfg(feature = "gev")]
+            {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("GigE IP:");
+                    ui.add(egui::TextEdit::singleline(&mut self.gev_manual_ip)
+                        .hint_text("192.168.0.2").desired_width(120.0));
+                });
+                if widgets::styled_button(ui, "Connect to IP", &pal) {
+                    match self.gev_manual_ip.trim().parse::<std::net::Ipv4Addr>() {
+                        Ok(ip) => {
+                            let info = gev_camera::GevDeviceInfo {
+                                ip,
+                                model: String::new(),
+                                manufacturer: String::new(),
+                                id: ip.to_string(),
+                            };
+                            self.start_gev(&info);
+                        }
+                        Err(_) => {
+                            self.camera_error = Some(format!(
+                                "Invalid IP: '{}'", self.gev_manual_ip.trim()
+                            ));
+                        }
+                    }
+                }
             }
 
             // Open FITS shortcut
@@ -1586,37 +1689,268 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(feature = "svbony")]
+    #[cfg(any(feature = "svbony", feature = "gev"))]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
-        let pal = self.pal();
-        if let CaptureState::SVBony { ref handle, ref mut control_values } = self.capture_state {
-            let n = handle.controls.len();
-            let mid = (n + 1) / 2;
-            let label_w = 120.0_f32;
-            let value_w = 80.0_f32;
-            let auto_w = 65.0_f32;
+        #[cfg(feature = "gev")]
+        if matches!(self.capture_state, CaptureState::Gev { .. }) {
+            self.gev_controls_content(ui);
+            return;
+        }
+        #[cfg(feature = "svbony")]
+        {
+            let pal = self.pal();
+            if let CaptureState::SVBony { ref handle, ref mut control_values } = self.capture_state {
+                let n = handle.controls.len();
+                let mid = (n + 1) / 2;
+                let label_w = 120.0_f32;
+                let value_w = 80.0_f32;
+                let auto_w = 65.0_f32;
 
-            // Two-column layout
-            ui.columns(2, |cols| {
-                let col_w = cols[0].available_width();
-                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
-                cols[0].spacing_mut().item_spacing.y = 8.0;
-                for idx in 0..mid {
-                    Self::draw_control(&mut cols[0], &handle.controls[idx], &mut control_values[idx],
-                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
-                }
-                let col_w = cols[1].available_width();
-                let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
-                cols[1].spacing_mut().item_spacing.y = 8.0;
-                for idx in mid..n {
-                    Self::draw_control(&mut cols[1], &handle.controls[idx], &mut control_values[idx],
-                        &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
-                }
-            });
-        } else {
-            ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
-                ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
+                // Two-column layout
+                ui.columns(2, |cols| {
+                    let col_w = cols[0].available_width();
+                    let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                    cols[0].spacing_mut().item_spacing.y = 8.0;
+                    for idx in 0..mid {
+                        Self::draw_control(&mut cols[0], &handle.controls[idx], &mut control_values[idx],
+                            &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                    }
+                    let col_w = cols[1].available_width();
+                    let slider_w = (col_w - label_w - value_w - auto_w - 24.0).max(60.0);
+                    cols[1].spacing_mut().item_spacing.y = 8.0;
+                    for idx in mid..n {
+                        Self::draw_control(&mut cols[1], &handle.controls[idx], &mut control_values[idx],
+                            &handle.cmd_tx, label_w, slider_w, value_w, auto_w, &pal);
+                    }
+                });
+                return;
+            }
+        }
+        // No camera connected (or non-SVBony build).
+        let pal = self.pal();
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
+        });
+    }
+
+    /// Render the GigE camera's GenICam-derived controls, grouped by the
+    /// camera's own categories in collapsible sections, with a substring
+    /// filter. Writable floats/ints → sliders, enums → combo, bools →
+    /// checkbox, commands → button; read-only features render as telemetry
+    /// text. Controls disabled by an `Auto` mode re-enable automatically once
+    /// the capture thread pushes a fresh snapshot.
+    #[cfg(feature = "gev")]
+    fn gev_controls_content(&mut self, ui: &mut egui::Ui) {
+        use gev_camera::{GevCmd, GevControlKind};
+        let pal = self.pal();
+        if !matches!(self.capture_state, CaptureState::Gev { .. }) { return }
+
+        // Filter box — the full GenICam tree can run to hundreds of features.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.gev_filter)
+                    .hint_text("Filter features…")
+                    .desired_width(180.0),
+            );
+            if !self.gev_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.gev_filter.clear();
+            }
+        });
+        let filter = self.gev_filter.trim().to_lowercase();
+        let filtering = !filter.is_empty();
+        let matches = |c: &gev_camera::GevControl| {
+            !filtering
+                || c.display.to_lowercase().contains(&filter)
+                || c.name.to_lowercase().contains(&filter)
+        };
+
+        let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state else { return };
+
+        // Categories in first-seen (XML tree) order.
+        let mut cats: Vec<String> = Vec::new();
+        for c in controls.iter() {
+            if !cats.contains(&c.category) { cats.push(c.category.clone()); }
+        }
+
+        for cat in &cats {
+            if !controls.iter().any(|c| &c.category == cat && matches(c)) {
+                continue;
+            }
+            ui.add_space(2.0);
+            let mut header = egui::CollapsingHeader::new(
+                egui::RichText::new(cat).strong().color(pal.accent),
+            )
+            .default_open(gev_category_default_open(cat));
+            if filtering {
+                header = header.open(Some(true)); // reveal matches; reverts when cleared
+            }
+            header.show(ui, |ui| {
+                ui.spacing_mut().slider_width = 120.0;
+                egui::Grid::new(format!("gev_ctrl_{cat}"))
+                    .num_columns(3)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        for c in controls.iter_mut().filter(|c| &c.category == cat && matches(c)) {
+                            let lbl = ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
+                            let mut hover = c.name.clone();
+                            if c.needs_restart {
+                                hover.push_str("\nChanging this briefly stops and restarts the stream");
+                            }
+                            lbl.on_hover_text(hover);
+                            let unit = c.unit.clone();
+                            let unit_lbl = move |ui: &mut egui::Ui| {
+                                ui.label(egui::RichText::new(unit).small().color(pal.text_secondary));
+                            };
+                            let ro_text = |ui: &mut egui::Ui, text: String| {
+                                ui.label(egui::RichText::new(text).monospace().color(pal.text_primary));
+                            };
+                            // `needs_restart` controls (PixelFormat, Width/Height, binning)
+                            // read as read-only *while acquiring*, but we apply them by
+                            // stopping/restarting the stream — so keep them editable.
+                            let enabled = c.writable || c.needs_restart;
+                            match &c.kind {
+                                GevControlKind::Float if enabled => {
+                                    let old = c.fvalue;
+                                    let mut v = c.fvalue;
+                                    let range = c.fmin..=c.fmax.max(c.fmin + 1.0);
+                                    ui.add(egui::Slider::new(&mut v, range).logarithmic(true));
+                                    unit_lbl(ui);
+                                    if (v - old).abs() > f64::EPSILON {
+                                        c.fvalue = v;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetFloat(c.name.clone(), v));
+                                    }
+                                }
+                                GevControlKind::Float | GevControlKind::ReadOnly => {
+                                    ro_text(ui, fmt_gev_float(c.fvalue));
+                                    unit_lbl(ui);
+                                }
+                                GevControlKind::Integer if enabled => {
+                                    let old = c.value;
+                                    let mut v = c.value;
+                                    ui.add(egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                                    unit_lbl(ui);
+                                    if v != old {
+                                        c.value = v;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), v));
+                                    }
+                                }
+                                GevControlKind::Integer => {
+                                    ro_text(ui, c.value.to_string());
+                                    unit_lbl(ui);
+                                }
+                                GevControlKind::IpV4 if enabled => {
+                                    // Octets in human order; `ip_swapped` says how the
+                                    // camera packs them into the integer.
+                                    let mut oct = if c.ip_swapped {
+                                        (c.value as u32).to_le_bytes()
+                                    } else {
+                                        (c.value as u32).to_be_bytes()
+                                    };
+                                    let mut edited = false;
+                                    let mut active = false;
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        for (k, o) in oct.iter_mut().enumerate() {
+                                            if k > 0 {
+                                                ui.label(egui::RichText::new(".").monospace());
+                                            }
+                                            let r = ui.add(egui::DragValue::new(o).speed(1));
+                                            edited |= r.changed();
+                                            active |= r.has_focus() || r.dragged();
+                                        }
+                                    });
+                                    ui.label("");
+                                    if edited {
+                                        c.value = if c.ip_swapped {
+                                            u32::from_le_bytes(oct)
+                                        } else {
+                                            u32::from_be_bytes(oct)
+                                        } as i64;
+                                    }
+                                    // Write only once the user is done editing — sending
+                                    // per keystroke would set half-typed addresses.
+                                    let dirty_id = egui::Id::new(("gev_ip_dirty", &c.name));
+                                    let mut dirty: bool =
+                                        ui.data(|d| d.get_temp(dirty_id)).unwrap_or(false);
+                                    dirty |= edited;
+                                    if dirty && !active {
+                                        let _ = handle.cmd_tx.send(GevCmd::SetInt(c.name.clone(), c.value));
+                                        dirty = false;
+                                    }
+                                    ui.data_mut(|d| d.insert_temp(dirty_id, dirty));
+                                }
+                                GevControlKind::IpV4 => {
+                                    let o = if c.ip_swapped {
+                                        (c.value as u32).to_le_bytes()
+                                    } else {
+                                        (c.value as u32).to_be_bytes()
+                                    };
+                                    ro_text(ui, format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]));
+                                    ui.label("");
+                                }
+                                GevControlKind::MacAddr => {
+                                    let b = (c.value as u64).to_be_bytes();
+                                    let m: [u8; 6] = if c.ip_swapped {
+                                        [b[7], b[6], b[5], b[4], b[3], b[2]]
+                                    } else {
+                                        [b[2], b[3], b[4], b[5], b[6], b[7]]
+                                    };
+                                    ro_text(ui, format!(
+                                        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                        m[0], m[1], m[2], m[3], m[4], m[5]
+                                    ));
+                                    ui.label("");
+                                }
+                                GevControlKind::Enumeration(opts) if enabled => {
+                                    let opts = opts.clone();
+                                    let idx = c.value as usize;
+                                    let cur = opts.get(idx).cloned().unwrap_or_default();
+                                    let mut pick: Option<(usize, String)> = None;
+                                    egui::ComboBox::from_id_salt(&c.name)
+                                        .selected_text(cur)
+                                        .show_ui(ui, |ui| {
+                                            for (i, o) in opts.iter().enumerate() {
+                                                if ui.selectable_label(i == idx, o).clicked() {
+                                                    pick = Some((i, o.clone()));
+                                                }
+                                            }
+                                        });
+                                    ui.label("");
+                                    if let Some((i, sym)) = pick {
+                                        c.value = i as i64;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetEnum(c.name.clone(), sym));
+                                    }
+                                }
+                                GevControlKind::Enumeration(opts) => {
+                                    let cur = opts.get(c.value as usize).cloned().unwrap_or_default();
+                                    ro_text(ui, cur);
+                                    ui.label("");
+                                }
+                                GevControlKind::Boolean if enabled => {
+                                    let mut on = c.value != 0;
+                                    let resp = ui.add(egui::Checkbox::new(&mut on, ""));
+                                    ui.label("");
+                                    if resp.changed() {
+                                        c.value = on as i64;
+                                        let _ = handle.cmd_tx.send(GevCmd::SetBool(c.name.clone(), on));
+                                    }
+                                }
+                                GevControlKind::Boolean => {
+                                    ro_text(ui, if c.value != 0 { "On".into() } else { "Off".into() });
+                                    ui.label("");
+                                }
+                                GevControlKind::Command => {
+                                    if ui.button("Execute").clicked() {
+                                        let _ = handle.cmd_tx.send(GevCmd::Execute(c.name.clone()));
+                                    }
+                                    ui.label("");
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
             });
         }
     }
@@ -2061,6 +2395,30 @@ impl ViewerApp {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Categories worth showing expanded by default; the rest (device info,
+/// transport layer, …) start collapsed.
+#[cfg(feature = "gev")]
+fn gev_category_default_open(cat: &str) -> bool {
+    let c = cat.to_ascii_lowercase();
+    c.contains("acquisition") || c.contains("image") || c.contains("analog") || c.contains("gain")
+}
+
+/// Format a GenICam float for telemetry display: integers plain, otherwise
+/// precision scaled to magnitude.
+#[cfg(feature = "gev")]
+fn fmt_gev_float(v: f64) -> String {
+    let a = v.abs();
+    if v == v.trunc() && a < 1e7 {
+        format!("{v:.0}")
+    } else if a >= 1000.0 {
+        format!("{v:.1}")
+    } else if a >= 1.0 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.5}")
+    }
+}
+
 #[cfg(feature = "svbony")]
 fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {
     match ctrl {
@@ -2306,6 +2664,13 @@ impl eframe::App for ViewerApp {
                                             self.start_svbony(&info);
                                         }
                                     }
+                                    #[cfg(feature = "gev")]
+                                    CameraSource::Gev(id) => {
+                                        let id = id.clone();
+                                        if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
+                                            self.start_gev(&info);
+                                        }
+                                    }
                                 }
                                 ui.close();
                             }
@@ -2321,6 +2686,24 @@ impl eframe::App for ViewerApp {
                                 let label = format!("{} ({})", cam_info.name, cam_info.serial);
                                 if menu_radio(ui, is_this, &label) && !is_this {
                                     self.start_svbony(cam_info);
+                                    ui.close();
+                                }
+                            }
+                        }
+                        #[cfg(feature = "gev")]
+                        {
+                            ui.separator();
+                            // To connect by IP, use the "GigE IP" field in the
+                            // side-panel Camera section (text entry inside a menu
+                            // is unreliable in egui).
+                            if ui.button("Refresh GigE Cameras").clicked() {
+                                self.discovered_gev = gev_camera::enumerate();
+                            }
+                            for gev_info in &self.discovered_gev.clone() {
+                                let is_this = matches!(&self.camera_source, CameraSource::Gev(id) if *id == gev_info.id);
+                                let label = format!("{} ({})", gev_info.display_name(), gev_info.ip);
+                                if menu_radio(ui, is_this, &label) && !is_this {
+                                    self.start_gev(gev_info);
                                     ui.close();
                                 }
                             }
@@ -2376,6 +2759,13 @@ impl eframe::App for ViewerApp {
                                 let cam_id = *cam_id;
                                 if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
                                     self.start_svbony(&info);
+                                }
+                            }
+                            #[cfg(feature = "gev")]
+                            CameraSource::Gev(id) => {
+                                let id = id.clone();
+                                if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
+                                    self.start_gev(&info);
                                 }
                             }
                         }
@@ -2495,13 +2885,13 @@ impl eframe::App for ViewerApp {
                         match self.bottom_tab {
                             BottomTab::Histogram => self.histogram_content(ui),
                             BottomTab::Controls => {
-                                #[cfg(feature = "svbony")]
+                                #[cfg(any(feature = "svbony", feature = "gev"))]
                                 {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
                                         self.controls_content(ui);
                                     });
                                 }
-                                #[cfg(not(feature = "svbony"))]
+                                #[cfg(not(any(feature = "svbony", feature = "gev")))]
                                 ui.label("Camera support not compiled in");
                             }
                             #[cfg(feature = "starsolve")]
@@ -2871,7 +3261,16 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // cameleon_genapi logs an ERROR every time it constructs an error, even for
+    // ones we handle (e.g. probing chunk-backed features we then skip) — keep
+    // its internal logging out; failures we care about are reported by our code.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .add_directive("cameleon_genapi=off".parse().expect("valid directive")),
+        )
+        .init();
     let options = eframe::NativeOptions {
         // Setting an explicit (empty) icon suppresses eframe's default behavior of
         // loading the bundled egui logo and calling setApplicationIconImage shortly

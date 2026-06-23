@@ -241,29 +241,107 @@ struct ViewerApp {
     camera_error: Option<String>,
 }
 
+/// Name of the semibold font family used for headings, section eyebrows, and
+/// emphasized labels. egui's `.strong()` only recolors text — real weight has
+/// to come from a heavier font, which we synthesize here.
+const FONT_STRONG: &str = "strong";
+
+fn strong_family() -> egui::FontFamily {
+    egui::FontFamily::Name(FONT_STRONG.into())
+}
+
+/// Install the best available system UI + monospace fonts, plus a semibold UI
+/// instance for emphasis. The macOS SF files are *variable* fonts, so the
+/// semibold is the same file driven to `wght: 600` via the variation axis;
+/// other platforms fall back to a static-bold file, then to regular, then to
+/// egui's bundled fonts for glyph coverage.
+fn install_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::VariationCoords;
+    use egui::{FontData, FontFamily};
+
+    // First existing path wins, per role.
+    const PROP: &[&str] = &[
+        "/System/Library/Fonts/SFNS.ttf",                  // macOS — SF Pro (variable)
+        "C:/Windows/Fonts/segoeui.ttf",                    // Windows — Segoe UI
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Linux
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    ];
+    const PROP_BOLD: &[&str] = &[ // static-bold fallback for non-variable platforms
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    ];
+    const MONO: &[&str] = &[
+        "/System/Library/Fonts/SFNSMono.ttf", // macOS — SF Mono
+        "C:/Windows/Fonts/consola.ttf",       // Windows — Consolas
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    ];
+
+    let read_first = |paths: &[&str]| {
+        paths.iter().find_map(|p| std::fs::read(p).ok().map(|d| (p.to_string(), d)))
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Proportional regular + semibold instance.
+    if let Some((path, data)) = read_first(PROP) {
+        let variable = path.contains("SFNS");
+
+        let mut reg = FontData::from_owned(data.clone());
+        reg.tweak.y_offset_factor = -0.02;
+        fonts.font_data.insert("ui".to_owned(), reg.into());
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".to_owned());
+
+        let mut sb = if variable {
+            let mut d = FontData::from_owned(data);
+            d.tweak.coords = VariationCoords::new([(b"wght", 600.0)]);
+            d
+        } else if let Some((_, bold)) = read_first(PROP_BOLD) {
+            FontData::from_owned(bold)
+        } else {
+            FontData::from_owned(data)
+        };
+        sb.tweak.y_offset_factor = -0.02;
+        fonts.font_data.insert("ui_semibold".to_owned(), sb.into());
+
+        // Semibold family, with regular UI + egui defaults as glyph fallback.
+        let mut fam = vec!["ui_semibold".to_owned()];
+        if let Some(prop) = fonts.families.get(&FontFamily::Proportional) {
+            fam.extend(prop.iter().filter(|n| *n != "ui_semibold").cloned());
+        }
+        fonts.families.insert(strong_family(), fam);
+    }
+
+    // Monospace.
+    if let Some((path, data)) = read_first(MONO) {
+        let mut md = FontData::from_owned(data);
+        if path.contains("SFNSMono") {
+            md.tweak.scale = 0.95; // SF Mono runs large; match the proportional cap height
+        }
+        md.tweak.y_offset_factor = -0.02;
+        fonts.font_data.insert("ui_mono".to_owned(), md.into());
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "ui_mono".to_owned());
+    }
+
+    // Guarantee the strong family resolves even if no system UI font loaded.
+    if !fonts.families.contains_key(&strong_family()) {
+        let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+        fonts.families.insert(strong_family(), fallback);
+    }
+
+    ctx.set_fonts(fonts);
+}
+
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Load system fonts
-        let mut fonts = egui::FontDefinitions::default();
-        if let Ok(sf_data) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
-            let mut font_data = egui::FontData::from_owned(sf_data);
-            font_data.tweak.y_offset_factor = -0.02;
-            fonts.font_data.insert("sf_pro".to_owned(), font_data.into());
-            fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "sf_pro".to_owned());
-        }
-        if let Ok(sf_mono) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") {
-            let mut font_data = egui::FontData::from_owned(sf_mono);
-            font_data.tweak.scale = 0.95;
-            font_data.tweak.y_offset_factor = -0.02;
-            fonts.font_data.insert("sf_mono".to_owned(), font_data.into());
-            fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "sf_mono".to_owned());
-        }
-        cc.egui_ctx.set_fonts(fonts);
+        // Load system UI + monospace fonts (with a real semibold for emphasis).
+        install_fonts(&cc.egui_ctx);
 
         // Theme
         let mut style = (*cc.egui_ctx.global_style()).clone();
         style.text_styles.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(15.0, egui::FontFamily::Proportional));
+        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(15.5, strong_family()));
         style.text_styles.insert(egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Proportional));
         style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::new(12.5, egui::FontFamily::Monospace));
         style.text_styles.insert(egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional));
@@ -329,7 +407,7 @@ impl ViewerApp {
             capture_running = false;
         }
 
-        let ui_theme = widgets::UiTheme::Light;
+        let ui_theme = widgets::UiTheme::Dark;
 
         #[allow(unused_mut)]
         let mut app = Self {
@@ -631,13 +709,45 @@ impl ViewerApp {
         self.ui_theme.palette()
     }
 
+    /// Human-readable label for the current image source.
+    fn source_label(&self) -> String {
+        match &self.camera_source {
+            CameraSource::None => "No source".to_string(),
+            CameraSource::FitsFile(path) => {
+                format!("FITS: {}", path.file_name().unwrap_or_default().to_string_lossy())
+            }
+            #[cfg(feature = "svbony")]
+            CameraSource::SVBony(cam_id) => self
+                .discovered_cameras
+                .iter()
+                .find(|c| c.camera_id == *cam_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("Camera {}", cam_id)),
+        }
+    }
+
+    /// Open the native FITS file picker on a worker thread. No-op if one is
+    /// already pending; the chosen path is consumed by `poll_fits_load`.
+    fn open_fits_dialog(&mut self) {
+        if self.pending_fits_path.is_some() {
+            return;
+        }
+        let (tx, rx) = bounded(1);
+        self.pending_fits_path = Some(rx);
+        std::thread::spawn(move || {
+            let result = rfd::FileDialog::new()
+                .add_filter("FITS", &["fits", "fit", "fts"])
+                .pick_file();
+            let _ = tx.send(result);
+        });
+    }
+
     fn apply_theme(&self, ctx: &egui::Context) {
         let pal = self.pal();
-        let is_night = self.ui_theme == widgets::UiTheme::Night;
         let mut style = (*ctx.global_style()).clone();
 
         let r = egui::CornerRadius::same(6);
-        style.visuals.dark_mode = is_night;
+        style.visuals.dark_mode = self.ui_theme.is_dark();
         style.visuals.widgets.noninteractive.corner_radius = r;
         style.visuals.widgets.inactive.corner_radius = r;
         style.visuals.widgets.hovered.corner_radius = r;
@@ -645,16 +755,8 @@ impl ViewerApp {
         style.visuals.panel_fill = pal.panel_fill;
         style.visuals.window_fill = pal.window_fill;
         // Text input / DragValue backgrounds
-        style.visuals.extreme_bg_color = if is_night {
-            egui::Color32::from_rgb(20, 8, 8)
-        } else {
-            egui::Color32::from_rgb(248, 248, 248)
-        };
-        style.visuals.faint_bg_color = if is_night {
-            egui::Color32::from_rgb(30, 12, 12)
-        } else {
-            egui::Color32::from_rgb(245, 245, 245)
-        };
+        style.visuals.extreme_bg_color = pal.extreme_bg;
+        style.visuals.faint_bg_color = pal.faint_bg;
         style.visuals.widgets.noninteractive.bg_fill = pal.panel_fill;
         style.visuals.widgets.noninteractive.weak_bg_fill = pal.panel_fill;
         style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, pal.section_border);
@@ -1133,21 +1235,7 @@ impl ViewerApp {
 
         section(ui, "Camera", &pal, |ui| {
             // Current source status line
-            let source_label = match &self.camera_source {
-                CameraSource::None => "No source".to_string(),
-                CameraSource::FitsFile(path) => {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    format!("FITS: {}", name)
-                }
-                #[cfg(feature = "svbony")]
-                CameraSource::SVBony(cam_id) => {
-                    self.discovered_cameras.iter()
-                        .find(|c| c.camera_id == *cam_id)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| format!("Camera {}", cam_id))
-                }
-            };
-            ui.label(egui::RichText::new(source_label).size(13.0).color(pal.accent));
+            ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
             #[cfg(feature = "svbony")]
             if let Some(err) = &self.camera_error {
@@ -1172,14 +1260,7 @@ impl ViewerApp {
             ui.add_space(4.0);
             let dialog_pending = self.pending_fits_path.is_some();
             if !dialog_pending && widgets::styled_button(ui, "Open FITS...", &pal) {
-                let (tx, rx) = bounded(1);
-                self.pending_fits_path = Some(rx);
-                std::thread::spawn(move || {
-                    let result = rfd::FileDialog::new()
-                        .add_filter("FITS", &["fits", "fit", "fts"])
-                        .pick_file();
-                    let _ = tx.send(result);
-                });
+                self.open_fits_dialog();
             }
         });
 
@@ -1284,12 +1365,12 @@ impl ViewerApp {
         section(ui, "Statistics", &pal, |ui| {
             let lw = 65.0;
             egui::Grid::new("stats_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
-                stat_row(ui, lw, "FPS", &format!("{:.1}", self.fps));
+                stat_row(ui, lw, "FPS", &format!("{:.1}", self.fps), &pal);
                 if let Some(frame) = &self.current_frame {
-                    stat_row(ui, lw, "Size", &format!("{} x {}", frame.width, frame.height));
-                    stat_row(ui, lw, "Bit depth", &format!("{}", frame.bit_depth));
-                    stat_row(ui, lw, "Mean", &format!("{:.1}", frame.mean));
-                    stat_row(ui, lw, "Std Dev", &format!("{:.1}", frame.stddev));
+                    stat_row(ui, lw, "Size", &format!("{} x {}", frame.width, frame.height), &pal);
+                    stat_row(ui, lw, "Bit depth", &format!("{}", frame.bit_depth), &pal);
+                    stat_row(ui, lw, "Mean", &format!("{:.1}", frame.mean), &pal);
+                    stat_row(ui, lw, "Std Dev", &format!("{:.1}", frame.stddev), &pal);
                 }
             });
             ui.add_space(4.0);
@@ -1401,12 +1482,23 @@ impl ViewerApp {
                 .map(|f| ((1u64 << f.bit_depth) - 1) as f64)
                 .unwrap_or(65535.0);
 
+            // A single coarse "nice" step (~4-5 lines) keeps the histogram
+            // surgical instead of graph-papery.
+            let grid_step = {
+                let raw = (x_max / 4.0).max(1.0);
+                let mag = 10f64.powf(raw.log10().floor());
+                let norm = raw / mag;
+                let nice = if norm < 1.5 { 1.0 } else if norm < 3.0 { 2.0 } else if norm < 7.0 { 5.0 } else { 10.0 };
+                nice * mag
+            };
+
             let plot_resp = egui_plot::Plot::new("histogram")
                 .height(plot_height)
                 .y_axis_label(y_label)
                 .show_axes([true, false])
                 .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
                 .show_grid([true, false])
+                .x_grid_spacer(egui_plot::uniform_grid_spacer(move |_| [grid_step, grid_step * 5.0, grid_step * 10.0]))
                 .x_axis_label("Pixel Value")
                 .include_x(0.0)
                 .include_x(x_max)
@@ -1804,33 +1896,40 @@ impl ViewerApp {
         ui.add_space(2.0);
         let total_w = ui.available_width();
         let col_w = (total_w / 3.0 - 4.0).max(100.0);
-        let label_w = 85.0;
+        let label_w = 92.0;
         let slider_w = (col_w - label_w - 8.0).max(40.0);
 
-        let fixed_label = |ui: &mut egui::Ui, text: String| {
+        // Name on the left, value right-aligned in a mono column so the numbers
+        // line up into a scannable column directly before each slider.
+        let param_label = |ui: &mut egui::Ui, name: &str, value: &str| {
             ui.allocate_ui(egui::vec2(label_w, 20.0), |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(text).size(12.0));
+                ui.set_min_width(label_w);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(egui::RichText::new(name).size(12.0).color(pal.text_secondary));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(value).size(12.0).monospace().color(pal.text_primary));
+                    });
                 });
             });
         };
 
         // Row 1
         ui.horizontal(|ui| {
-            fixed_label(ui, format!("Pix σ {:.1}", self.centroid_config.sigma_threshold));
+            param_label(ui, "Pix σ", &format!("{:.1}", self.centroid_config.sigma_threshold));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0, &pal);
             });
 
             let mut v = self.centroid_config.min_pixels as f32;
-            fixed_label(ui, format!("Min px {}", self.centroid_config.min_pixels));
+            param_label(ui, "Min px", &format!("{}", self.centroid_config.min_pixels));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0, &pal);
             });
             self.centroid_config.min_pixels = v.round() as usize;
 
             let mut v = self.centroid_config.max_pixels as f32;
-            fixed_label(ui, format!("Max px {}", self.centroid_config.max_pixels));
+            param_label(ui, "Max px", &format!("{}", self.centroid_config.max_pixels));
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0, &pal);
             });
@@ -1840,24 +1939,24 @@ impl ViewerApp {
         // Row 2
         ui.horizontal(|ui| {
             let mut v = self.centroid_config.max_centroids.unwrap_or(0) as f32;
-            let lbl = if self.centroid_config.max_centroids.is_none() { "Stars all".into() } else { format!("Stars {}", v.round() as usize) };
-            fixed_label(ui, lbl);
+            let val = if self.centroid_config.max_centroids.is_none() { "all".into() } else { format!("{}", v.round() as usize) };
+            param_label(ui, "Stars", &val);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0, &pal);
             });
             self.centroid_config.max_centroids = if (v as usize) == 0 { None } else { Some(v.round() as usize) };
 
             let mut v = self.centroid_config.local_bg_block_size.unwrap_or(0) as f32;
-            let lbl = if self.centroid_config.local_bg_block_size.is_none() { "Global BG".into() } else { format!("BG tile {} px", v.round() as u32) };
-            fixed_label(ui, lbl);
+            let val = if self.centroid_config.local_bg_block_size.is_none() { "global".into() } else { format!("{} px", v.round() as u32) };
+            param_label(ui, "BG", &val);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0, &pal);
             });
             self.centroid_config.local_bg_block_size = if (v as u32) == 0 { None } else { Some(v.round() as u32) };
 
             let mut v = self.centroid_config.max_elongation.unwrap_or(0.0);
-            let lbl = if self.centroid_config.max_elongation.is_none() { "Elong. off".into() } else { format!("Elong. {:.1}", v) };
-            fixed_label(ui, lbl);
+            let val = if self.centroid_config.max_elongation.is_none() { "off".into() } else { format!("{:.1}", v) };
+            param_label(ui, "Elong", &val);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0, &pal);
             });
@@ -1867,8 +1966,8 @@ impl ViewerApp {
         // Row 3
         ui.horizontal(|ui| {
             let mut v = self.centroid_config.matched_filter_sigma.unwrap_or(0.0);
-            let lbl = if self.centroid_config.matched_filter_sigma.is_none() { "Blur off".into() } else { format!("Blur σ {:.1}", v) };
-            fixed_label(ui, lbl);
+            let val = if self.centroid_config.matched_filter_sigma.is_none() { "off".into() } else { format!("{:.1}", v) };
+            param_label(ui, "Blur σ", &val);
             ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                 widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
             });
@@ -1993,13 +2092,22 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
                 ui.painter().hline(rect.x_range(), rect.max.y, egui::Stroke::new(1.0, pal.section_border));
                 rect
             };
-            ui.painter().text(
-                egui::pos2(header_rect.min.x + 10.0, header_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                title.to_uppercase(),
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-                pal.section_header_text,
+            // Semibold, letter-spaced uppercase eyebrow — tracking gives the
+            // small caps room to breathe instead of reading as a cramped run.
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                &title.to_uppercase(),
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::new(11.0, strong_family()),
+                    color: pal.section_header_text,
+                    extra_letter_spacing: 1.2,
+                    ..Default::default()
+                },
             );
+            let galley = ui.painter().layout_job(job);
+            let gy = header_rect.center().y - galley.size().y / 2.0;
+            ui.painter().galley(egui::pos2(header_rect.min.x + 10.0, gy), galley, pal.section_header_text);
             ui.allocate_space(egui::vec2(0.0, header_h));
             egui::Frame::new()
                 .inner_margin(egui::Margin { left: 9, right: 9, top: 8, bottom: 8 })
@@ -2017,9 +2125,14 @@ fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
     });
 }
 
-fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_width); ui.label(label); });
-    ui.label(egui::RichText::new(value).monospace());
+/// One row of the Statistics panel: a dim, right-aligned label and a monospace
+/// value — the same dim-label + mono-value register as the Plate Solve readout.
+fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str, pal: &widgets::Palette) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.set_width(label_width);
+        ui.label(egui::RichText::new(label).color(pal.text_secondary));
+    });
+    ui.label(egui::RichText::new(value).monospace().color(pal.text_primary));
     ui.end_row();
 }
 
@@ -2098,14 +2211,7 @@ impl eframe::App for ViewerApp {
                     ui.menu_button("File", |ui| {
                         let dialog_pending = self.pending_fits_path.is_some();
                         if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
-                            let (tx, rx) = bounded(1);
-                            self.pending_fits_path = Some(rx);
-                            std::thread::spawn(move || {
-                                let result = rfd::FileDialog::new()
-                                    .add_filter("FITS", &["fits", "fit", "fts"])
-                                    .pick_file();
-                                let _ = tx.send(result);
-                            });
+                            self.open_fits_dialog();
                             ui.close();
                         }
                         ui.separator();
@@ -2258,7 +2364,7 @@ impl eframe::App for ViewerApp {
                         if ui.button(egui::RichText::new("\u{23F9}  Stop").size(14.0)).clicked() {
                             self.stop_capture();
                         }
-                    } else if ui.button(egui::RichText::new("\u{25B6}  Play").size(14.0)).clicked() {
+                    } else if widgets::primary_button(ui, "\u{25B6}  Play", &pal) {
                         match &self.camera_source.clone() {
                             CameraSource::None => {}
                             CameraSource::FitsFile(path) => {
@@ -2287,23 +2393,12 @@ impl eframe::App for ViewerApp {
                     } else if ui.button(egui::RichText::new("Record").size(14.0)).clicked() {
                         self.start_recording();
                     }
-                    ui.separator();
-                    let cmap_options: Vec<(ColormapKind, &str)> = ColormapKind::ALL.iter().map(|&k| (k, k.name())).collect();
-                    if widgets::combo_box(ui, "toolbar_cmap", "", &mut self.colormap.kind, &cmap_options, &pal) {
-                        self.colormap = Colormap::new(self.colormap.kind);
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Scale:").size(13.0));
-                    widgets::combo_box(ui, "toolbar_scale", "", &mut self.scale_mode, ScaleMode::ALL, &pal);
-                    ui.separator();
-                    // Theme selector
-                    widgets::combo_box(ui, "toolbar_theme", "", &mut self.ui_theme, widgets::UiTheme::ALL, &pal);
+                    // Display settings (colormap, scale, theme) live in the
+                    // DISPLAY panel + View/Theme menus; the toolbar stays a
+                    // transport bar. fps reads on the right.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
                         ui.label(egui::RichText::new(format!("{:.1} fps", self.fps)).monospace().size(13.0).color(pal.accent));
-                        if let (Some((px, py)), Some(val)) = (self.cursor_pixel, self.cursor_value) {
-                            ui.label(egui::RichText::new(format!("({}, {}) = {:.0}", px, py, val)).monospace().size(13.0));
-                        }
                     });
                 });
             });
@@ -2317,16 +2412,53 @@ impl eframe::App for ViewerApp {
                 .stroke(egui::Stroke::new(1.0, pal.statusbar_border))
             )
             .show_inside(ui, |ui| {
+                let dim = pal.text_secondary;
+                let small = 11.0;
+                let sep = |ui: &mut egui::Ui| {
+                    ui.label(egui::RichText::new("·").size(small).color(dim));
+                };
                 ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+
                     if self.recording {
                         ui.label(egui::RichText::new(format!(
-                            "Recording: {} | {} frames",
+                            "\u{25CF} REC {} · {} frames",
                             self.rec_filename, self.rec_frame_count
-                        )).size(11.0).color(egui::Color32::from_rgb(220, 40, 40)).monospace());
-                    } else {
-                        ui.label(egui::RichText::new("Ready").size(11.0)
-                            .color(pal.text_secondary).monospace());
+                        )).size(small).monospace().color(egui::Color32::from_rgb(220, 40, 40)));
+                        sep(ui);
                     }
+
+                    // Source · dimensions · bit depth
+                    ui.label(egui::RichText::new(self.source_label()).size(small).monospace().color(dim));
+                    if let Some(frame) = &self.current_frame {
+                        sep(ui);
+                        ui.label(egui::RichText::new(format!("{}×{}", frame.width, frame.height))
+                            .size(small).monospace().color(pal.text_primary));
+                        sep(ui);
+                        ui.label(egui::RichText::new(format!("{}-bit", frame.bit_depth))
+                            .size(small).monospace().color(pal.text_primary));
+                    }
+
+                    // Right group: solve status + cursor readout
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        #[cfg(feature = "starsolve")]
+                        {
+                            if self.solve_rx.is_some() {
+                                ui.label(egui::RichText::new("Solving…").size(small).monospace()
+                                    .color(egui::Color32::from_rgb(217, 119, 6)));
+                            } else if self.last_solve.as_ref()
+                                .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound)
+                            {
+                                ui.label(egui::RichText::new("Solved").size(small).monospace()
+                                    .color(egui::Color32::from_rgb(34, 197, 94)));
+                            }
+                        }
+                        if let (Some((px, py)), Some(val)) = (self.cursor_pixel, self.cursor_value) {
+                            ui.label(egui::RichText::new(format!("({}, {}) = {:.0}", px, py, val))
+                                .size(small).monospace().color(pal.text_primary));
+                        }
+                    });
                 });
             });
 
@@ -2395,7 +2527,35 @@ impl eframe::App for ViewerApp {
                 self.cursor_pixel = resp.hovered_pixel;
                 self.cursor_value = resp.hovered_value;
             } else {
-                ui.vertical_centered(|ui| { ui.label("Waiting for frames..."); });
+                let pal2 = self.pal();
+                let source = self.source_label();
+                let has_source = !matches!(self.camera_source, CameraSource::None);
+                let cmap_name = self.colormap.kind.name();
+                let dialog_pending = self.pending_fits_path.is_some();
+                let mut open = false;
+                ui.vertical_centered(|ui| {
+                    ui.add_space((ui.available_height() * 0.30).max(24.0));
+                    ui.label(egui::RichText::new("AstroViewer")
+                        .font(egui::FontId::new(30.0, strong_family()))
+                        .color(pal2.text_secondary));
+                    ui.add_space(8.0);
+                    let hint = if has_source {
+                        format!("Press Play to start  {}", source)
+                    } else {
+                        "Open a FITS file or connect a camera to begin".to_string()
+                    };
+                    ui.label(egui::RichText::new(hint).size(13.0).color(pal2.text_secondary));
+                    ui.add_space(18.0);
+                    if !dialog_pending && widgets::primary_button(ui, "Open FITS\u{2026}", &pal2) {
+                        open = true;
+                    }
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(format!("Colormap  {}", cmap_name))
+                        .size(11.0).monospace().color(pal2.text_secondary));
+                });
+                if open {
+                    self.open_fits_dialog();
+                }
             }
         });
 
@@ -2720,11 +2880,11 @@ fn main() -> Result<()> {
         // With IconData::default(), eframe leaves the OS-provided icon untouched.
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 1000.0])
-            .with_title("Viewer")
+            .with_title("AstroViewer")
             .with_icon(egui::IconData::default()),
         ..Default::default()
     };
-    eframe::run_native("Viewer", options, Box::new(|cc| Ok(Box::new(ViewerApp::new(cc)))))
+    eframe::run_native("AstroViewer", options, Box::new(|cc| Ok(Box::new(ViewerApp::new(cc)))))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     Ok(())
 }

@@ -57,7 +57,7 @@ fn combo_box_inner<T: PartialEq + Copy>(
     let painter = ui.painter();
     painter.rect(
         rect,
-        egui::CornerRadius::same(4),
+        egui::CornerRadius::same(6),
         bg,
         egui::Stroke::new(1.0, border_color),
         egui::StrokeKind::Inside,
@@ -97,7 +97,7 @@ fn combo_box_inner<T: PartialEq + Copy>(
     let popup_frame = egui::Frame::new()
         .fill(pal.combo_popup_bg)
         .stroke(egui::Stroke::new(1.0, pal.combo_popup_border))
-        .corner_radius(egui::CornerRadius::same(4))
+        .corner_radius(egui::CornerRadius::same(6))
         .shadow(egui::Shadow {
             offset: [0, 2],
             blur: 8,
@@ -136,7 +136,7 @@ fn combo_box_inner<T: PartialEq + Copy>(
                 };
 
                 if item_bg != egui::Color32::TRANSPARENT {
-                    ui.painter().rect_filled(item_rect, egui::CornerRadius::same(3), item_bg);
+                    ui.painter().rect_filled(item_rect, egui::CornerRadius::same(4), item_bg);
                 }
                 ui.painter().text(
                     egui::pos2(item_rect.min.x + 10.0, item_rect.center().y),

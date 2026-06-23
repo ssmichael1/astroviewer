@@ -6,7 +6,7 @@ pub fn styled_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str, pal: 
     let old = *checked;
     let height = 20.0;
     let box_size = 18.0;
-    let r = egui::CornerRadius::same(5);
+    let r = egui::CornerRadius::same(6);
     let font = egui::FontId::proportional(13.0);
 
     let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.text_primary);

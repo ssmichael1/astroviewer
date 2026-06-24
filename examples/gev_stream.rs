@@ -176,6 +176,52 @@ fn main() -> anyhow::Result<()> {
 
     // Receive window (seconds) — optional 2nd arg, default 8.
     let listen_secs: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+
+    // TEMP DIAGNOSTIC: capture the camera's GVSP off the datalink (BPF), below
+    // the network-extension/socket filter, to prove the packets are on the wire
+    // even when the socket sees zero.
+    {
+        let secs = listen_secs;
+        // Sniff the camera by MAC on every plausible NIC, promiscuously, to find
+        // where (if anywhere) it puts GVSP on the wire after the port switch.
+        for ifn in ["en0", "en8"] {
+            let secs = secs;
+            std::thread::spawn(move || {
+                let open = pcap::Capture::from_device(ifn)
+                    .and_then(|c| c.promisc(true).immediate_mode(true).snaplen(2048).timeout(500).open());
+                match open {
+                    Ok(mut cap) => {
+                        let _ = cap.filter("ether src 3c:39:e7:71:02:86", true);
+                        let (mut n, mut bytes) = (0u64, 0u64);
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let end = Instant::now() + Duration::from_secs(secs);
+                        while Instant::now() < end {
+                            match cap.next_packet() {
+                                Ok(p) => {
+                                    n += 1; bytes += p.data.len() as u64;
+                                    let f = p.data;
+                                    if f.len() >= 38 {
+                                        let dmac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", f[0],f[1],f[2],f[3],f[4],f[5]);
+                                        let et = u16::from_be_bytes([f[12],f[13]]);
+                                        let info = if et==0x0800 {
+                                            format!("dstMAC={dmac} dstIP={}.{}.{}.{} dport={} p{}", f[30],f[31],f[32],f[33], u16::from_be_bytes([f[36],f[37]]), f[23])
+                                        } else { format!("dstMAC={dmac} ethertype=0x{et:04x}") };
+                                        if seen.len() < 6 { seen.insert(info); }
+                                    }
+                                }
+                                Err(pcap::Error::TimeoutExpired) => {}
+                                Err(_) => break,
+                            }
+                        }
+                        println!("[BPF {ifn}] camera-MAC frames: {n} pkts ({} KB)", bytes / 1024);
+                        for s in &seen { println!("   [{ifn}] {s}"); }
+                    }
+                    Err(e) => println!("[BPF {ifn}] open failed: {e}"),
+                }
+            });
+        }
+    }
+
     println!("\nlistening for GVSP packets for {listen_secs} s…");
     let mut buf = vec![0u8; 65536];
     let mut assembly: Option<FrameAssembly> = None;

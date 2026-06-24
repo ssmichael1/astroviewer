@@ -83,6 +83,8 @@ enum CameraSource {
     SVBony(i32),
     #[cfg(feature = "gev")]
     Gev(String),
+    #[cfg(feature = "indi")]
+    Indi { host: String, port: u16, device: String },
 }
 
 enum CaptureState {
@@ -256,10 +258,16 @@ struct ViewerApp {
     discovered_gev: Vec<gev_camera::GevDeviceInfo>,
     #[cfg(feature = "gev")]
     gev_manual_ip: String,
+    #[cfg(feature = "indi")]
+    indi_addr: String,
+    #[cfg(feature = "indi")]
+    discovered_indi: Vec<indi_camera::IndiDeviceInfo>,
+    #[cfg(feature = "indi")]
+    pending_indi: Option<Receiver<anyhow::Result<Vec<indi_camera::IndiDeviceInfo>>>>,
     /// Substring filter for the camera controls panel.
     #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
     controls_filter: String,
-    #[cfg(any(feature = "svbony", feature = "gev"))]
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
     camera_error: Option<String>,
 }
 
@@ -391,7 +399,7 @@ impl ViewerApp {
         #[cfg(feature = "gev")]
         let discovered_gev = gev_camera::enumerate();
 
-        #[cfg(any(feature = "svbony", feature = "gev"))]
+        #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
         #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
         let mut camera_error: Option<String> = None;
 
@@ -505,9 +513,15 @@ impl ViewerApp {
             discovered_gev,
             #[cfg(feature = "gev")]
             gev_manual_ip: String::new(),
+            #[cfg(feature = "indi")]
+            indi_addr: "localhost:7624".to_string(),
+            #[cfg(feature = "indi")]
+            discovered_indi: Vec::new(),
+            #[cfg(feature = "indi")]
+            pending_indi: None,
             #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
             controls_filter: String::new(),
-            #[cfg(any(feature = "svbony", feature = "gev"))]
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
             camera_error,
         };
 
@@ -760,6 +774,8 @@ impl ViewerApp {
                 .find(|c| c.id == *id)
                 .map(|c| c.display_name())
                 .unwrap_or_else(|| format!("GigE {}", id)),
+            #[cfg(feature = "indi")]
+            CameraSource::Indi { device, .. } => format!("INDI: {device}"),
         }
     }
 
@@ -1057,6 +1073,34 @@ impl ViewerApp {
         }
     }
 
+    /// Collect the result of a background INDI device scan.
+    #[cfg(feature = "indi")]
+    fn poll_indi(&mut self) {
+        if let Some(rx) = &self.pending_indi {
+            if let Ok(result) = rx.try_recv() {
+                self.pending_indi = None;
+                match result {
+                    Ok(devices) => {
+                        self.add_log(LogEntry::info(format!(
+                            "INDI: found {} CCD device(s)",
+                            devices.len()
+                        )));
+                        if devices.is_empty() {
+                            self.camera_error =
+                                Some("No INDI CCD devices found on that server".into());
+                        }
+                        self.discovered_indi = devices;
+                    }
+                    Err(e) => {
+                        let msg = format!("INDI scan failed: {e}");
+                        self.camera_error = Some(msg.clone());
+                        self.add_log(LogEntry::error(msg));
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "svbony")]
     fn start_svbony(&mut self, info: &svbony::CameraInfo) {
         self.stop_capture();
@@ -1094,6 +1138,65 @@ impl ViewerApp {
             }
             Err(e) => {
                 let msg = format!("Failed to open GigE camera: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
+    /// Parse the `host:port` field, defaulting the port to the INDI default.
+    #[cfg(feature = "indi")]
+    fn indi_host_port(&self) -> (String, u16) {
+        let s = self.indi_addr.trim();
+        match s.rsplit_once(':') {
+            Some((h, p)) => (
+                h.to_string(),
+                p.trim().parse().unwrap_or(indi_camera::DEFAULT_PORT),
+            ),
+            None if !s.is_empty() => (s.to_string(), indi_camera::DEFAULT_PORT),
+            _ => ("localhost".to_string(), indi_camera::DEFAULT_PORT),
+        }
+    }
+
+    /// Enumerate INDI CCDs on a worker thread (the connect blocks ~1–2 s).
+    #[cfg(feature = "indi")]
+    fn scan_indi(&mut self) {
+        if self.pending_indi.is_some() {
+            return;
+        }
+        let (host, port) = self.indi_host_port();
+        let (tx, rx) = bounded(1);
+        self.pending_indi = Some(rx);
+        self.add_log(LogEntry::info(format!("Scanning INDI server {host}:{port}…")));
+        std::thread::spawn(move || {
+            let _ = tx.send(indi_camera::enumerate(&host, port));
+        });
+    }
+
+    #[cfg(feature = "indi")]
+    fn start_indi(&mut self, device: &str) {
+        self.stop_capture();
+        self.camera_error = None;
+        let (host, port) = self.indi_host_port();
+        match indi_camera::start_camera(
+            &host,
+            port,
+            device,
+            self.frame_tx.clone(),
+            self.log_tx.clone(),
+        ) {
+            Ok(handle) => {
+                self.add_log(LogEntry::info(format!("INDI camera opened: {device}")));
+                self.capture_state = CaptureState::Live(Box::new(handle));
+                self.camera_source = CameraSource::Indi {
+                    host,
+                    port,
+                    device: device.to_string(),
+                };
+                self.capture_running = true;
+            }
+            Err(e) => {
+                let msg = format!("Failed to open INDI camera: {e}");
                 self.camera_error = Some(msg.clone());
                 self.add_log(LogEntry::error(msg));
             }
@@ -1281,7 +1384,7 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(any(feature = "svbony", feature = "gev"))]
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "indi"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
@@ -1300,6 +1403,8 @@ impl ViewerApp {
                 CameraSource::SVBony(_) => {}
                 #[cfg(feature = "gev")]
                 CameraSource::Gev(_) => {}
+                #[cfg(feature = "indi")]
+                CameraSource::Indi { .. } => {}
             }
 
             // GigE: connect directly by IP (needed when a camera is reachable by
@@ -1328,6 +1433,30 @@ impl ViewerApp {
                                 "Invalid IP: '{}'", self.gev_manual_ip.trim()
                             ));
                         }
+                    }
+                }
+            }
+
+            // INDI: connect to an indiserver, then pick a CCD from the Camera
+            // menu (discovered devices listed there). Default localhost:7624.
+            #[cfg(feature = "indi")]
+            {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("INDI:");
+                    ui.add(egui::TextEdit::singleline(&mut self.indi_addr)
+                        .hint_text("host:7624").desired_width(120.0));
+                });
+                let scanning = self.pending_indi.is_some();
+                let scan_label = if scanning { "Scanning\u{2026}" } else { "Scan INDI" };
+                if !scanning && widgets::styled_button(ui, scan_label, &pal) {
+                    self.scan_indi();
+                }
+                for dev in &self.discovered_indi.clone() {
+                    let is_this = matches!(&self.camera_source,
+                        CameraSource::Indi { device, .. } if device == &dev.device);
+                    if menu_radio(ui, is_this, &dev.display_name()) && !is_this {
+                        self.start_indi(&dev.device.clone());
                     }
                 }
             }
@@ -2271,11 +2400,15 @@ impl eframe::App for ViewerApp {
         self.poll_log();
         self.poll_fits_load();
         self.poll_bg();
+        #[cfg(feature = "indi")]
+        self.poll_indi();
         #[cfg(feature = "starsolve")]
         self.poll_solver_generation();
         self.apply_theme(&ctx);
 
         if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        #[cfg(feature = "indi")]
+        if self.pending_indi.is_some() { ctx.request_repaint(); }
         // Keep repainting while the database builds so the elapsed timer ticks
         // and completion is detected promptly.
         #[cfg(feature = "starsolve")]
@@ -2433,6 +2566,11 @@ impl eframe::App for ViewerApp {
                                             self.start_gev(&info);
                                         }
                                     }
+                                    #[cfg(feature = "indi")]
+                                    CameraSource::Indi { device, .. } => {
+                                        let device = device.clone();
+                                        self.start_indi(&device);
+                                    }
                                 }
                                 ui.close();
                             }
@@ -2529,6 +2667,11 @@ impl eframe::App for ViewerApp {
                                 if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
                                     self.start_gev(&info);
                                 }
+                            }
+                            #[cfg(feature = "indi")]
+                            CameraSource::Indi { device, .. } => {
+                                let device = device.clone();
+                                self.start_indi(&device);
                             }
                         }
                     }

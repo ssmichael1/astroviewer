@@ -26,7 +26,7 @@ use tokio::runtime::Runtime;
 
 use cameleon_genapi::elem_type::{IntegerRepresentation, Visibility};
 use cameleon_genapi::interface::ICategoryKind;
-use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
+use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeData, NodeId, NodeStore};
 use cameleon_genapi::{GenApiError, ValueCtxt};
 use viva_gige::gvcp::{self, DeviceInfo, GigeDevice};
 use viva_gige::gvsp::{self, FrameAssembly, GvspPacket};
@@ -48,6 +48,13 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 const RX_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// Stream channel index (single-channel cameras use 0).
 const STREAM_CHANNEL: u32 = 0;
+/// Target GVSP packet size (bytes) for jumbo-frame streaming. viva-gige's
+/// `nic::mtu` hardcodes 1500 on every non-Linux platform, so `negotiate_stream`
+/// always derives a 1458-byte packet size on macOS regardless of the real en0
+/// MTU — defeating jumbo frames entirely. When the link (en0 MTU 9000) and the
+/// camera both allow it, we override the negotiated value with this. 8192 sits
+/// safely under a 9000-byte MTU after Ethernet/IP/UDP headers.
+const JUMBO_PACKET_SIZE: u32 = 8192;
 /// How long to wait for stream packets before returning to service commands.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long an in-flight frame may take to reassemble before being abandoned.
@@ -105,6 +112,9 @@ pub struct GevControl {
     /// GenICam feature node name (used to set the value back on the camera).
     pub name: String,
     pub display: String,
+    /// ToolTip (falling back to Description) from the GenICam XML, shown on
+    /// hover. Empty when the node documents neither.
+    pub tooltip: String,
     /// GenICam category (used to group controls in the UI).
     pub category: String,
     pub kind: GevControlKind,
@@ -112,6 +122,9 @@ pub struct GevControl {
     pub value: i64,
     pub min: i64,
     pub max: i64,
+    /// Increment/granularity for integer features (GenICam `Inc`). Writes are
+    /// snapped to this grid; many cameras reject off-grid values. 1 if unspecified.
+    pub inc: i64,
     pub fvalue: f64,
     pub fmin: f64,
     pub fmax: f64,
@@ -123,6 +136,11 @@ pub struct GevControl {
     /// relative to the GigE convention (first octet in the most significant
     /// byte), so the UI must reverse byte order when displaying/composing.
     pub ip_swapped: bool,
+    /// Whether this control holds live telemetry worth re-polling while
+    /// streaming (temperature, status, counters). Static identity/config
+    /// (IP/MAC, sensor maxima, versions) is read once and left alone, so the
+    /// telemetry loop doesn't spend a GVCP round-trip per static node every tick.
+    volatile: bool,
 }
 
 /// Commands from the UI thread to the capture thread.
@@ -344,11 +362,33 @@ pub fn start_camera(
         stream_params.mtu, stream_params.packet_size
     )));
 
+    // viva-gige negotiated against a hardcoded 1500 MTU (its nic::mtu off-Linux),
+    // so on macOS the packet size is capped at 1458 even when en0 is set to a
+    // jumbo MTU. Override it with a jumbo packet size, clamped to whatever the
+    // camera advertises as GevSCPSPacketSize's max.
+    let mut packet_size = stream_params.packet_size;
+    let want = jumbo_packet_size(genapi.as_mut(), &mut dev, &rt);
+    if want > packet_size {
+        match rt.block_on(dev.set_stream_packet_size(STREAM_CHANNEL, want)) {
+            Ok(()) => {
+                let _ = log_tx.try_send(LogEntry::info(format!(
+                    "GigE: GVSP packet size {packet_size} -> {want} (jumbo frames)"
+                )));
+                packet_size = want;
+            }
+            Err(e) => {
+                let _ = log_tx.try_send(LogEntry::warn(format!(
+                    "GigE: jumbo packet-size override to {want} failed ({e}); using {packet_size}"
+                )));
+            }
+        }
+    }
+
     // Acquisition is started inside the capture thread once everything is wired.
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
-    let packet_payload = stream_params.packet_size.saturating_sub(8).max(1) as usize;
+    let packet_payload = packet_size.saturating_sub(8).max(1) as usize;
     let cam_name = info.display_name();
 
     // When the BPF workaround is requested, hand the capture thread what it
@@ -478,6 +518,24 @@ fn read_mem_chunked(
 
 /// Configure full-frame mono acquisition: set PixelFormat to the widest mono
 /// format the camera offers, set Width/Height to max, AcquisitionMode=Continuous.
+/// Pick a jumbo GVSP packet size, clamped to the camera's advertised
+/// `GevSCPSPacketSize` maximum. Falls back to [`JUMBO_PACKET_SIZE`] when GenICam
+/// is unavailable or the node can't be read (the camera then validates the raw
+/// register write itself, rejecting a too-large value).
+fn jumbo_packet_size(genapi: Option<&mut GenApi>, dev: &mut GigeDevice, rt: &Runtime) -> u32 {
+    let Some(g) = genapi else { return JUMBO_PACKET_SIZE };
+    let mut bridge = DeviceBridge { rt, dev };
+    let cap = g
+        .store
+        .id_by_name("GevSCPSPacketSize")
+        .and_then(|nid| nid.as_iinteger_kind(&g.store))
+        .and_then(|int| int.max(&mut bridge, &g.store, &mut g.ctxt).ok());
+    match cap {
+        Some(max) if max > 0 => JUMBO_PACKET_SIZE.min(max as u32),
+        _ => JUMBO_PACKET_SIZE,
+    }
+}
+
 fn configure_acquisition(
     g: &mut GenApi,
     dev: &mut GigeDevice,
@@ -525,16 +583,73 @@ fn configure_acquisition(
     }
 }
 
-/// Build the UI control list by walking the camera's own GenICam category tree
-/// from `Root`, reading each feature live (type, value, range, writability,
-/// enum options). Invisible nodes and non-value kinds (ports, registers,
-/// plain strings) are skipped; nested categories are flattened under their
-/// own display name.
+/// NodeId of a *user-facing feature* node for the orphan sweep: only the
+/// high-level types a person sets (Integer/Float/Boolean/Enumeration/Command).
+/// Backing nodes — registers (`*Reg`), converters, swiss-knife expressions
+/// (`*Expr`), ports, EnumEntry, and the unimplemented DCAM placeholders — are
+/// skipped. They are implementation detail (and `node_base()` even panics on
+/// some), not controls. Categorized features of any kind are still picked up by
+/// the Root walk; this only governs the uncategorized leftovers.
+fn orphan_feature_id(data: &NodeData) -> Option<NodeId> {
+    match data {
+        NodeData::Integer(_)
+        | NodeData::Float(_)
+        | NodeData::Boolean(_)
+        | NodeData::Enumeration(_)
+        | NodeData::Command(_) => Some(data.node_base().id()),
+        _ => None,
+    }
+}
+
+/// Orphan features that are transport/protocol plumbing rather than imaging
+/// controls: chunk-data, event-channel, scheduled-action, and authentication
+/// nodes. They are noise in the UI and — crucially — reading chunk/selector
+/// nodes can leave streaming state disturbed (a Mono12Packed frame then decodes
+/// misaligned until the camera reboots), so the sweep skips them entirely. Any
+/// such feature the vendor *did* place in a category still shows via the Root
+/// walk; this only governs the uncategorized leftovers.
+fn is_transport_plumbing(name: &str) -> bool {
+    const PREFIXES: &[&str] = &["Chunk", "Event", "TestEvent", "Action", "CoreAuth"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Category bucket for value features the vendor's XML leaves out of the `Root`
+/// category tree (e.g. AcquisitionFrameRate on the Raptor Hawk). They are fully
+/// functional — just uncategorized — so we group them here rather than drop them.
+const ORPHAN_CATEGORY: &str = "Other";
+
+/// Build the UI control list. First walk the camera's own GenICam category tree
+/// from `Root` (preserving grouping/order), then sweep every remaining node in
+/// the store so value features that no category references still get exposed.
+/// Invisible nodes and non-value kinds (ports, registers, plain strings) are
+/// skipped; nested categories are flattened under their own display name.
 fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, cam_ip: Ipv4Addr) -> Vec<GevControl> {
     let mut out = Vec::new();
     let mut b = DeviceBridge { rt, dev };
-    let Some(root) = g.store.id_by_name("Root") else { return out };
-    walk_category(g, &mut b, root, None, &mut out);
+    if let Some(root) = g.store.id_by_name("Root") {
+        walk_category(g, &mut b, root, None, &mut out);
+    }
+
+    // Sweep orphans: any value feature not reachable through the category tree.
+    // Collect ids first (visit_nodes borrows the store) then build, so the
+    // mutable GenApi access in control_from_node doesn't alias the iteration.
+    let seen: std::collections::HashSet<String> = out.iter().map(|c| c.name.clone()).collect();
+    let mut all_ids: Vec<NodeId> = Vec::new();
+    g.store.visit_nodes(|data| {
+        if let Some(id) = orphan_feature_id(data) {
+            all_ids.push(id);
+        }
+    });
+    for nid in all_ids {
+        let nm = nid.name(&g.store);
+        if seen.contains(nm) || is_transport_plumbing(nm) {
+            continue;
+        }
+        if let Some(c) = control_from_node(g, &mut b, nid, ORPHAN_CATEGORY) {
+            out.push(c);
+        }
+    }
+
     orient_addresses(&mut out, cam_ip);
     out
 }
@@ -586,6 +701,12 @@ fn walk_category(
     }
 }
 
+/// Make a register-style feature name readable when the XML provides no
+/// DisplayName: underscores become spaces (e.g. `Temp_Coeff_P` → `Temp Coeff P`).
+fn prettify_name(name: &str) -> String {
+    name.replace('_', " ")
+}
+
 /// The node's display name, falling back to its raw feature name.
 fn node_display(g: &GenApi, nid: NodeId) -> String {
     g.store
@@ -615,23 +736,39 @@ fn control_from_node(
         return None;
     }
     let nb = g.store.node_opt(nid)?.node_base();
+    // Expose every visibility level the operator can meaningfully use — Beginner,
+    // Expert, and Guru (e.g. the temperature PID gains are Guru). Only `Invisible`
+    // (implementation-internal nodes the vendor never intends to surface) is
+    // dropped. Do not gate on Expert/Guru here or in the UI.
     if nb.visibility() == Visibility::Invisible {
         return None;
     }
     let name = nid.name(&g.store).to_string();
-    let display = nb.display_name().unwrap_or(&name).to_string();
+    // Prefer the XML DisplayName; otherwise make the raw register name readable.
+    let display = match nb.display_name() {
+        Some(d) => d.to_string(),
+        None => prettify_name(&name),
+    };
+    // Surface the node's own documentation (ToolTip, else the longer Description).
+    let tooltip = nb
+        .tooltip()
+        .or_else(|| nb.description())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
     let base = |kind, unit: String, writable: bool| GevControl {
         name: name.clone(),
         display: display.clone(),
+        tooltip: tooltip.clone(),
         category: category.to_string(),
         kind,
         unit,
-        value: 0, min: 0, max: 0,
+        value: 0, min: 0, max: 0, inc: 1,
         fvalue: 0.0, fmin: 0.0, fmax: 0.0,
         writable,
         needs_restart: needs_restart(&name),
         ip_swapped: false,
+        volatile: false,
     };
 
     // Order matters: boolean/enumeration before integer, since some are both.
@@ -645,14 +782,23 @@ fn control_from_node(
         };
         let mut c = base(GevControlKind::Boolean, String::new(), writable);
         c.value = v as i64;
+        c.volatile = is_volatile_name(&name);
         Some(c)
     } else if let Some(en) = nid.as_ienumeration_kind(&g.store) {
         let readable = en.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         let writable = en.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
         if !readable && !writable { return None; }
-        let opts: Vec<String> = en.entries(&g.store).iter()
-            .filter_map(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string()))
-            .collect();
+        // Only entries the camera reports as currently available — an enum may
+        // expose values that aren't valid in the present mode (e.g. PixelFormats
+        // unavailable for the active binning), and selecting one would fail.
+        let mut opts: Vec<String> = Vec::new();
+        for e in en.entries(&g.store) {
+            if let Ok(entry) = e.expect_enum_entry(&g.store) {
+                if entry.is_available(b, &g.store, &mut g.ctxt).unwrap_or(true) {
+                    opts.push(entry.symbolic().to_string());
+                }
+            }
+        }
         let cur = match en.current_entry(b, &g.store, &mut g.ctxt) {
             Err(GenApiError::ChunkDataMissing) => return None, // chunk-backed
             e => e.ok().and_then(|e| e.expect_enum_entry(&g.store).ok().map(|x| x.symbolic().to_string())),
@@ -660,6 +806,7 @@ fn control_from_node(
         let idx = cur.as_ref().and_then(|s| opts.iter().position(|o| o == s)).unwrap_or(0);
         let mut c = base(GevControlKind::Enumeration(opts), String::new(), writable);
         c.value = idx as i64;
+        c.volatile = is_volatile_name(&name);
         Some(c)
     } else if let Some(f) = nid.as_ifloat_kind(&g.store) {
         let readable = f.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
@@ -676,6 +823,8 @@ fn control_from_node(
         let kind = if writable && sane_range(fmin, fmax) { GevControlKind::Float } else { GevControlKind::ReadOnly };
         let mut c = base(kind, unit, writable);
         c.fvalue = value; c.fmin = fmin; c.fmax = fmax;
+        // Floats are analog measurements (temperature, voltage); poll them.
+        c.volatile = true;
         Some(c)
     } else if let Some(i) = nid.as_iinteger_kind(&g.store) {
         let readable = i.is_readable(b, &g.store, &mut g.ctxt).unwrap_or(false);
@@ -688,6 +837,7 @@ fn control_from_node(
         };
         let min = i.min(b, &g.store, &mut g.ctxt).unwrap_or(0);
         let max = i.max(b, &g.store, &mut g.ctxt).unwrap_or(0);
+        let inc = i.inc(b, &g.store, &mut g.ctxt).ok().flatten().unwrap_or(1).max(1);
         // Address-valued integers get dedicated rendering. Trust the XML's
         // Representation, with a name heuristic for XMLs that omit it.
         let repr = i.representation(&g.store);
@@ -700,8 +850,12 @@ fn control_from_node(
         } else {
             GevControlKind::Integer
         };
+        // Plain integers named like live telemetry (counters, status) are polled;
+        // addresses and static config integers are not.
+        let volatile = matches!(kind, GevControlKind::Integer) && is_volatile_name(&name);
         let mut c = base(kind, unit, writable);
-        c.value = value; c.min = min; c.max = max;
+        c.value = value; c.min = min; c.max = max; c.inc = inc;
+        c.volatile = volatile;
         Some(c)
     } else if let Some(cn) = nid.as_icommand_kind(&g.store) {
         let writable = cn.is_writable(b, &g.store, &mut g.ctxt).unwrap_or(false);
@@ -712,9 +866,23 @@ fn control_from_node(
     }
 }
 
-/// Re-read the current values of non-writable (telemetry) controls in place.
-/// Returns true if any value changed. Much cheaper than `build_controls`:
-/// skips ranges, writability, and all writable features.
+/// Whether a feature name denotes live telemetry worth re-polling while
+/// streaming. Used to keep the telemetry loop from spending a GVCP round-trip on
+/// static config (sensor maxima, versions) every tick. Floats are always polled
+/// regardless of name (see `control_from_node`); this rescues integer/enum/bool
+/// status nodes by their SFNC-style names.
+fn is_volatile_name(name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "temperature", "temp", "status", "state", "counter", "error",
+        "fan", "voltage", "humidity", "pressure", "power", "timestamp", "tick",
+    ];
+    let lname = name.to_ascii_lowercase();
+    KEYWORDS.iter().any(|k| lname.contains(k))
+}
+
+/// Re-read the current values of live telemetry controls in place. Returns true
+/// if any value changed. Much cheaper than `build_controls`: skips ranges,
+/// writability, writable features, and static (non-volatile) read-only nodes.
 fn refresh_telemetry(
     g: &mut GenApi,
     dev: &mut GigeDevice,
@@ -724,7 +892,7 @@ fn refresh_telemetry(
     enum Upd { I(i64), F(f64) }
     let mut b = DeviceBridge { rt, dev };
     let mut changed = false;
-    for c in controls.iter_mut().filter(|c| !c.writable) {
+    for c in controls.iter_mut().filter(|c| !c.writable && c.volatile) {
         let Some(nid) = g.store.id_by_name(&c.name) else { continue };
         let upd = match &c.kind {
             GevControlKind::Float | GevControlKind::ReadOnly => nid
@@ -816,25 +984,47 @@ fn capture_loop(
 
     loop {
         // 1. Service pending commands (sync GenICam access, not inside block_on).
+        // Track refresh scope: a *structural* change (enum/bool toggle, command,
+        // or a geometry/restart feature) can re-lock companion controls or shift
+        // ranges, so the whole control tree is rebuilt. A plain *value* change
+        // (dragging Exposure/Gain) touches only that one feature, so we re-read
+        // just it — re-walking the tree on every slider tick would stall the GVSP
+        // stream with dozens of synchronous GVCP round-trips.
         let mut stop = false;
-        let mut changed = false;
+        let mut structural = false;
+        let mut touched: Vec<String> = Vec::new();
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                GevCmd::Stop => { stop = true; break; }
-                other => {
-                    if let Some(g) = genapi.as_mut() {
-                        apply_set(g, &mut dev, &rt, other, &log_tx);
-                        changed = true;
+            if let GevCmd::Stop = cmd {
+                stop = true;
+                break;
+            }
+            let scope = command_scope(&cmd);
+            if let Some(g) = genapi.as_mut() {
+                apply_set(g, &mut dev, &rt, cmd, &log_tx);
+            }
+            match scope {
+                Scope::Structural => structural = true,
+                Scope::Value(name) => {
+                    if !touched.contains(&name) {
+                        touched.push(name);
                     }
                 }
             }
         }
-        // After any change, push a fresh control snapshot so the UI reflects new
-        // values and writability (e.g. ExposureAuto=Off unlocks ExposureTime).
-        if changed {
-            if let Some(g) = genapi.as_mut() {
+        // Push a fresh control snapshot so the UI reflects new values and
+        // writability (e.g. ExposureAuto=Off unlocks ExposureTime).
+        if let Some(g) = genapi.as_mut() {
+            if structural {
                 snapshot = build_controls(g, &mut dev, &rt, cam_ip);
                 let _ = controls_tx.try_send(snapshot.clone());
+            } else if !touched.is_empty() {
+                let mut any = false;
+                for name in &touched {
+                    any |= refresh_control_value(g, &mut dev, &rt, &mut snapshot, name);
+                }
+                if any {
+                    let _ = controls_tx.try_send(snapshot.clone());
+                }
             }
         }
         if stop {
@@ -1192,6 +1382,67 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
     }
 }
 
+// ── Control-refresh scope ───────────────────────────────────────────────────
+
+/// How much of the control list must be re-read after a command is applied.
+enum Scope {
+    /// May restructure the tree (re-lock companions, change ranges, alter
+    /// geometry); rebuild everything.
+    Structural,
+    /// A plain value change to the named feature only; re-read just that control.
+    Value(String),
+}
+
+/// Classify a command's refresh scope. Value writes to a plain (non-geometry)
+/// integer/float touch only themselves; enum/bool toggles, commands, and
+/// geometry/restart features may unlock companions or change ranges, so they
+/// warrant a full rebuild.
+fn command_scope(cmd: &GevCmd) -> Scope {
+    match cmd {
+        GevCmd::SetInt(n, _) | GevCmd::SetFloat(n, _) if !needs_restart(n) => Scope::Value(n.clone()),
+        _ => Scope::Structural,
+    }
+}
+
+/// Re-read one control's live value in place after a direct value change,
+/// reflecting any clamping/snapping the camera applied. Cheap: a single feature,
+/// no tree walk. Returns true if the stored value changed.
+fn refresh_control_value(
+    g: &mut GenApi,
+    dev: &mut GigeDevice,
+    rt: &Runtime,
+    controls: &mut [GevControl],
+    name: &str,
+) -> bool {
+    let Some(c) = controls.iter_mut().find(|c| c.name == name) else { return false };
+    let Some(nid) = g.store.id_by_name(name) else { return false };
+    let mut b = DeviceBridge { rt, dev };
+    match &c.kind {
+        GevControlKind::Float | GevControlKind::ReadOnly => {
+            if let Some(f) = nid.as_ifloat_kind(&g.store) {
+                if let Ok(v) = f.value(&mut b, &g.store, &mut g.ctxt) {
+                    if v != c.fvalue {
+                        c.fvalue = v;
+                        return true;
+                    }
+                }
+            }
+        }
+        GevControlKind::Integer | GevControlKind::IpV4 | GevControlKind::MacAddr => {
+            if let Some(i) = nid.as_iinteger_kind(&g.store) {
+                if let Ok(v) = i.value(&mut b, &g.store, &mut g.ctxt) {
+                    if v != c.value {
+                        c.value = v;
+                        return true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 // ── GenICam feature setters ─────────────────────────────────────────────────
 
 fn set_float_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, v: f64, log_tx: &Sender<LogEntry>) {
@@ -1209,6 +1460,17 @@ fn set_int_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &st
     let mut bridge = DeviceBridge { rt, dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(i) = nid.as_iinteger_kind(&g.store) {
+            // Snap to the feature's increment grid (rounding to nearest, clamped
+            // to range); cameras commonly reject writes that aren't a multiple of
+            // Inc above Min (e.g. Width in steps of 8).
+            let inc = i.inc(&mut bridge, &g.store, &mut g.ctxt).ok().flatten().unwrap_or(1);
+            let v = if inc > 1 {
+                let min = i.min(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(0);
+                let max = i.max(&mut bridge, &g.store, &mut g.ctxt).unwrap_or(i64::MAX);
+                (min + ((v - min).max(0) + inc / 2) / inc * inc).clamp(min, max)
+            } else {
+                v
+            };
             if let Err(e) = i.set_value(v, &mut bridge, &g.store, &mut g.ctxt) {
                 let _ = log_tx.try_send(LogEntry::error(format!("GigE set {name}={v}: {e}")));
             }

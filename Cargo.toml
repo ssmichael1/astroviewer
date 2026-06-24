@@ -62,6 +62,14 @@ required-features = ["gev"]
 name = "gev_features"
 required-features = ["gev"]
 
+[[example]]
+name = "gev_reset"
+required-features = ["gev"]
+
+[[example]]
+name = "gev_sniff_discover"
+required-features = ["gev"]
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

@@ -254,8 +254,11 @@ fn parse_discovery_ack(buf: &[u8]) -> Option<Found> {
         return None; // not DISCOVERY_ACK
     }
     let p = &buf[8..];
+    // Device-info layout (GigE Vision, bootstrap registers mirrored into the ack):
+    // p[8..10] reserved, p[10..16] MAC (2-byte MAC-high at 0x000E + 4-byte MAC-low
+    // at 0x0010). The MAC starts at p[10], not p[12].
     let mut mac = [0u8; 6];
-    mac.copy_from_slice(&p[12..18]);
+    mac.copy_from_slice(&p[10..16]);
     let ip = Ipv4Addr::new(p[36], p[37], p[38], p[39]);
     let manufacturer = fixed_string(&p[72..(72 + 32).min(p.len())]);
     let model = if p.len() >= 104 + 32 { fixed_string(&p[104..136]) } else { String::new() };

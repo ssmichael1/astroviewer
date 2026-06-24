@@ -1702,7 +1702,14 @@ impl ViewerApp {
                     .show(ui, |ui| {
                         for c in controls.iter_mut().filter(|c| &c.category == cat && matches(c)) {
                             let lbl = ui.label(egui::RichText::new(&c.display).color(pal.text_secondary));
-                            let mut hover = c.name.clone();
+                            // Hover shows the node's XML documentation, then the raw
+                            // GenICam name for reference, then any restart caveat.
+                            let mut hover = String::new();
+                            if !c.tooltip.is_empty() {
+                                hover.push_str(&c.tooltip);
+                                hover.push('\n');
+                            }
+                            hover.push_str(&c.name);
                             if c.needs_restart {
                                 hover.push_str("\nChanging this briefly stops and restarts the stream");
                             }
@@ -1737,7 +1744,28 @@ impl ViewerApp {
                                 GevControlKind::Integer if enabled => {
                                     let old = c.value;
                                     let mut v = c.value;
-                                    ui.add(egui::Slider::new(&mut v, c.min..=c.max.max(c.min + 1)));
+                                    // A slider needs a sane bounded range; some features
+                                    // (e.g. the temperature PID gains) declare none and
+                                    // report the full int range — use a numeric entry then.
+                                    let bounded = c.max > c.min
+                                        && c.min > i64::MIN / 2
+                                        && c.max < i64::MAX / 2
+                                        && (c.max as i128 - c.min as i128) <= 100_000_000;
+                                    if bounded {
+                                        let mut slider = egui::Slider::new(&mut v, c.min..=c.max);
+                                        // Step on the camera's increment grid so the
+                                        // slider can only land on writable values.
+                                        if c.inc > 1 {
+                                            slider = slider.step_by(c.inc as f64);
+                                        }
+                                        ui.add(slider);
+                                    } else {
+                                        let mut dv = egui::DragValue::new(&mut v).speed(c.inc.max(1) as f64);
+                                        if c.min > i64::MIN / 2 && c.max < i64::MAX / 2 && c.max > c.min {
+                                            dv = dv.range(c.min..=c.max);
+                                        }
+                                        ui.add(dv);
+                                    }
                                     unit_lbl(ui);
                                     if v != old {
                                         c.value = v;

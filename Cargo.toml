@@ -26,6 +26,10 @@ tetra3 = { version = "0.7.3", features = [
 ], optional = true }
 # tetra3 = { version = "0.7.2", features = ["image"], optional = true }
 
+# INDI client support (streaming XML over TCP; BLOBs decoded via fitskit).
+quick-xml = { version = "0.37", optional = true }
+base64 = { version = "0.22", optional = true }
+
 # GigE Vision support (pure-Rust transport + GenICam XML interpreter).
 viva-gige = { version = "0.2", optional = true }
 cameleon-genapi = { version = "0.1", optional = true }
@@ -39,6 +43,7 @@ svbony = ["dep:svbony"]
 toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
 gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
+indi = ["dep:quick-xml", "dep:base64"]
 
 [[example]]
 name = "gev_spike"

@@ -1,0 +1,692 @@
+//! INDI client — connects to an indiserver, drives a CCD driver, and delivers
+//! frames as `FrameData` over the same channel pattern as `camera` / `gev_camera`.
+//!
+//! Protocol notes (INDI 1.7, docs.indilib.org/protocol):
+//! - Plain TCP (default port 7624) carrying a stream of flat XML elements with
+//!   no document root. The client sends `<getProperties/>` and receives
+//!   `def*Vector` / `set*Vector` / `delProperty` / `message` elements forever.
+//! - Property values are changed by sending `new*Vector` elements.
+//! - Images arrive as base64 BLOBs (FITS), only after `<enableBLOB>` opt-in.
+//! - INDI CCDs are one-shot: write CCD_EXPOSURE, wait for the BLOB. "Live view"
+//!   is implemented here by re-triggering the exposure when each BLOB lands.
+//!
+//! Threading (mirrors `gev_camera`):
+//! - A *writer* thread owns the command channel and serializes `IndiCmd` → XML.
+//! - A *reader* thread blocks on the socket, parses elements, maintains the
+//!   property store, decodes BLOBs, and pushes property snapshots to the UI.
+//! - `IndiCmd::Stop` shuts down the socket, which unblocks the reader.
+//!
+//! UI integration (not yet wired — next steps):
+//! - `CameraSource::Indi(host)` + `CaptureState::Indi { handle }` in main.rs
+//! - Side panel: host:port field + Connect, device picker from snapshots
+//! - Controls tab: render `IndiProperty` list generically (the GevControl
+//!   pattern), special-casing CONNECTION, CCD_EXPOSURE, and CCD_GAIN
+#![allow(dead_code)]
+
+use anyhow::{anyhow, bail, Result};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
+use std::collections::HashMap;
+use std::io::{BufReader, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+pub const DEFAULT_PORT: u16 = 7624;
+
+/// Well-known property/element names (conventions, not schema).
+pub const PROP_CONNECTION: &str = "CONNECTION";
+pub const PROP_EXPOSURE: &str = "CCD_EXPOSURE";
+pub const ELEM_EXPOSURE: &str = "CCD_EXPOSURE_VALUE";
+
+// ── Protocol model ──────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PropState { Idle, Ok, Busy, Alert }
+
+impl PropState {
+    fn parse(s: &str) -> Self {
+        match s {
+            "Ok" => PropState::Ok,
+            "Busy" => PropState::Busy,
+            "Alert" => PropState::Alert,
+            _ => PropState::Idle,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PropPerm { Ro, Wo, Rw }
+
+impl PropPerm {
+    fn parse(s: &str) -> Self {
+        match s {
+            "wo" => PropPerm::Wo,
+            "rw" => PropPerm::Rw,
+            _ => PropPerm::Ro,
+        }
+    }
+}
+
+/// How switches in a vector interact (radio group vs. checkboxes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SwitchRule { OneOfMany, AtMostOne, AnyOfMany }
+
+impl SwitchRule {
+    fn parse(s: &str) -> Self {
+        match s {
+            "AtMostOne" => SwitchRule::AtMostOne,
+            "AnyOfMany" => SwitchRule::AnyOfMany,
+            _ => SwitchRule::OneOfMany,
+        }
+    }
+}
+
+/// One element (member) of a property vector.
+#[derive(Clone, Debug)]
+pub enum IndiValue {
+    Number { value: f64, min: f64, max: f64, step: f64, format: String },
+    Switch(bool),
+    Text(String),
+    Light(PropState),
+    /// BLOB metadata only — pixel data goes straight to the frame channel,
+    /// never into the property store.
+    Blob { format: String, size: usize },
+}
+
+#[derive(Clone, Debug)]
+pub struct IndiElement {
+    pub name: String,
+    pub label: String,
+    pub value: IndiValue,
+}
+
+/// A property vector as defined by the driver. This is the UI-facing unit —
+/// render one widget group per property, like `GevControl`.
+#[derive(Clone, Debug)]
+pub struct IndiProperty {
+    pub device: String,
+    pub name: String,
+    pub label: String,
+    pub group: String,
+    pub state: PropState,
+    pub perm: PropPerm,
+    pub rule: Option<SwitchRule>,
+    pub elements: Vec<IndiElement>,
+}
+
+// ── Commands (UI thread → writer thread) ────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BlobMode { Never, Also, Only }
+
+impl BlobMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            BlobMode::Never => "Never",
+            BlobMode::Also => "Also",
+            BlobMode::Only => "Only",
+        }
+    }
+}
+
+pub enum IndiCmd {
+    /// Set number elements: (element name, value).
+    SetNumber { device: String, property: String, values: Vec<(String, f64)> },
+    /// Set switch elements: (element name, on).
+    SetSwitch { device: String, property: String, values: Vec<(String, bool)> },
+    /// Set text elements: (element name, text).
+    SetText { device: String, property: String, values: Vec<(String, String)> },
+    /// Opt in/out of BLOB delivery for a device.
+    EnableBlob { device: String, mode: BlobMode },
+    /// Convenience: CONNECTION.CONNECT = On.
+    Connect { device: String },
+    /// Trigger an exposure; if `live`, re-trigger on every received frame.
+    StartExposure { device: String, seconds: f64, live: bool },
+    /// Stop re-triggering (does not abort an in-flight exposure).
+    StopLive,
+    /// Shut down the connection and both threads.
+    Stop,
+}
+
+// ── Handle ──────────────────────────────────────────────────────────────────
+
+/// Handle to a running INDI client. Mirrors `GevHandle`.
+pub struct IndiHandle {
+    pub cmd_tx: Sender<IndiCmd>,
+    /// Full property snapshots pushed by the reader thread whenever anything
+    /// changes; the UI drains and keeps the last (same pattern as `GevHandle`).
+    pub props_rx: Receiver<Vec<IndiProperty>>,
+    reader_jh: Option<JoinHandle<()>>,
+    writer_jh: Option<JoinHandle<()>>,
+}
+
+impl IndiHandle {
+    pub fn stop(&mut self) {
+        let _ = self.cmd_tx.send(IndiCmd::Stop);
+        for jh in [self.writer_jh.take(), self.reader_jh.take()].into_iter().flatten() {
+            let _ = jh.join();
+        }
+    }
+}
+
+impl Drop for IndiHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// State shared between reader (blob → retrigger) and writer (exposure cmds).
+struct SharedState {
+    live: AtomicBool,
+    exposure_s: Mutex<f64>,
+    live_device: Mutex<String>,
+}
+
+// ── Client startup ──────────────────────────────────────────────────────────
+
+/// Connect to an indiserver and spawn the reader/writer threads.
+pub fn start_client(
+    host: &str,
+    port: u16,
+    frame_tx: Sender<super::FrameData>,
+    log_tx: Sender<super::LogEntry>,
+) -> Result<IndiHandle> {
+    let stream = TcpStream::connect((host, port))
+        .map_err(|e| anyhow!("connect {host}:{port}: {e}"))?;
+    stream.set_nodelay(true).ok();
+
+    let mut write_stream = stream.try_clone()?;
+    write_stream.write_all(b"<getProperties version=\"1.7\"/>\n")?;
+
+    let (cmd_tx, cmd_rx) = bounded::<IndiCmd>(32);
+    let (props_tx, props_rx) = bounded::<Vec<IndiProperty>>(4);
+    let shared = Arc::new(SharedState {
+        live: AtomicBool::new(false),
+        exposure_s: Mutex::new(1.0),
+        live_device: Mutex::new(String::new()),
+    });
+
+    let writer_jh = {
+        let shared = shared.clone();
+        let log_tx = log_tx.clone();
+        std::thread::spawn(move || writer_loop(write_stream, cmd_rx, shared, log_tx))
+    };
+    let reader_jh = {
+        let shared = shared.clone();
+        let cmd_tx = cmd_tx.clone();
+        std::thread::spawn(move || {
+            reader_loop(stream, frame_tx, props_tx, cmd_tx, shared, log_tx)
+        })
+    };
+
+    Ok(IndiHandle {
+        cmd_tx,
+        props_rx,
+        reader_jh: Some(reader_jh),
+        writer_jh: Some(writer_jh),
+    })
+}
+
+// ── Writer thread: IndiCmd → XML ────────────────────────────────────────────
+
+fn writer_loop(
+    mut stream: TcpStream,
+    cmd_rx: Receiver<IndiCmd>,
+    shared: Arc<SharedState>,
+    log_tx: Sender<super::LogEntry>,
+) {
+    loop {
+        let cmd = match cmd_rx.recv() {
+            Ok(IndiCmd::Stop) | Err(_) => {
+                shared.live.store(false, Ordering::Relaxed);
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+            Ok(cmd) => cmd,
+        };
+        let result = match cmd {
+            IndiCmd::SetNumber { device, property, values } => {
+                let items: Vec<(String, String)> =
+                    values.into_iter().map(|(n, v)| (n, format!("{v}"))).collect();
+                write_new_vector(&mut stream, "Number", &device, &property, &items)
+            }
+            IndiCmd::SetSwitch { device, property, values } => {
+                let items: Vec<(String, String)> = values
+                    .into_iter()
+                    .map(|(n, on)| (n, if on { "On" } else { "Off" }.to_string()))
+                    .collect();
+                write_new_vector(&mut stream, "Switch", &device, &property, &items)
+            }
+            IndiCmd::SetText { device, property, values } => {
+                write_new_vector(&mut stream, "Text", &device, &property, &values)
+            }
+            IndiCmd::EnableBlob { device, mode } => stream.write_all(
+                format!(
+                    "<enableBLOB device=\"{}\">{}</enableBLOB>\n",
+                    xml_escape(&device),
+                    mode.as_str()
+                )
+                .as_bytes(),
+            ),
+            IndiCmd::Connect { device } => write_new_vector(
+                &mut stream,
+                "Switch",
+                &device,
+                PROP_CONNECTION,
+                &[("CONNECT".to_string(), "On".to_string())],
+            ),
+            IndiCmd::StartExposure { device, seconds, live } => {
+                *shared.exposure_s.lock().unwrap() = seconds;
+                *shared.live_device.lock().unwrap() = device.clone();
+                shared.live.store(live, Ordering::Relaxed);
+                write_new_vector(
+                    &mut stream,
+                    "Number",
+                    &device,
+                    PROP_EXPOSURE,
+                    &[(ELEM_EXPOSURE.to_string(), format!("{seconds}"))],
+                )
+            }
+            IndiCmd::StopLive => {
+                shared.live.store(false, Ordering::Relaxed);
+                Ok(())
+            }
+            IndiCmd::Stop => unreachable!(),
+        };
+        if let Err(e) = result {
+            let _ = log_tx.try_send(super::LogEntry::error(format!("INDI write: {e}")));
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+}
+
+/// Emit `<newNumberVector device=.. name=..><oneNumber name=..>v</oneNumber>…`
+fn write_new_vector(
+    stream: &mut TcpStream,
+    kind: &str,
+    device: &str,
+    property: &str,
+    items: &[(String, String)],
+) -> std::io::Result<()> {
+    let mut xml = format!(
+        "<new{kind}Vector device=\"{}\" name=\"{}\">\n",
+        xml_escape(device),
+        xml_escape(property)
+    );
+    for (name, value) in items {
+        xml.push_str(&format!(
+            "  <one{kind} name=\"{}\">{}</one{kind}>\n",
+            xml_escape(name),
+            xml_escape(value)
+        ));
+    }
+    xml.push_str(&format!("</new{kind}Vector>\n"));
+    stream.write_all(xml.as_bytes())
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// ── Reader thread: XML → property store / frames ────────────────────────────
+
+/// One parsed child element of a def*/set* vector (`defNumber`, `oneBLOB`, …).
+struct RawChild {
+    tag: String,
+    attrs: HashMap<String, String>,
+    text: String,
+}
+
+fn reader_loop(
+    stream: TcpStream,
+    frame_tx: Sender<super::FrameData>,
+    props_tx: Sender<Vec<IndiProperty>>,
+    cmd_tx: Sender<IndiCmd>,
+    shared: Arc<SharedState>,
+    log_tx: Sender<super::LogEntry>,
+) {
+    let mut reader = Reader::from_reader(BufReader::with_capacity(1 << 16, stream));
+    reader.config_mut().trim_text(true);
+    // The INDI stream is a sequence of top-level elements with no root, which
+    // is fine for quick-xml's event reader but means we never see a "document".
+    let mut store: HashMap<(String, String), IndiProperty> = HashMap::new();
+    let mut buf = Vec::new();
+
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = attr_map(&e);
+                let children = match read_children(&mut reader, &tag) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = log_tx.try_send(super::LogEntry::error(format!("INDI parse: {e}")));
+                        return;
+                    }
+                };
+                handle_element(
+                    &tag, attrs, children, &mut store, &frame_tx, &props_tx, &cmd_tx,
+                    &shared, &log_tx,
+                );
+            }
+            Ok(Event::Empty(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = attr_map(&e);
+                handle_element(
+                    &tag, attrs, Vec::new(), &mut store, &frame_tx, &props_tx, &cmd_tx,
+                    &shared, &log_tx,
+                );
+            }
+            Ok(Event::Eof) => {
+                let _ = log_tx.try_send(super::LogEntry::info("INDI server disconnected".into()));
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Also the normal exit path: Stop shuts the socket down under us.
+                let _ = log_tx.try_send(super::LogEntry::info(format!("INDI reader exit: {e}")));
+                return;
+            }
+        }
+    }
+}
+
+/// Read the children of a vector element until its matching end tag.
+fn read_children(
+    reader: &mut Reader<BufReader<TcpStream>>,
+    parent_tag: &str,
+) -> Result<Vec<RawChild>> {
+    let mut children = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = attr_map(&e);
+                // Collect text (may be huge for oneBLOB) until the child's end tag.
+                let mut text = String::new();
+                let mut tbuf = Vec::new();
+                loop {
+                    tbuf.clear();
+                    match reader.read_event_into(&mut tbuf)? {
+                        Event::Text(t) => {
+                            text.push_str(&t.unescape().unwrap_or_default());
+                        }
+                        Event::End(_) => break,
+                        Event::Eof => bail!("EOF inside <{tag}>"),
+                        _ => {}
+                    }
+                }
+                children.push(RawChild { tag, attrs, text });
+            }
+            Event::Empty(e) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let attrs = attr_map(&e);
+                children.push(RawChild { tag, attrs, text: String::new() });
+            }
+            Event::End(_) => return Ok(children),
+            Event::Eof => bail!("EOF inside <{parent_tag}>"),
+            _ => {}
+        }
+    }
+}
+
+fn attr_map(e: &BytesStart) -> HashMap<String, String> {
+    e.attributes()
+        .flatten()
+        .map(|a| {
+            (
+                String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+                a.unescape_value().unwrap_or_default().into_owned(),
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_element(
+    tag: &str,
+    attrs: HashMap<String, String>,
+    children: Vec<RawChild>,
+    store: &mut HashMap<(String, String), IndiProperty>,
+    frame_tx: &Sender<super::FrameData>,
+    props_tx: &Sender<Vec<IndiProperty>>,
+    cmd_tx: &Sender<IndiCmd>,
+    shared: &SharedState,
+    log_tx: &Sender<super::LogEntry>,
+) {
+    let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
+    match tag {
+        "defNumberVector" | "defSwitchVector" | "defTextVector" | "defLightVector"
+        | "defBLOBVector" => {
+            let prop = IndiProperty {
+                device: get("device"),
+                name: get("name"),
+                label: {
+                    let l = get("label");
+                    if l.is_empty() { get("name") } else { l }
+                },
+                group: get("group"),
+                state: PropState::parse(&get("state")),
+                perm: PropPerm::parse(&get("perm")),
+                rule: (tag == "defSwitchVector").then(|| SwitchRule::parse(&get("rule"))),
+                elements: children.iter().map(parse_def_element).collect(),
+            };
+            store.insert((prop.device.clone(), prop.name.clone()), prop);
+            push_snapshot(store, props_tx);
+        }
+        "setNumberVector" | "setSwitchVector" | "setTextVector" | "setLightVector"
+        | "setBLOBVector" => {
+            let key = (get("device"), get("name"));
+            // BLOBs: decode straight to the frame channel; don't hold pixels
+            // in the property store.
+            for child in children.iter().filter(|c| c.tag == "oneBLOB") {
+                handle_blob(child, frame_tx, cmd_tx, shared, log_tx);
+            }
+            if let Some(prop) = store.get_mut(&key) {
+                if let Some(s) = attrs.get("state") {
+                    prop.state = PropState::parse(s);
+                }
+                for child in &children {
+                    let name = child.attrs.get("name").cloned().unwrap_or_default();
+                    if let Some(el) = prop.elements.iter_mut().find(|el| el.name == name) {
+                        update_element(el, child);
+                    }
+                }
+                push_snapshot(store, props_tx);
+            }
+        }
+        "delProperty" => {
+            let device = get("device");
+            let name = get("name");
+            if name.is_empty() {
+                store.retain(|(d, _), _| *d != device);
+            } else {
+                store.remove(&(device, name));
+            }
+            push_snapshot(store, props_tx);
+        }
+        "message" => {
+            let msg = get("message");
+            if !msg.is_empty() {
+                let device = get("device");
+                let text = if device.is_empty() { msg } else { format!("{device}: {msg}") };
+                let _ = log_tx.try_send(super::LogEntry::info(text));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_def_element(child: &RawChild) -> IndiElement {
+    let get = |k: &str| child.attrs.get(k).cloned().unwrap_or_default();
+    let name = get("name");
+    let label = {
+        let l = get("label");
+        if l.is_empty() { name.clone() } else { l }
+    };
+    let num = |k: &str| child.attrs.get(k).and_then(|v| parse_indi_number(v)).unwrap_or(0.0);
+    let value = match child.tag.as_str() {
+        "defNumber" => IndiValue::Number {
+            value: parse_indi_number(&child.text).unwrap_or(0.0),
+            min: num("min"),
+            max: num("max"),
+            step: num("step"),
+            format: get("format"),
+        },
+        "defSwitch" => IndiValue::Switch(child.text.trim() == "On"),
+        "defLight" => IndiValue::Light(PropState::parse(child.text.trim())),
+        "defBLOB" => IndiValue::Blob { format: get("format"), size: 0 },
+        _ => IndiValue::Text(child.text.clone()),
+    };
+    IndiElement { name, label, value }
+}
+
+fn update_element(el: &mut IndiElement, child: &RawChild) {
+    match &mut el.value {
+        IndiValue::Number { value, .. } => {
+            if let Some(v) = parse_indi_number(&child.text) {
+                *value = v;
+            }
+        }
+        IndiValue::Switch(on) => *on = child.text.trim() == "On",
+        IndiValue::Text(t) => *t = child.text.clone(),
+        IndiValue::Light(s) => *s = PropState::parse(child.text.trim()),
+        IndiValue::Blob { format, size } => {
+            if let Some(f) = child.attrs.get("format") {
+                *format = f.clone();
+            }
+            *size = child.attrs.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+    }
+}
+
+/// Push a snapshot of all properties to the UI (dropped if the channel is
+/// full — the next change will push a fresher one anyway).
+fn push_snapshot(
+    store: &HashMap<(String, String), IndiProperty>,
+    props_tx: &Sender<Vec<IndiProperty>>,
+) {
+    let mut snapshot: Vec<IndiProperty> = store.values().cloned().collect();
+    snapshot.sort_by(|a, b| (&a.device, &a.group, &a.name).cmp(&(&b.device, &b.group, &b.name)));
+    let _ = props_tx.try_send(snapshot);
+}
+
+// ── BLOB → FrameData ────────────────────────────────────────────────────────
+
+fn handle_blob(
+    child: &RawChild,
+    frame_tx: &Sender<super::FrameData>,
+    cmd_tx: &Sender<IndiCmd>,
+    shared: &SharedState,
+    log_tx: &Sender<super::LogEntry>,
+) {
+    let format = child.attrs.get("format").map(String::as_str).unwrap_or("");
+    if !format.contains("fits") {
+        let _ = log_tx.try_send(super::LogEntry::error(format!(
+            "INDI: unsupported BLOB format {format:?} (only FITS is handled)"
+        )));
+        return;
+    }
+    match decode_fits_blob(&child.text) {
+        Ok(frame) => {
+            let _ = frame_tx.try_send(frame);
+        }
+        Err(e) => {
+            let _ = log_tx.try_send(super::LogEntry::error(format!("INDI BLOB decode: {e}")));
+        }
+    }
+    // Live view: an INDI exposure is one-shot, so trigger the next one now.
+    if shared.live.load(Ordering::Relaxed) {
+        let device = shared.live_device.lock().unwrap().clone();
+        let seconds = *shared.exposure_s.lock().unwrap();
+        let _ = cmd_tx.try_send(IndiCmd::SetNumber {
+            device,
+            property: PROP_EXPOSURE.to_string(),
+            values: vec![(ELEM_EXPOSURE.to_string(), seconds)],
+        });
+    }
+}
+
+/// Base64 text → FITS → mono `FrameData` (first image HDU).
+fn decode_fits_blob(b64: &str) -> Result<super::FrameData> {
+    use base64::Engine;
+    // Servers wrap base64 in newlines; strip all whitespace before decoding.
+    let cleaned: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let data = base64::engine::general_purpose::STANDARD.decode(&cleaned)?;
+
+    let fits = fitskit::FitsFile::from_bytes(&data)?;
+    for hdu in fits.iter() {
+        let img = match &hdu.data {
+            fitskit::HduData::Image(im) if im.axes.len() >= 2 => im,
+            _ => continue,
+        };
+        let width = img.axes[0] as u32;
+        let height = img.axes[1] as u32;
+        let bscale = hdu.header.get_float("BSCALE").unwrap_or(1.0);
+        let bzero = hdu.header.get_float("BZERO").unwrap_or(0.0);
+        let pixels = img.scaled_values(bscale, bzero);
+        let npix = (width as usize) * (height as usize);
+        if pixels.len() < npix {
+            continue;
+        }
+        let mono: Vec<f32> = pixels[..npix].iter().map(|&v| v as f32).collect();
+        let max_val = mono.iter().copied().fold(0.0_f32, f32::max);
+        let bit_depth = if max_val <= 255.0 { 8 }
+            else if max_val <= 4095.0 { 12 }
+            else if max_val <= 16383.0 { 14 }
+            else { 16 };
+        return Ok(super::FrameData::new(mono, width, height, bit_depth));
+    }
+    bail!("no image HDU in BLOB")
+}
+
+// ── Number parsing ──────────────────────────────────────────────────────────
+
+/// Parse an INDI number: plain float or sexagesimal ("12:30:45", "12 30 45").
+fn parse_indi_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(v) = s.parse::<f64>() {
+        return Some(v);
+    }
+    let neg = s.starts_with('-');
+    let parts: Option<Vec<f64>> = s
+        .split([':', ' '])
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<f64>().ok())
+        .collect();
+    let parts = parts?;
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut val = 0.0;
+    for (i, p) in parts.iter().enumerate() {
+        val += p.abs() / 60f64.powi(i as i32);
+    }
+    Some(if neg { -val } else { val })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_indi_number;
+
+    #[test]
+    fn numbers() {
+        assert_eq!(parse_indi_number("1.5"), Some(1.5));
+        assert_eq!(parse_indi_number("-12:30"), Some(-12.5));
+        assert_eq!(parse_indi_number("12 30 36"), Some(12.51));
+        assert_eq!(parse_indi_number(""), None);
+    }
+}

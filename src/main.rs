@@ -1,6 +1,8 @@
 // Hide the console window on Windows in release builds (keep it in debug for logs).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(feature = "toupcam")]
+mod bayer;
 #[cfg(feature = "starsolve")]
 mod bright_stars;
 mod colormaps;
@@ -40,6 +42,10 @@ struct FrameData {
     width: u32,
     height: u32,
     hist: histogram::Histogram,
+    /// Per-channel R/G/B histograms of the raw CFA mosaic, present only for
+    /// color sensors streaming RAW with the pattern intact. Binned identically
+    /// to `hist` so the curves overlay directly.
+    channel_hists: Option<[histogram::Histogram; 3]>,
     mean: f32,
     stddev: f32,
     bit_depth: u8,
@@ -51,7 +57,7 @@ impl FrameData {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         let hist = compute_histogram(&mono, 256, 0.0, range_max);
         let (mean, stddev) = compute_stats(&mono);
-        FrameData { mono, width, height, hist, mean, stddev, bit_depth }
+        FrameData { mono, width, height, hist, channel_hists: None, mean, stddev, bit_depth }
     }
 }
 
@@ -184,6 +190,8 @@ struct ViewerApp {
     cursor_value: Option<f32>,
     hist_drag: Option<HistDrag>,
     hist_log_y: bool,
+    /// Overlay per-channel R/G/B histograms when the frame carries them.
+    hist_rgb: bool,
 
     // Overlay system
     overlay_items: Vec<overlays::OverlayItem>,
@@ -471,6 +479,7 @@ impl ViewerApp {
             cursor_pixel: None, cursor_value: None,
             hist_drag: None,
             hist_log_y: false,
+            hist_rgb: true,
             overlay_items: Vec::new(),
             #[cfg(feature = "starsolve")]
             show_centroids: false,
@@ -1668,10 +1677,45 @@ impl ViewerApp {
                 line_vec.push([(cx + bin_width * 0.5) as f64, y]);
             }
 
-            // Log Y toggle
+            // Per-channel R/G/B overlays (raw CFA subsampling from color
+            // sensors), same step-line shape as the main curve. G sits ~2×
+            // higher than R/B: green covers half the mosaic. Hidden while
+            // background subtraction is on — its histogram is re-ranged and
+            // the CFA curves would no longer share the axis.
+            let log_y = self.hist_log_y;
+            let step_line = |h: &histogram::Histogram| -> Vec<[f64; 2]> {
+                let centers = h.centers();
+                let bw = if centers.len() > 1 { centers[1] - centers[0] } else { 1.0 };
+                let mut pts = Vec::with_capacity(centers.len() * 2);
+                for (&cx, &cy) in centers.iter().zip(h.counts.iter()) {
+                    let y = if log_y { (cy as f64 + 1.0).log10() } else { cy as f64 };
+                    pts.push([(cx - bw * 0.5) as f64, y]);
+                    pts.push([(cx + bw * 0.5) as f64, y]);
+                }
+                pts
+            };
+            let has_rgb = frame.channel_hists.is_some() && !self.bg_subtract_enabled;
+            let rgb_lines: Vec<(&'static str, egui::Color32, Vec<[f64; 2]>)> =
+                if has_rgb && self.hist_rgb {
+                    frame.channel_hists.as_ref().map_or(Vec::new(), |chs| {
+                        vec![
+                            ("R", egui::Color32::from_rgb(235, 87, 87), step_line(&chs[0])),
+                            ("G", egui::Color32::from_rgb(76, 187, 106), step_line(&chs[1])),
+                            ("B", egui::Color32::from_rgb(96, 165, 250), step_line(&chs[2])),
+                        ]
+                    })
+                } else {
+                    Vec::new()
+                };
+
+            // Log Y / RGB overlay toggles
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 widgets::styled_checkbox(ui, &mut self.hist_log_y, "Log Y", &pal);
+                if has_rgb {
+                    ui.add_space(8.0);
+                    widgets::styled_checkbox(ui, &mut self.hist_rgb, "RGB", &pal);
+                }
             });
 
             let plot_height = ui.available_height().max(80.0);
@@ -1712,6 +1756,13 @@ impl ViewerApp {
                             .fill(0.0)
                             .fill_alpha(0.35),
                     );
+                    for (name, color, pts) in rgb_lines {
+                        plot_ui.line(
+                            egui_plot::Line::new(name, egui_plot::PlotPoints::from(pts))
+                                .color(color)
+                                .width(1.0),
+                        );
+                    }
                     if self.scale_mode == ScaleMode::Manual {
                         let smin = self.display_params.scale_min as f64;
                         let smax = self.display_params.scale_max as f64;
@@ -2000,6 +2051,25 @@ impl ViewerApp {
                             controls.roi_edit = controls.roi;
                         }
                     }
+                    ui.end_row();
+                }
+
+                // ── Software 2×2 superpixel binning (color sensors) ─────────
+                if controls.is_color {
+                    ctrl_label(ui, label_w, "Superpixel");
+                    let mut sp = controls.superpixel;
+                    if widgets::styled_checkbox(ui, &mut sp, "2×2 mono bin", &pal) {
+                        controls.superpixel = sp;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetSuperpixel(sp));
+                    }
+                    ui.label(
+                        egui::RichText::new("exact CFA average, ½ res")
+                            .size(11.0).color(pal.text_secondary),
+                    ).on_hover_text(
+                        "Averages each 2×2 Bayer cell into one mono pixel — removes the \
+                         mosaic checkerboard without interpolation. Applies to display, \
+                         statistics, and recording.",
+                    );
                     ui.end_row();
                 }
 

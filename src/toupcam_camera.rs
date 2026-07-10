@@ -46,6 +46,9 @@ pub enum ToupCmd {
     /// Hardware sensor ROI: `(x, y, width, height)`; all values must be even,
     /// minimum size 8×8. `(0, 0, 0, 0)` restores the full frame.
     SetRoi(u32, u32, u32, u32),
+    /// Software 2×2 superpixel averaging of the Bayer mosaic (color sensors;
+    /// applied in the capture thread — affects display, stats, and recording).
+    SetSuperpixel(bool),
     Correction(Correction, CorrectionAction),
     /// Move the filter wheel to a 0-based slot (shortest direction).
     SetFilterPosition(u32),
@@ -194,6 +197,10 @@ pub struct ToupControls {
     pub roi: (u32, u32, u32, u32),
     /// UI staging for the ROI editor (sent on Apply).
     pub roi_edit: (u32, u32, u32, u32),
+    /// Color sensor with a recognized Bayer pattern; gates the Superpixel row.
+    pub is_color: bool,
+    /// UI mirror of the capture thread's 2×2 superpixel-averaging state.
+    pub superpixel: bool,
     /// Model has an ST4 autoguider port; gates the Guide group.
     pub has_st4: bool,
     /// UI-side ST4 pulse duration, milliseconds.
@@ -463,12 +470,26 @@ pub fn start_camera(
     } else {
         (BitDepth::Bpp8, 8)
     };
+    // Bayer pattern of the top-left cell; hardware ROI keeps the phase intact
+    // (offsets are forced even), hardware binning does not (handled in the
+    // capture loop).
+    let cfa = if mono {
+        None
+    } else {
+        cam.raw_format()
+            .ok()
+            .and_then(|(fourcc, _)| crate::bayer::CfaPattern::from_fourcc(fourcc))
+    };
     let _ = log_tx.try_send(super::LogEntry::info(format!(
         "{}: RAW {} capture, {}-bit{}",
         info.display_name,
         if mono { "mono" } else { "color (Bayer)" },
         bit_depth,
-        if mono { "" } else { " — mosaic visible at 1:1 zoom" },
+        match cfa {
+            Some(p) => format!(", {} mosaic", p.label()),
+            None if mono => String::new(),
+            None => " — unrecognized CFA, treating as mono".into(),
+        },
     )));
 
     // Deterministic manual exposure and free-running video to start; the
@@ -550,6 +571,9 @@ pub fn start_camera(
         ));
     }
     info_rows.push(("Sensor", format!("{} × {}, {}-bit", full.0, full.1, bit_depth)));
+    if let Some(p) = cfa {
+        info_rows.push(("CFA", p.label().to_string()));
+    }
     info_rows.push(("SDK", toupcam::version()));
 
     let corrections = probe_corrections(&cam);
@@ -605,6 +629,8 @@ pub fn start_camera(
         resolution_index,
         roi,
         roi_edit: roi,
+        is_color: cfa.is_some(),
+        superpixel: false,
         has_st4: info.model.has_st4(),
         guide_ms: 500,
         has_tec,
@@ -640,6 +666,7 @@ pub fn start_camera(
         pull_bits,
         bit_depth,
         telemetry_cfg,
+        cfa,
     };
     let join_handle = std::thread::spawn(move || capture_loop(ctx));
 
@@ -664,11 +691,15 @@ struct CaptureCtx {
     pull_bits: BitDepth,
     bit_depth: u8,
     telemetry_cfg: TelemetryCfg,
+    /// Bayer pattern for color sensors (None = mono or unrecognized CFA).
+    cfa: Option<crate::bayer::CfaPattern>,
 }
 
 fn apply_cmd(cam: &Camera, cmd: ToupCmd) -> toupcam::Result<()> {
     match cmd {
-        ToupCmd::Stop | ToupCmd::SetResolution(_) => unreachable!("handled by caller"),
+        ToupCmd::Stop | ToupCmd::SetResolution(_) | ToupCmd::SetSuperpixel(_) => {
+            unreachable!("handled by caller")
+        }
         ToupCmd::SetExposure(us) => cam.set_exposure(us),
         ToupCmd::SetAutoExposure(on) => cam.set_auto_exposure(if on {
             AutoExposure::Continuous
@@ -754,9 +785,15 @@ fn capture_loop(ctx: CaptureCtx) {
         pull_bits,
         bit_depth,
         telemetry_cfg,
+        cfa,
     } = ctx;
 
     let native_max: u16 = if bit_depth >= 16 { u16::MAX } else { (1u16 << bit_depth) - 1 };
+    // Software 2×2 superpixel averaging (UI-toggled). CFA processing is also
+    // suspended while hardware binning ≠ 1×1: the SDK's binning modes are not
+    // pattern-aware, so binned color frames carry no usable mosaic.
+    let mut superpixel = false;
+    let mut hw_bin_1x1 = true;
     // Whether 16-bit samples arrive left-justified (e.g. 12-bit data in the
     // top bits). The SDK doesn't document this and it varies by model, so
     // detect it: any sample above the native range proves left-justification,
@@ -795,6 +832,17 @@ fn capture_loop(ctx: CaptureCtx) {
                     }
                 }
                 continue;
+            }
+            if let ToupCmd::SetSuperpixel(on) = cmd {
+                superpixel = on;
+                continue;
+            }
+            // Track hardware binning: CFA processing pauses while the bin
+            // factor (low nibble of the mode value) is not 1.
+            if let ToupCmd::SetOption(opt, v) = &cmd {
+                if opt.0 == sys::TOUPCAM_OPTION_BINNING {
+                    hw_bin_1x1 = (v & 0x0f) <= 1;
+                }
             }
             if let Err(e) = apply_cmd(&cam, cmd) {
                 let _ = log_tx.try_send(super::LogEntry::error(format!(
@@ -837,7 +885,17 @@ fn capture_loop(ctx: CaptureCtx) {
                         img = shift_image_right(img, shift_bits);
                     }
                 }
-                let frame_data = super::process_image(img, bit_depth);
+                // Per-channel histograms come from the raw mosaic; superpixel
+                // averaging (if on) is applied after, so display/stats/record
+                // see the binned frame.
+                let cfa_live = cfa.filter(|_| hw_bin_1x1);
+                let channel_hists = cfa_live
+                    .and_then(|p| crate::bayer::compute_cfa_histograms(&img, p, bit_depth));
+                if superpixel && cfa_live.is_some() {
+                    img = crate::bayer::superpixel_bin(img);
+                }
+                let mut frame_data = super::process_image(img, bit_depth);
+                frame_data.channel_hists = channel_hists;
                 if frame_tx.try_send(frame_data).is_err() && frame_tx.is_empty() {
                     // Receiver dropped — the UI is gone.
                     let _ = cam.stop();

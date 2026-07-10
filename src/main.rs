@@ -1201,11 +1201,19 @@ impl ViewerApp {
                 *controls = snap;
             }
         }
-        // Latest ToupTek sensor-temperature reading.
+        // Latest ToupTek telemetry (temperature, power, wheel/focuser state).
         #[cfg(feature = "toupcam")]
         if let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state {
-            while let Ok(t) = handle.temp_rx.try_recv() {
-                controls.temperature_c = Some(t);
+            while let Ok(t) = handle.telemetry_rx.try_recv() {
+                if let Some(v) = t.temperature_c { controls.temperature_c = Some(v); }
+                if let Some(v) = t.power_mw { controls.power_mw = Some(v); }
+                if let (Some(fw), Some(p)) = (controls.filter_wheel.as_mut(), t.filter_position) {
+                    fw.position = (p >= 0).then_some(p as u32);
+                }
+                if let Some(f) = controls.focuser.as_mut() {
+                    if let Some(p) = t.focuser_position { f.position = p; }
+                    if let Some(m) = t.focuser_moving { f.moving = m; }
+                }
             }
         }
         let mut latest = None;
@@ -1817,15 +1825,17 @@ impl ViewerApp {
         });
     }
 
-    /// Render the curated ToupTek controls: exposure (+auto) and gain always,
-    /// plus a Cooling group only on TEC-equipped models. The toupcam SDK has
-    /// no runtime control discovery, so anything shown here is hand-picked;
-    /// options not listed stay at their SDK defaults. Additional curated
-    /// options can be added as rows sending `ToupCmd::SetOption`.
+    /// Render the curated ToupTek controls: exposure (+auto/target), gain, and
+    /// speed always; Cooling, Corrections, Filter Wheel, and Focuser groups
+    /// only when the model has the hardware; and a collapsed Advanced section
+    /// for the capability-gated option table. The toupcam SDK has no runtime
+    /// control discovery, so anything shown here is hand-picked; options not
+    /// listed stay at their SDK defaults.
     #[cfg(feature = "toupcam")]
     fn toupcam_controls_content(&mut self, ui: &mut egui::Ui) {
-        use toupcam_camera::ToupCmd;
+        use toupcam_camera::{CorrectionAction, ToupCmd};
         let pal = self.pal();
+        let log_tx = self.log_tx.clone();
         let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state else { return };
 
         let label_w = 120.0_f32;
@@ -1886,6 +1896,22 @@ impl ViewerApp {
                 }
                 ui.end_row();
 
+                // ── Auto-exposure target brightness (only meaningful in auto)
+                if controls.auto_exposure {
+                    ctrl_label(ui, label_w, "AE Target");
+                    let old = controls.auto_expo_target;
+                    let mut t = controls.auto_expo_target as f32;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut t, 16.0..=220.0, &pal);
+                    });
+                    controls.auto_expo_target = t.round() as u16;
+                    ui.label(egui::RichText::new(controls.auto_expo_target.to_string()).monospace().size(12.0));
+                    if controls.auto_expo_target != old {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetAutoExpoTarget(controls.auto_expo_target));
+                    }
+                    ui.end_row();
+                }
+
                 // ── Gain (percent, 100 = 1×) ────────────────────────────────
                 ctrl_label(ui, label_w, "Gain");
                 let old_gain = controls.gain;
@@ -1904,6 +1930,22 @@ impl ViewerApp {
                 }
                 ui.end_row();
 
+                // ── Frame-speed level (USB/link bandwidth tier) ─────────────
+                if controls.max_speed > 0 {
+                    ctrl_label(ui, label_w, "Speed Level");
+                    let old = controls.speed;
+                    let mut s = controls.speed as f32;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut s, 0.0..=controls.max_speed as f32, &pal);
+                    });
+                    controls.speed = s.round() as u16;
+                    ui.label(egui::RichText::new(format!("{} / {}", controls.speed, controls.max_speed)).monospace().size(12.0));
+                    if controls.speed != old {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetSpeed(controls.speed));
+                    }
+                    ui.end_row();
+                }
+
                 // ── Cooling (TEC-equipped models only) ──────────────────────
                 if controls.has_tec {
                     ctrl_label(ui, label_w, "Cooler");
@@ -1917,8 +1959,9 @@ impl ViewerApp {
                     ctrl_label(ui, label_w, "Target Temp");
                     let old_target = controls.tec_target_c;
                     let mut t = controls.tec_target_c;
+                    let (tec_lo, tec_hi) = controls.tec_range;
                     ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                        widgets::styled_slider_bare(ui, &mut t, -50.0..=30.0, &pal);
+                        widgets::styled_slider_bare(ui, &mut t, tec_lo..=tec_hi, &pal);
                     });
                     ui.label(egui::RichText::new(format!("{:.1} °C", t)).monospace().size(12.0));
                     if (t - old_target).abs() >= 0.05 {
@@ -1931,7 +1974,7 @@ impl ViewerApp {
                     ui.end_row();
                 }
 
-                // ── Sensor temperature (read-only telemetry) ────────────────
+                // ── Read-only telemetry ─────────────────────────────────────
                 if let Some(temp) = controls.temperature_c {
                     ctrl_label(ui, label_w, "Sensor Temp");
                     ui.label(
@@ -1940,7 +1983,189 @@ impl ViewerApp {
                     );
                     ui.end_row();
                 }
+                if let Some(mw) = controls.power_mw {
+                    ctrl_label(ui, label_w, "Power Draw");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} W", mw as f32 / 1000.0))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
             });
+
+        // ── Advanced: curated, capability-gated SDK options ─────────────────
+        if !controls.advanced.is_empty() {
+            use toupcam_camera::AdvKind;
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Advanced").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_advanced")
+                    .num_columns(3)
+                    .spacing([4.0, 8.0])
+                    .show(ui, |ui| {
+                        for c in controls.advanced.iter_mut() {
+                            ctrl_label(ui, label_w, c.label);
+                            let old = c.value;
+                            match c.kind {
+                                AdvKind::Bool => {
+                                    let mut on = c.value != 0;
+                                    if widgets::styled_checkbox(ui, &mut on, "", &pal) {
+                                        c.value = on as i32;
+                                    }
+                                }
+                                AdvKind::Int { min, max } => {
+                                    let mut v = c.value as f32;
+                                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                                        widgets::styled_slider_bare(ui, &mut v, min as f32..=max as f32, &pal);
+                                    });
+                                    c.value = v.round() as i32;
+                                    ui.label(egui::RichText::new(c.value.to_string()).monospace().size(12.0));
+                                }
+                                AdvKind::Enum(variants) => {
+                                    widgets::combo_box(ui, c.label, "", &mut c.value, variants, &pal);
+                                }
+                            }
+                            if c.value != old {
+                                let _ = handle.cmd_tx.send(ToupCmd::SetOption(c.opt, c.value));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+
+        // ── Corrections: on-camera flat/dark/fixed-pattern pipelines ────────
+        if !controls.corrections.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Corrections").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_corrections")
+                    .num_columns(5)
+                    .spacing([6.0, 8.0])
+                    .show(ui, |ui| {
+                        for c in controls.corrections.iter_mut() {
+                            let kind = c.kind;
+                            ctrl_label(ui, label_w, kind.label());
+                            let mut on = c.enabled;
+                            if widgets::styled_checkbox(ui, &mut on, "Apply", &pal) {
+                                c.enabled = on;
+                                let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                    kind, CorrectionAction::Enable(on),
+                                ));
+                            }
+                            if ui.button("Capture").on_hover_text(kind.capture_hint()).clicked() {
+                                let _ = log_tx.try_send(LogEntry::info(format!(
+                                    "{}: {}", kind.label(), kind.capture_hint(),
+                                )));
+                                let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                    kind, CorrectionAction::Capture,
+                                ));
+                                c.enabled = true; // a successful capture auto-applies
+                            }
+                            if ui.button("Import…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                        kind,
+                                        CorrectionAction::Import(path.to_string_lossy().into_owned()),
+                                    ));
+                                    c.enabled = true;
+                                }
+                            }
+                            if ui.button("Export…").clicked() {
+                                let default = format!(
+                                    "{}.dat",
+                                    kind.label().to_lowercase().replace(' ', "_")
+                                );
+                                if let Some(path) = rfd::FileDialog::new().set_file_name(default).save_file() {
+                                    let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                        kind,
+                                        CorrectionAction::Export(path.to_string_lossy().into_owned()),
+                                    ));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+
+        // ── Filter wheel (models with an integrated/connected wheel) ────────
+        if let Some(fw) = controls.filter_wheel.as_mut() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Filter Wheel").strong().color(pal.accent),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_wheel").num_columns(3).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Position");
+                    match fw.position {
+                        Some(pos) => {
+                            let labels: Vec<String> =
+                                (0..fw.slots).map(|i| format!("Slot {}", i + 1)).collect();
+                            let opts: Vec<(u32, &str)> = labels
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| (i as u32, s.as_str()))
+                                .collect();
+                            let mut sel = pos.min(fw.slots.saturating_sub(1));
+                            if widgets::combo_box(ui, "toup_wheel_pos", "", &mut sel, &opts, &pal) {
+                                let _ = handle.cmd_tx.send(ToupCmd::SetFilterPosition(sel));
+                                fw.position = None; // shows "moving" until telemetry updates
+                            }
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("moving…")
+                                    .color(pal.text_secondary).italics(),
+                            );
+                        }
+                    }
+                    if ui.button("Home").on_hover_text("Reset / re-home the wheel").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::ResetFilterWheel);
+                        fw.position = None;
+                    }
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── Astro auto-focuser ───────────────────────────────────────────────
+        if let Some(f) = controls.focuser.as_mut() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Focuser").strong().color(pal.accent),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_focuser").num_columns(4).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Position");
+                    let pos_text = if f.moving {
+                        format!("{} (moving)", f.position)
+                    } else {
+                        f.position.to_string()
+                    };
+                    ui.label(egui::RichText::new(pos_text).monospace().size(12.0));
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Target");
+                    ui.add(egui::DragValue::new(&mut f.target).range(0..=f.max_step).speed(10));
+                    if ui.button("Move").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetFocuserPosition(f.target));
+                    }
+                    if ui.button("Halt").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::FocuserHalt);
+                    }
+                    ui.end_row();
+                });
+            });
+        }
     }
 
     /// Render the GigE camera's GenICam-derived controls, grouped by the

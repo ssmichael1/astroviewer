@@ -155,6 +155,8 @@ enum RecordMsg {
         cfa: Option<&'static str>,
         /// Camera gain setting, in the camera's native units.
         gain: Option<f64>,
+        /// Black level / bias offset setting, ADU.
+        offset: Option<f64>,
         /// Sensor temperature, °C.
         ccd_temp: Option<f64>,
         /// Cooler setpoint, °C (only when the cooler is on).
@@ -936,7 +938,7 @@ impl ViewerApp {
 
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, ccd_temp, set_temp } => {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp } => {
                         // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
                         let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
                             let clamped = v.clamp(0.0, 65535.0) as u16;
@@ -962,6 +964,9 @@ impl ViewerApp {
                         }
                         if let Some(g) = gain {
                             hdu.header.set("GAIN", HeaderValue::Float(g), Some("camera gain setting"));
+                        }
+                        if let Some(o) = offset {
+                            hdu.header.set("OFFSET", HeaderValue::Float(o), Some("black level / bias offset (ADU)"));
                         }
                         if let Some(t) = ccd_temp {
                             hdu.header.set("CCD-TEMP", HeaderValue::Float(t), Some("sensor temperature (C)"));
@@ -1019,6 +1024,8 @@ impl ViewerApp {
             let mut exposure_us: f64 = 0.0;
             #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
             let mut gain: Option<f64> = None;
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
+            let mut offset: Option<f64> = None;
             #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
             let mut ccd_temp: Option<f64> = None;
             #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
@@ -1032,6 +1039,9 @@ impl ViewerApp {
                 gain = control_values.iter()
                     .find(|(ct, _, _)| *ct == svbony::ControlType::Gain)
                     .map(|(_, v, _)| *v as f64);
+                offset = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::BlackLevel)
+                    .map(|(_, v, _)| *v as f64);
             }
             #[cfg(feature = "gev")]
             if let CaptureState::Gev { ref controls, .. } = self.capture_state {
@@ -1041,11 +1051,16 @@ impl ViewerApp {
                     .map(|c| c.fvalue)
                     .unwrap_or(0.0);
                 gain = controls.iter().find(|c| c.name == "Gain").map(|c| c.fvalue);
+                offset = controls.iter().find(|c| c.name == "BlackLevel").map(|c| c.fvalue);
             }
             #[cfg(feature = "toupcam")]
             if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
                 exposure_us = controls.exposure_us as f64;
                 gain = Some(controls.gain as f64);
+                // The pedestal lives in the probe-gated Advanced table.
+                offset = controls.advanced.iter()
+                    .find(|c| c.opt.0 == toupcam::sys::TOUPCAM_OPTION_BLACKLEVEL)
+                    .map(|c| c.value as f64);
                 ccd_temp = controls.temperature_c.map(|t| t as f64);
                 set_temp = controls.tec_on.then_some(controls.tec_target_c as f64);
             }
@@ -1062,6 +1077,7 @@ impl ViewerApp {
                 exptime_s,
                 cfa: frame.cfa,
                 gain,
+                offset,
                 ccd_temp,
                 set_temp,
             };

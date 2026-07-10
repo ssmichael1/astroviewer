@@ -4116,6 +4116,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
+name = "toupcam"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "thiserror 2.0.18",
+ "toupcam-sys",
+]
+
+[[package]]
+name = "toupcam-sys"
+version = "0.1.0"
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4332,6 +4345,7 @@ dependencies = [
  "svbony",
  "tetra3",
  "tokio",
+ "toupcam",
  "tracing",
  "tracing-subscriber",
  "viva-gige",

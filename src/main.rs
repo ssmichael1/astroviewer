@@ -16,10 +16,13 @@ mod camera;
 #[cfg(feature = "gev")]
 mod gev_camera;
 
+#[cfg(feature = "toupcam")]
+mod toupcam_camera;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 use image::DynamicImage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -75,6 +78,9 @@ enum CameraSource {
     SVBony(i32),
     #[cfg(feature = "gev")]
     Gev(String),
+    /// ToupTek camera, identified by its opaque enumeration id.
+    #[cfg(feature = "toupcam")]
+    Toupcam(String),
 }
 
 enum CaptureState {
@@ -88,6 +94,13 @@ enum CaptureState {
     Gev {
         handle: gev_camera::GevHandle,
         controls: Vec<gev_camera::GevControl>,
+    },
+    #[cfg(feature = "toupcam")]
+    Toupcam {
+        // Boxed: the handle (device info, full model description) is much
+        // larger than the other variants.
+        handle: Box<toupcam_camera::ToupHandle>,
+        controls: toupcam_camera::ToupControls,
     },
     Stopped,
 }
@@ -254,7 +267,9 @@ struct ViewerApp {
     /// Substring filter for the GigE controls panel.
     #[cfg(feature = "gev")]
     gev_filter: String,
-    #[cfg(any(feature = "svbony", feature = "gev"))]
+    #[cfg(feature = "toupcam")]
+    discovered_toupcam: Vec<toupcam::DeviceInfo>,
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
     camera_error: Option<String>,
 }
 
@@ -376,7 +391,7 @@ impl ViewerApp {
         let (frame_tx, frame_rx) = bounded(2);
         let (log_tx, log_rx) = bounded(64);
 
-        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
+        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
         let mut log = vec![LogEntry::info("Viewer started".to_string())];
 
         // Try to start with an SVBony camera if available
@@ -386,46 +401,58 @@ impl ViewerApp {
         #[cfg(feature = "gev")]
         let discovered_gev = gev_camera::enumerate();
 
-        #[cfg(any(feature = "svbony", feature = "gev"))]
-        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
+        #[cfg(feature = "toupcam")]
+        let discovered_toupcam = toupcam_camera::enumerate();
+
+        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
         let mut camera_error: Option<String> = None;
 
-        let (camera_source, capture_state, capture_running);
+        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
+        let mut camera_source = CameraSource::None;
+        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
+        let mut capture_state = CaptureState::Stopped;
+        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
+        let mut capture_running = false;
 
         #[cfg(feature = "svbony")]
-        {
-            if let Some(info) = discovered_cameras.first() {
-                match camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
-                    Ok(handle) => {
-                        let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
-                            .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
-                            .collect();
-                        log.push(LogEntry::info(format!("Camera opened: {}", info.name)));
-                        camera_source = CameraSource::SVBony(info.camera_id);
-                        capture_state = CaptureState::SVBony { handle, control_values };
+        if let Some(info) = discovered_cameras.first() {
+            match camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
+                Ok(handle) => {
+                    let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
+                        .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
+                        .collect();
+                    log.push(LogEntry::info(format!("Camera opened: {}", info.name)));
+                    camera_source = CameraSource::SVBony(info.camera_id);
+                    capture_state = CaptureState::SVBony { handle, control_values };
+                    capture_running = true;
+                }
+                Err(e) => {
+                    let msg = format!("Failed to open camera: {}", e);
+                    log.push(LogEntry::error(msg.clone()));
+                    camera_error = Some(msg);
+                }
+            }
+        }
+
+        // Fall back to the first ToupTek camera if nothing is streaming yet.
+        #[cfg(feature = "toupcam")]
+        if !capture_running {
+            if let Some(info) = discovered_toupcam.first() {
+                match toupcam_camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
+                    Ok((handle, controls)) => {
+                        log.push(LogEntry::info(format!("Camera opened: {}", info.display_name)));
+                        camera_source = CameraSource::Toupcam(info.id.clone());
+                        capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls };
                         capture_running = true;
                     }
                     Err(e) => {
                         let msg = format!("Failed to open camera: {}", e);
                         log.push(LogEntry::error(msg.clone()));
                         camera_error = Some(msg);
-                        camera_source = CameraSource::None;
-                        capture_state = CaptureState::Stopped;
-                        capture_running = false;
                     }
                 }
-            } else {
-                camera_source = CameraSource::None;
-                capture_state = CaptureState::Stopped;
-                capture_running = false;
             }
-        }
-
-        #[cfg(not(feature = "svbony"))]
-        {
-            camera_source = CameraSource::None;
-            capture_state = CaptureState::Stopped;
-            capture_running = false;
         }
 
         let ui_theme = widgets::UiTheme::Dark;
@@ -504,7 +531,9 @@ impl ViewerApp {
             gev_manual_ip: String::new(),
             #[cfg(feature = "gev")]
             gev_filter: String::new(),
-            #[cfg(any(feature = "svbony", feature = "gev"))]
+            #[cfg(feature = "toupcam")]
+            discovered_toupcam,
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
             camera_error,
         };
 
@@ -757,6 +786,13 @@ impl ViewerApp {
                 .find(|c| c.id == *id)
                 .map(|c| c.display_name())
                 .unwrap_or_else(|| format!("GigE {}", id)),
+            #[cfg(feature = "toupcam")]
+            CameraSource::Toupcam(id) => self
+                .discovered_toupcam
+                .iter()
+                .find(|d| d.id == *id)
+                .map(|d| d.display_name.clone())
+                .unwrap_or_else(|| "ToupTek camera".to_string()),
         }
     }
 
@@ -925,7 +961,7 @@ impl ViewerApp {
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
             // Estimate exposure time from camera controls (microseconds)
-            #[cfg_attr(not(any(feature = "svbony", feature = "gev")), allow(unused_mut))]
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
             let mut exposure_us: f64 = 0.0;
             #[cfg(feature = "svbony")]
             if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
@@ -941,6 +977,10 @@ impl ViewerApp {
                     .find(|c| c.name == "ExposureTime")
                     .map(|c| c.fvalue)
                     .unwrap_or(0.0);
+            }
+            #[cfg(feature = "toupcam")]
+            if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
+                exposure_us = controls.exposure_us as f64;
             }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
@@ -980,6 +1020,14 @@ impl ViewerApp {
             #[cfg(feature = "gev")]
             CaptureState::Gev { mut handle, .. } => {
                 handle.stop();
+            }
+            #[cfg(feature = "toupcam")]
+            CaptureState::Toupcam { mut handle, .. } => {
+                let _ = handle.cmd_tx.send(toupcam_camera::ToupCmd::Stop);
+                // Wait for the capture thread so the SDK closes cleanly before drop.
+                if let Some(jh) = handle.join_handle.take() {
+                    let _ = jh.join();
+                }
             }
             CaptureState::Stopped => {}
         }
@@ -1102,6 +1150,27 @@ impl ViewerApp {
         }
     }
 
+    #[cfg(feature = "toupcam")]
+    fn start_toupcam(&mut self, info: &toupcam::DeviceInfo) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        match toupcam_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok((handle, controls)) => {
+                self.add_log(LogEntry::info(format!("Camera opened: {}", info.display_name)));
+                let id = info.id.clone();
+                self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls };
+                self.camera_source = CameraSource::Toupcam(id);
+                self.capture_running = true;
+            }
+            Err(e) => {
+                let msg = format!("Failed to open camera: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
     #[cfg(feature = "gev")]
     fn start_gev(&mut self, info: &gev_camera::GevDeviceInfo) {
         self.stop_capture();
@@ -1130,6 +1199,13 @@ impl ViewerApp {
         if let CaptureState::Gev { ref handle, ref mut controls } = self.capture_state {
             while let Ok(snap) = handle.controls_rx.try_recv() {
                 *controls = snap;
+            }
+        }
+        // Latest ToupTek sensor-temperature reading.
+        #[cfg(feature = "toupcam")]
+        if let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state {
+            while let Ok(t) = handle.temp_rx.try_recv() {
+                controls.temperature_c = Some(t);
             }
         }
         let mut latest = None;
@@ -1308,7 +1384,7 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(any(feature = "svbony", feature = "gev"))]
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
@@ -1327,6 +1403,8 @@ impl ViewerApp {
                 CameraSource::SVBony(_) => {}
                 #[cfg(feature = "gev")]
                 CameraSource::Gev(_) => {}
+                #[cfg(feature = "toupcam")]
+                CameraSource::Toupcam(_) => {}
             }
 
             // GigE: connect directly by IP (needed when a camera is reachable by
@@ -1689,11 +1767,16 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(feature = "svbony", feature = "gev"))]
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
         #[cfg(feature = "gev")]
         if matches!(self.capture_state, CaptureState::Gev { .. }) {
             self.gev_controls_content(ui);
+            return;
+        }
+        #[cfg(feature = "toupcam")]
+        if matches!(self.capture_state, CaptureState::Toupcam { .. }) {
+            self.toupcam_controls_content(ui);
             return;
         }
         #[cfg(feature = "svbony")]
@@ -1732,6 +1815,132 @@ impl ViewerApp {
             ui.add_space(20.0);
             ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
         });
+    }
+
+    /// Render the curated ToupTek controls: exposure (+auto) and gain always,
+    /// plus a Cooling group only on TEC-equipped models. The toupcam SDK has
+    /// no runtime control discovery, so anything shown here is hand-picked;
+    /// options not listed stay at their SDK defaults. Additional curated
+    /// options can be added as rows sending `ToupCmd::SetOption`.
+    #[cfg(feature = "toupcam")]
+    fn toupcam_controls_content(&mut self, ui: &mut egui::Ui) {
+        use toupcam_camera::ToupCmd;
+        let pal = self.pal();
+        let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state else { return };
+
+        let label_w = 120.0_f32;
+        let value_w = 80.0_f32;
+        let slider_w = (ui.available_width() * 0.5 - label_w - value_w - 90.0).max(60.0);
+
+        ui.add_space(6.0);
+        egui::Grid::new("toup_controls")
+            .num_columns(4)
+            .spacing([4.0, 8.0])
+            .show(ui, |ui| {
+                // ── Exposure: log slider + unit-aware entry + Auto ──────────
+                ctrl_label(ui, label_w, "Exposure");
+                let old_exp = controls.exposure_us;
+                // Slider capped at 10 s so the log scale stays usable; the
+                // entry field still accepts the full range.
+                let slider_max = (controls.exposure_max as f32).min(10_000_000.0);
+                let mut v = controls.exposure_us as f32;
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_log_bare(
+                        ui, &mut v,
+                        (controls.exposure_min as f32).max(1.0)..=slider_max,
+                        &pal,
+                    );
+                });
+                let mut v_us = v.round() as f64;
+                let speed = (v_us * 0.005).max(1.0);
+                let dv = egui::DragValue::new(&mut v_us)
+                    .range(controls.exposure_min as f64..=controls.exposure_max as f64)
+                    .speed(speed)
+                    .custom_formatter(|v, _| {
+                        if v >= 1_000_000.0 { format!("{:.2} s", v / 1_000_000.0) }
+                        else if v >= 1_000.0 { format!("{:.1} ms", v / 1_000.0) }
+                        else { format!("{:.0} µs", v) }
+                    })
+                    .custom_parser(|s| {
+                        let s = s.trim();
+                        if let Some(n) = s.strip_suffix("ms").and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n * 1_000.0)
+                        } else if let Some(n) = s.strip_suffix("µs").or_else(|| s.strip_suffix("us")).and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n)
+                        } else if let Some(n) = s.strip_suffix('s').and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n * 1_000_000.0)
+                        } else {
+                            s.parse::<f64>().ok()
+                        }
+                    });
+                ui.add_sized([value_w, 20.0], dv);
+                controls.exposure_us = (v_us.round() as u32)
+                    .clamp(controls.exposure_min, controls.exposure_max);
+                if controls.exposure_us != old_exp {
+                    let _ = handle.cmd_tx.send(ToupCmd::SetExposure(controls.exposure_us));
+                }
+                let mut auto = controls.auto_exposure;
+                if widgets::styled_checkbox(ui, &mut auto, "Auto", &pal) {
+                    controls.auto_exposure = auto;
+                    let _ = handle.cmd_tx.send(ToupCmd::SetAutoExposure(auto));
+                }
+                ui.end_row();
+
+                // ── Gain (percent, 100 = 1×) ────────────────────────────────
+                ctrl_label(ui, label_w, "Gain");
+                let old_gain = controls.gain;
+                let mut g = controls.gain as f32;
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(
+                        ui, &mut g,
+                        controls.gain_min as f32..=(controls.gain_max.max(controls.gain_min + 1)) as f32,
+                        &pal,
+                    );
+                });
+                controls.gain = g.round() as u16;
+                ui.label(egui::RichText::new(format!("{} %", controls.gain)).monospace().size(12.0));
+                if controls.gain != old_gain {
+                    let _ = handle.cmd_tx.send(ToupCmd::SetGain(controls.gain));
+                }
+                ui.end_row();
+
+                // ── Cooling (TEC-equipped models only) ──────────────────────
+                if controls.has_tec {
+                    ctrl_label(ui, label_w, "Cooler");
+                    let mut on = controls.tec_on;
+                    if widgets::styled_checkbox(ui, &mut on, "TEC on", &pal) {
+                        controls.tec_on = on;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetOption(toupcam::Opt::TEC, on as i32));
+                    }
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Target Temp");
+                    let old_target = controls.tec_target_c;
+                    let mut t = controls.tec_target_c;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut t, -50.0..=30.0, &pal);
+                    });
+                    ui.label(egui::RichText::new(format!("{:.1} °C", t)).monospace().size(12.0));
+                    if (t - old_target).abs() >= 0.05 {
+                        controls.tec_target_c = t;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetOption(
+                            toupcam::Opt::TEC_TARGET,
+                            (t * 10.0).round() as i32,
+                        ));
+                    }
+                    ui.end_row();
+                }
+
+                // ── Sensor temperature (read-only telemetry) ────────────────
+                if let Some(temp) = controls.temperature_c {
+                    ctrl_label(ui, label_w, "Sensor Temp");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} °C", temp))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+            });
     }
 
     /// Render the GigE camera's GenICam-derived controls, grouped by the
@@ -2473,7 +2682,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
         });
 }
 
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
     ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
         ui.set_max_width(width);
@@ -2671,6 +2880,13 @@ impl eframe::App for ViewerApp {
                                             self.start_gev(&info);
                                         }
                                     }
+                                    #[cfg(feature = "toupcam")]
+                                    CameraSource::Toupcam(id) => {
+                                        let id = id.clone();
+                                        if let Some(info) = self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
+                                            self.start_toupcam(&info);
+                                        }
+                                    }
                                 }
                                 ui.close();
                             }
@@ -2704,6 +2920,20 @@ impl eframe::App for ViewerApp {
                                 let label = format!("{} ({})", gev_info.display_name(), gev_info.ip);
                                 if menu_radio(ui, is_this, &label) && !is_this {
                                     self.start_gev(gev_info);
+                                    ui.close();
+                                }
+                            }
+                        }
+                        #[cfg(feature = "toupcam")]
+                        {
+                            ui.separator();
+                            if ui.button("Refresh ToupTek Cameras").clicked() {
+                                self.discovered_toupcam = toupcam_camera::enumerate();
+                            }
+                            for dev in &self.discovered_toupcam.clone() {
+                                let is_this = matches!(&self.camera_source, CameraSource::Toupcam(id) if *id == dev.id);
+                                if menu_radio(ui, is_this, &dev.display_name) && !is_this {
+                                    self.start_toupcam(dev);
                                     ui.close();
                                 }
                             }
@@ -2766,6 +2996,13 @@ impl eframe::App for ViewerApp {
                                 let id = id.clone();
                                 if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
                                     self.start_gev(&info);
+                                }
+                            }
+                            #[cfg(feature = "toupcam")]
+                            CameraSource::Toupcam(id) => {
+                                let id = id.clone();
+                                if let Some(info) = self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
+                                    self.start_toupcam(&info);
                                 }
                             }
                         }
@@ -2900,13 +3137,13 @@ impl eframe::App for ViewerApp {
                         match self.bottom_tab {
                             BottomTab::Histogram => self.histogram_content(ui),
                             BottomTab::Controls => {
-                                #[cfg(any(feature = "svbony", feature = "gev"))]
+                                #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
                                 {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
                                         self.controls_content(ui);
                                     });
                                 }
-                                #[cfg(not(any(feature = "svbony", feature = "gev")))]
+                                #[cfg(not(any(feature = "svbony", feature = "gev", feature = "toupcam")))]
                                 ui.label("Camera support not compiled in");
                             }
                             #[cfg(feature = "starsolve")]
@@ -3187,7 +3424,7 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
     });
 }
 
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
     let width = img.width();
     let height = img.height();

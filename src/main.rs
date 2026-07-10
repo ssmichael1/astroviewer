@@ -97,10 +97,10 @@ enum CaptureState {
     },
     #[cfg(feature = "toupcam")]
     Toupcam {
-        // Boxed: the handle (device info, full model description) is much
-        // larger than the other variants.
+        // Boxed: the handle (device info, full model description) and the
+        // control mirror are much larger than the other variants.
         handle: Box<toupcam_camera::ToupHandle>,
-        controls: toupcam_camera::ToupControls,
+        controls: Box<toupcam_camera::ToupControls>,
     },
     Stopped,
 }
@@ -443,7 +443,7 @@ impl ViewerApp {
                     Ok((handle, controls)) => {
                         log.push(LogEntry::info(format!("Camera opened: {}", info.display_name)));
                         camera_source = CameraSource::Toupcam(info.id.clone());
-                        capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls };
+                        capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
                         capture_running = true;
                     }
                     Err(e) => {
@@ -1159,7 +1159,7 @@ impl ViewerApp {
             Ok((handle, controls)) => {
                 self.add_log(LogEntry::info(format!("Camera opened: {}", info.display_name)));
                 let id = info.id.clone();
-                self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls };
+                self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
                 self.camera_source = CameraSource::Toupcam(id);
                 self.capture_running = true;
             }
@@ -1207,6 +1207,16 @@ impl ViewerApp {
             while let Ok(t) = handle.telemetry_rx.try_recv() {
                 if let Some(v) = t.temperature_c { controls.temperature_c = Some(v); }
                 if let Some(v) = t.power_mw { controls.power_mw = Some(v); }
+                if let Some(v) = t.tec_voltage { controls.tec_voltage = Some(v); }
+                if let Some(v) = t.chamber_ht { controls.chamber_ht = Some(v); }
+                if let Some(v) = t.env_ht { controls.env_ht = Some(v); }
+                // Track the camera-chosen exposure while auto-exposure runs.
+                if controls.auto_exposure {
+                    if let Some(us) = t.real_exposure_us {
+                        controls.exposure_us = us.clamp(controls.exposure_min, controls.exposure_max);
+                    }
+                }
+                if let Some(roi) = t.roi { controls.roi = roi; }
                 if let (Some(fw), Some(p)) = (controls.filter_wheel.as_mut(), t.filter_position) {
                     fw.position = (p >= 0).then_some(p as u32);
                 }
@@ -1946,6 +1956,53 @@ impl ViewerApp {
                     ui.end_row();
                 }
 
+                // ── Capture mode: free-running video vs software trigger ────
+                if controls.has_soft_trigger {
+                    ctrl_label(ui, label_w, "Capture Mode");
+                    let mut mode = controls.trigger_mode as i32;
+                    if widgets::combo_box(
+                        ui, "toup_trig_mode", "", &mut mode,
+                        &[(0, "Video"), (1, "Triggered")], &pal,
+                    ) {
+                        controls.trigger_mode = mode != 0;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetTriggerMode(controls.trigger_mode));
+                    }
+                    if controls.trigger_mode
+                        && ui.button("Snap")
+                            .on_hover_text("Fire one software-triggered exposure")
+                            .clicked()
+                    {
+                        let _ = handle.cmd_tx.send(ToupCmd::Snap);
+                    }
+                    ui.end_row();
+                }
+
+                // ── Sensor readout resolution (restarts the stream) ─────────
+                if controls.resolutions.len() > 1 {
+                    ctrl_label(ui, label_w, "Resolution");
+                    let labels: Vec<String> = controls
+                        .resolutions
+                        .iter()
+                        .map(|(w, h)| format!("{} × {}", w, h))
+                        .collect();
+                    let opts: Vec<(u32, &str)> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i as u32, s.as_str()))
+                        .collect();
+                    let mut sel = controls.resolution_index;
+                    if widgets::combo_box(ui, "toup_resolution", "", &mut sel, &opts, &pal) {
+                        controls.resolution_index = sel;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetResolution(sel));
+                        // ROI resets to the new full frame; telemetry corrects.
+                        if let Some(&(w, h)) = controls.resolutions.get(sel as usize) {
+                            controls.roi = (0, 0, w, h);
+                            controls.roi_edit = controls.roi;
+                        }
+                    }
+                    ui.end_row();
+                }
+
                 // ── Cooling (TEC-equipped models only) ──────────────────────
                 if controls.has_tec {
                     ctrl_label(ui, label_w, "Cooler");
@@ -1987,6 +2044,34 @@ impl ViewerApp {
                     ctrl_label(ui, label_w, "Power Draw");
                     ui.label(
                         egui::RichText::new(format!("{:.1} W", mw as f32 / 1000.0))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some(v) = controls.tec_voltage {
+                    ctrl_label(ui, label_w, "TEC Drive");
+                    let text = match controls.tec_voltage_max {
+                        Some(max) => format!("{:.1} V / {:.1} V max", v, max),
+                        None => format!("{:.1} V", v),
+                    };
+                    ui.label(
+                        egui::RichText::new(text)
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some((rh, t)) = controls.chamber_ht {
+                    ctrl_label(ui, label_w, "Chamber");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} %RH  {:.1} °C", rh, t))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some((rh, t)) = controls.env_ht {
+                    ctrl_label(ui, label_w, "Ambient");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} %RH  {:.1} °C", rh, t))
                             .monospace().size(12.0).color(pal.text_secondary),
                     );
                     ui.end_row();
@@ -2034,6 +2119,55 @@ impl ViewerApp {
                             ui.end_row();
                         }
                     });
+            });
+        }
+
+        // ── Hardware sensor ROI (reduces readout region on-camera) ──────────
+        {
+            let (full_w, full_h) = controls
+                .resolutions
+                .get(controls.resolution_index as usize)
+                .copied()
+                .unwrap_or((controls.roi.2, controls.roi.3));
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Sensor ROI").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_roi").num_columns(5).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Active");
+                    let (x, y, w, h) = controls.roi;
+                    ui.label(
+                        egui::RichText::new(format!("{} × {} @ ({}, {})", w, h, x, y))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+
+                    let e = &mut controls.roi_edit;
+                    ctrl_label(ui, label_w, "Offset");
+                    ui.add(egui::DragValue::new(&mut e.0).range(0..=full_w.saturating_sub(8)).speed(2).prefix("x "));
+                    ui.add(egui::DragValue::new(&mut e.1).range(0..=full_h.saturating_sub(8)).speed(2).prefix("y "));
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Size");
+                    ui.add(egui::DragValue::new(&mut e.2).range(8..=full_w).speed(2).prefix("w "));
+                    ui.add(egui::DragValue::new(&mut e.3).range(8..=full_h).speed(2).prefix("h "));
+                    if ui.button("Apply").on_hover_text("Set the sensor readout region (values rounded to even)").clicked() {
+                        // SDK constraints: offsets/sizes even, minimum 8×8,
+                        // region inside the frame.
+                        e.0 = (e.0 & !1).min(full_w.saturating_sub(8));
+                        e.1 = (e.1 & !1).min(full_h.saturating_sub(8));
+                        e.2 = (e.2 & !1).clamp(8, full_w - e.0);
+                        e.3 = (e.3 & !1).clamp(8, full_h - e.1);
+                        let _ = handle.cmd_tx.send(ToupCmd::SetRoi(e.0, e.1, e.2, e.3));
+                    }
+                    if ui.button("Full Frame").clicked() {
+                        *e = (0, 0, full_w, full_h);
+                        let _ = handle.cmd_tx.send(ToupCmd::SetRoi(0, 0, 0, 0));
+                    }
+                    ui.end_row();
+                });
             });
         }
 
@@ -2163,6 +2297,67 @@ impl ViewerApp {
                         let _ = handle.cmd_tx.send(ToupCmd::FocuserHalt);
                     }
                     ui.end_row();
+                });
+            });
+        }
+
+        // ── ST4 autoguider port: manual pulse for cable/mount testing ───────
+        if controls.has_st4 {
+            use toupcam::GuideDirection;
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Guide (ST4)").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_st4").num_columns(2).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Pulse Length");
+                    ui.add(
+                        egui::DragValue::new(&mut controls.guide_ms)
+                            .range(10..=10_000)
+                            .speed(10)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Pulse");
+                    ui.horizontal(|ui| {
+                        for (label, dir) in [
+                            ("N", GuideDirection::North),
+                            ("S", GuideDirection::South),
+                            ("E", GuideDirection::East),
+                            ("W", GuideDirection::West),
+                        ] {
+                            if ui.button(label).clicked() {
+                                let _ = handle.cmd_tx.send(ToupCmd::Guide(dir, controls.guide_ms));
+                            }
+                        }
+                        if ui.button("Stop").on_hover_text("Cancel any pulse in progress").clicked() {
+                            let _ = handle.cmd_tx.send(ToupCmd::Guide(GuideDirection::Stop, 0));
+                        }
+                    });
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── Static device identity ───────────────────────────────────────────
+        if !controls.info_rows.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Camera Info").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_info").num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
+                    for (label, value) in &controls.info_rows {
+                        ctrl_label(ui, label_w, label);
+                        ui.label(
+                            egui::RichText::new(value)
+                                .monospace().size(12.0).color(pal.text_secondary),
+                        );
+                        ui.end_row();
+                    }
                 });
             });
         }

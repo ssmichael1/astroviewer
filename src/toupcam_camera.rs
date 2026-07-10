@@ -18,7 +18,7 @@
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::time::{Duration, Instant};
-use toupcam::{sys, AutoExposure, BitDepth, Camera, DeviceInfo, Event, Opt};
+use toupcam::{sys, AutoExposure, BitDepth, Camera, DeviceInfo, Event, GuideDirection, Opt};
 
 /// Commands sent from the UI thread to the camera capture thread.
 pub enum ToupCmd {
@@ -33,6 +33,19 @@ pub enum ToupCmd {
     SetSpeed(u16),
     /// Any `TOUPCAM_OPTION_*` value (TEC, black level, and the advanced table).
     SetOption(Opt, i32),
+    /// `true` = software-trigger mode (frames only on [`ToupCmd::Snap`]),
+    /// `false` = free-running video.
+    SetTriggerMode(bool),
+    /// Fire one software-triggered exposure.
+    Snap,
+    /// ST4 guide pulse in the given direction for a duration in milliseconds.
+    /// `GuideDirection::Stop` cancels any pulse in progress.
+    Guide(GuideDirection, u32),
+    /// Switch to the preview resolution at this index (restarts the stream).
+    SetResolution(u32),
+    /// Hardware sensor ROI: `(x, y, width, height)`; all values must be even,
+    /// minimum size 8×8. `(0, 0, 0, 0)` restores the full frame.
+    SetRoi(u32, u32, u32, u32),
     Correction(Correction, CorrectionAction),
     /// Move the filter wheel to a 0-based slot (shortest direction).
     SetFilterPosition(u32),
@@ -94,6 +107,16 @@ pub struct ToupTelemetry {
     pub temperature_c: Option<f32>,
     /// Power consumption, milliwatts.
     pub power_mw: Option<i32>,
+    /// Current TEC drive voltage, volts.
+    pub tec_voltage: Option<f32>,
+    /// Sensor-chamber `(humidity %, temperature °C)`.
+    pub chamber_ht: Option<(f32, f32)>,
+    /// Ambient `(humidity %, temperature °C)`.
+    pub env_ht: Option<(f32, f32)>,
+    /// Actual exposure time, µs — tracks the camera while auto-exposure runs.
+    pub real_exposure_us: Option<u32>,
+    /// Hardware ROI actually applied by the camera, `(x, y, w, h)`.
+    pub roi: Option<(u32, u32, u32, u32)>,
     /// Filter-wheel slot, `-1` while the wheel is in motion.
     pub filter_position: Option<i32>,
     pub focuser_position: Option<i32>,
@@ -105,8 +128,20 @@ pub struct ToupTelemetry {
 struct TelemetryCfg {
     temp: bool,
     power: bool,
+    tec_voltage: bool,
+    chamber_ht: bool,
+    env_ht: bool,
+    roi: bool,
     wheel: bool,
     focuser: bool,
+}
+
+/// Unpack a `TOUPCAM_OPTION_*_HT` value: humidity in 0.1 % (high 16 bits),
+/// temperature in 0.1 °C (low 16 bits), both signed.
+fn unpack_ht(v: i32) -> (f32, f32) {
+    let humidity = ((v >> 16) & 0xffff) as i16 as f32 / 10.0;
+    let temperature = (v & 0xffff) as i16 as f32 / 10.0;
+    (humidity, temperature)
 }
 
 /// Enable state of one supported correction.
@@ -148,6 +183,21 @@ pub struct ToupControls {
     /// Frame-speed level; row hidden when `max_speed == 0`.
     pub speed: u16,
     pub max_speed: u16,
+    /// Camera supports software trigger; gates the Capture Mode row.
+    pub has_soft_trigger: bool,
+    /// `true` = frames only on Snap; `false` = free-running video.
+    pub trigger_mode: bool,
+    /// Preview resolutions `(width, height)`; picker hidden when only one.
+    pub resolutions: Vec<(u32, u32)>,
+    pub resolution_index: u32,
+    /// Hardware ROI last reported by the camera, `(x, y, w, h)`.
+    pub roi: (u32, u32, u32, u32),
+    /// UI staging for the ROI editor (sent on Apply).
+    pub roi_edit: (u32, u32, u32, u32),
+    /// Model has an ST4 autoguider port; gates the Guide group.
+    pub has_st4: bool,
+    /// UI-side ST4 pulse duration, milliseconds.
+    pub guide_ms: u32,
     /// Model has a thermoelectric cooler; gates the Cooling group in the UI.
     pub has_tec: bool,
     pub tec_on: bool,
@@ -158,6 +208,15 @@ pub struct ToupControls {
     pub temperature_c: Option<f32>,
     /// Latest power draw, milliwatts, if the camera reports it.
     pub power_mw: Option<i32>,
+    /// Latest TEC drive voltage, volts, with the configured maximum.
+    pub tec_voltage: Option<f32>,
+    pub tec_voltage_max: Option<f32>,
+    /// Sensor-chamber `(humidity %, temperature °C)` — desiccant health.
+    pub chamber_ht: Option<(f32, f32)>,
+    /// Ambient `(humidity %, temperature °C)` — dew-point context.
+    pub env_ht: Option<(f32, f32)>,
+    /// Static device identity (serial, firmware, …) for the Camera Info panel.
+    pub info_rows: Vec<(&'static str, String)>,
     /// Corrections this camera supports, with their enable state.
     pub corrections: Vec<CorrectionState>,
     pub filter_wheel: Option<FilterWheelState>,
@@ -201,6 +260,20 @@ fn build_advanced(cam: &Camera, model: &toupcam::ModelInfo, bit_depth: u8) -> Ve
     /// safe with the viewer's fixed-depth display pipeline.
     const BINNING: &[(i32, &str)] =
         &[(1, "1×1"), (0x82, "2×2"), (0x83, "3×3"), (0x84, "4×4")];
+    const DDR_DEPTH: &[(i32, &str)] =
+        &[(0, "Auto"), (1, "One frame"), (-1, "Full capacity")];
+    const TEST_PATTERN: &[(i32, &str)] = &[
+        (0, "Off"),
+        (3, "Diagonal stripes"),
+        (5, "Vertical stripes"),
+        (7, "Horizontal stripes"),
+        (9, "Chromatic stripes"),
+    ];
+    const SHUTTER: &[(i32, &str)] = &[(0, "Open"), (1, "Closed")];
+
+    // Read-only companion option holding an Int row's maximum; row dropped
+    // unless it reads back positive.
+    let probed_max = |o: u32| cam.get_option(Opt::new(o)).ok().filter(|&m| m > 0);
 
     let mut defs: Vec<(&'static str, Opt, AdvKind)> = Vec::new();
 
@@ -226,6 +299,35 @@ fn build_advanced(cam: &Camera, model: &toupcam::ModelInfo, bit_depth: u8) -> Ve
             Opt::new(sys::TOUPCAM_OPTION_BLACKLEVEL),
             AdvKind::Int { min: 0, max },
         ));
+        // Compensates optical-black drift on long exposures.
+        defs.push((
+            "Black Level Auto",
+            Opt::new(sys::TOUPCAM_OPTION_BLACKLEVEL_AUTOADJUST),
+            AdvKind::Bool,
+        ));
+    }
+    defs.push(("Defect Pixel Corr", Opt::new(sys::TOUPCAM_OPTION_DEFECT_PIXEL), AdvKind::Bool));
+    // Correlated double sampling and anti-blooming: sensor-level readout
+    // tuning; ranges come from their read-only *_MAX companions.
+    if let Some(max) = probed_max(sys::TOUPCAM_OPTION_CDS_MAX) {
+        defs.push(("CDS", Opt::new(sys::TOUPCAM_OPTION_CDS), AdvKind::Int { min: 0, max }));
+    }
+    if let Some(max) = probed_max(sys::TOUPCAM_OPTION_ANTI_BLOOMING_MAX) {
+        defs.push((
+            "Anti-Blooming",
+            Opt::new(sys::TOUPCAM_OPTION_ANTI_BLOOMING),
+            AdvKind::Int { min: 0, max },
+        ));
+    }
+    defs.push(("Zero Offset", Opt::new(sys::TOUPCAM_OPTION_ZERO_OFFSET), AdvKind::Bool));
+    if model.has_flag(sys::TOUPCAM_FLAG_HEAT) {
+        if let Some(max) = probed_max(sys::TOUPCAM_OPTION_HEAT_MAX) {
+            defs.push((
+                "Anti-Dew Heater",
+                Opt::new(sys::TOUPCAM_OPTION_HEAT),
+                AdvKind::Int { min: 0, max },
+            ));
+        }
     }
     if model.has_flag(sys::TOUPCAM_FLAG_FAN) && model.max_fan_speed > 0 {
         defs.push((
@@ -234,8 +336,53 @@ fn build_advanced(cam: &Camera, model: &toupcam::ModelInfo, bit_depth: u8) -> Ve
             AdvKind::Int { min: 0, max: model.max_fan_speed as i32 },
         ));
     }
-    // 0 = unlimited; the SDK caps the limit value at 63 fps.
-    defs.push(("Frame Rate Limit", Opt::FRAMERATE, AdvKind::Int { min: 0, max: 63 }));
+    if model.has_flag(sys::TOUPCAM_FLAG_TEC) {
+        // Caps the TEC drive (0.1 V units): trades cooling headroom for
+        // power/condensation control. Range comes from the camera itself.
+        if let Ok(range) = cam.get_option(Opt::new(sys::TOUPCAM_OPTION_TEC_VOLTAGE_MAX_RANGE)) {
+            let (min, max) = ((range & 0xffff) as i16 as i32, ((range >> 16) & 0xffff) as i16 as i32);
+            if max > min {
+                defs.push((
+                    "TEC Max Volt (0.1V)",
+                    Opt::new(sys::TOUPCAM_OPTION_TEC_VOLTAGE_MAX),
+                    AdvKind::Int { min, max },
+                ));
+            }
+        }
+    }
+    if model.has_flag(sys::TOUPCAM_FLAG_DDR) || model.has_flag(sys::TOUPCAM_FLAG_BUFFER) {
+        defs.push(("DDR Buffering", Opt::new(sys::TOUPCAM_OPTION_DDR_DEPTH), AdvKind::Enum(DDR_DEPTH)));
+    }
+    defs.push(("Low Power Mode", Opt::new(sys::TOUPCAM_OPTION_LOW_POWERCONSUMPTION), AdvKind::Bool));
+    if let Some(max) = probed_max(sys::TOUPCAM_OPTION_OVERCLOCK_MAX) {
+        defs.push(("Overclock", Opt::new(sys::TOUPCAM_OPTION_OVERCLOCK), AdvKind::Int { min: 0, max }));
+    }
+    defs.push((
+        "Mech Shutter",
+        Opt::new(sys::TOUPCAM_OPTION_MECHANICALSHUTTER),
+        AdvKind::Enum(SHUTTER),
+    ));
+    if model.has_flag(sys::TOUPCAM_FLAG_PRECISE_FRAMERATE) {
+        let min = cam
+            .get_option(Opt::new(sys::TOUPCAM_OPTION_MIN_PRECISE_FRAMERATE))
+            .unwrap_or(1)
+            .max(1);
+        if let Some(max) = probed_max(sys::TOUPCAM_OPTION_MAX_PRECISE_FRAMERATE) {
+            defs.push((
+                "Frame Rate (0.1fps)",
+                Opt::new(sys::TOUPCAM_OPTION_PRECISE_FRAMERATE),
+                AdvKind::Int { min, max },
+            ));
+        }
+    } else {
+        // 0 = unlimited; the SDK caps the limit value at 63 fps.
+        defs.push(("Frame Rate Limit", Opt::FRAMERATE, AdvKind::Int { min: 0, max: 63 }));
+    }
+    defs.push((
+        "Test Pattern",
+        Opt::new(sys::TOUPCAM_OPTION_TESTPATTERN),
+        AdvKind::Enum(TEST_PATTERN),
+    ));
 
     defs.into_iter()
         .filter_map(|(label, opt, kind)| {
@@ -324,8 +471,13 @@ pub fn start_camera(
         if mono { "" } else { " — mosaic visible at 1:1 zoom" },
     )));
 
-    // Deterministic manual exposure to start; the Auto checkbox re-enables it.
+    // Deterministic manual exposure and free-running video to start; the
+    // Auto checkbox / Capture Mode combo re-enable the alternatives.
     let _ = cam.set_auto_exposure(AutoExposure::Off);
+    let has_soft_trigger = info.model.has_trigger_software();
+    if has_soft_trigger {
+        let _ = cam.put_option(Opt::TRIGGER, 0);
+    }
 
     let (exp_min, exp_max, exp_def) = cam.exposure_range().unwrap_or((1, 10_000_000, 100_000));
     let exposure_us = cam.exposure().unwrap_or(exp_def).clamp(exp_min, exp_max);
@@ -346,6 +498,59 @@ pub fn start_camera(
         .clamp(tec_range.0, tec_range.1);
     let temperature_c = cam.temperature().ok();
     let power_mw = cam.power_consumption().ok();
+    let tec_voltage = cam
+        .get_option(Opt::new(sys::TOUPCAM_OPTION_TEC_VOLTAGE))
+        .ok()
+        .map(|v| v as f32 / 10.0);
+    let tec_voltage_max = cam
+        .get_option(Opt::new(sys::TOUPCAM_OPTION_TEC_VOLTAGE_MAX))
+        .ok()
+        .map(|v| v as f32 / 10.0);
+    let chamber_ht = cam
+        .get_option(Opt::new(sys::TOUPCAM_OPTION_CHAMBER_HT))
+        .ok()
+        .map(unpack_ht);
+    let env_ht = cam
+        .get_option(Opt::new(sys::TOUPCAM_OPTION_ENV_HT))
+        .ok()
+        .map(unpack_ht);
+
+    // Preview resolutions; changing one restarts the stream in the capture
+    // thread. The model table is authoritative, the live query a fallback.
+    let resolutions: Vec<(u32, u32)> = if info.model.preview_resolutions.is_empty() {
+        let n = cam.resolution_count().unwrap_or(0);
+        (0..n).filter_map(|i| cam.resolution(i).ok()).collect()
+    } else {
+        info.model.preview_resolutions.iter().map(|r| (r.width, r.height)).collect()
+    };
+    let resolution_index = cam.resolution_index().unwrap_or(0);
+    let full = resolutions
+        .get(resolution_index as usize)
+        .copied()
+        .unwrap_or((0, 0));
+    let roi = cam.roi().unwrap_or((0, 0, full.0, full.1));
+
+    let mut info_rows: Vec<(&'static str, String)> = vec![("Model", info.model.name.clone())];
+    if let Ok(v) = cam.serial_number() {
+        info_rows.push(("Serial", v));
+    }
+    if let Ok(v) = cam.firmware_version() {
+        info_rows.push(("Firmware", v));
+    }
+    if let Ok(v) = cam.hardware_version() {
+        info_rows.push(("Hardware", v));
+    }
+    if let Ok(v) = cam.production_date() {
+        info_rows.push(("Produced", v));
+    }
+    if info.model.pixel_width_um > 0.0 {
+        info_rows.push((
+            "Pixel Size",
+            format!("{:.2} × {:.2} µm", info.model.pixel_width_um, info.model.pixel_height_um),
+        ));
+    }
+    info_rows.push(("Sensor", format!("{} × {}, {}-bit", full.0, full.1, bit_depth)));
+    info_rows.push(("SDK", toupcam::version()));
 
     let corrections = probe_corrections(&cam);
 
@@ -375,6 +580,10 @@ pub fn start_camera(
     let telemetry_cfg = TelemetryCfg {
         temp: info.model.can_get_temperature() || temperature_c.is_some(),
         power: power_mw.is_some(),
+        tec_voltage: tec_voltage.is_some(),
+        chamber_ht: chamber_ht.is_some(),
+        env_ht: env_ht.is_some(),
+        roi: true,
         wheel: filter_wheel.is_some(),
         focuser: focuser.is_some(),
     };
@@ -390,12 +599,25 @@ pub fn start_camera(
         gain_max,
         speed,
         max_speed,
+        has_soft_trigger,
+        trigger_mode: false,
+        resolutions,
+        resolution_index,
+        roi,
+        roi_edit: roi,
+        has_st4: info.model.has_st4(),
+        guide_ms: 500,
         has_tec,
         tec_on,
         tec_target_c,
         tec_range,
         temperature_c,
         power_mw,
+        tec_voltage,
+        tec_voltage_max,
+        chamber_ht,
+        env_ht,
+        info_rows,
         corrections,
         filter_wheel,
         focuser,
@@ -446,7 +668,7 @@ struct CaptureCtx {
 
 fn apply_cmd(cam: &Camera, cmd: ToupCmd) -> toupcam::Result<()> {
     match cmd {
-        ToupCmd::Stop => unreachable!("handled by caller"),
+        ToupCmd::Stop | ToupCmd::SetResolution(_) => unreachable!("handled by caller"),
         ToupCmd::SetExposure(us) => cam.set_exposure(us),
         ToupCmd::SetAutoExposure(on) => cam.set_auto_exposure(if on {
             AutoExposure::Continuous
@@ -457,6 +679,10 @@ fn apply_cmd(cam: &Camera, cmd: ToupCmd) -> toupcam::Result<()> {
         ToupCmd::SetGain(g) => cam.set_gain(g),
         ToupCmd::SetSpeed(s) => cam.set_speed(s),
         ToupCmd::SetOption(opt, v) => cam.put_option(opt, v),
+        ToupCmd::SetTriggerMode(on) => cam.put_option(Opt::TRIGGER, on as i32),
+        ToupCmd::Snap => cam.trigger(1),
+        ToupCmd::Guide(dir, ms) => cam.st4_guide(dir, ms),
+        ToupCmd::SetRoi(x, y, w, h) => cam.set_roi(x, y, w, h),
         ToupCmd::Correction(kind, action) => match action {
             CorrectionAction::Capture => match kind {
                 Correction::FlatField => cam.ffc_once(),
@@ -486,6 +712,24 @@ fn poll_telemetry(cam: &Camera, cfg: TelemetryCfg) -> ToupTelemetry {
     ToupTelemetry {
         temperature_c: cfg.temp.then(|| cam.temperature().ok()).flatten(),
         power_mw: cfg.power.then(|| cam.power_consumption().ok()).flatten(),
+        tec_voltage: cfg
+            .tec_voltage
+            .then(|| {
+                cam.get_option(Opt::new(sys::TOUPCAM_OPTION_TEC_VOLTAGE))
+                    .ok()
+                    .map(|v| v as f32 / 10.0)
+            })
+            .flatten(),
+        chamber_ht: cfg
+            .chamber_ht
+            .then(|| cam.get_option(Opt::new(sys::TOUPCAM_OPTION_CHAMBER_HT)).ok().map(unpack_ht))
+            .flatten(),
+        env_ht: cfg
+            .env_ht
+            .then(|| cam.get_option(Opt::new(sys::TOUPCAM_OPTION_ENV_HT)).ok().map(unpack_ht))
+            .flatten(),
+        real_exposure_us: cam.real_exposure_time().ok(),
+        roi: cfg.roi.then(|| cam.roi().ok()).flatten(),
         filter_position: cfg
             .wheel
             .then(|| {
@@ -526,6 +770,31 @@ fn capture_loop(ctx: CaptureCtx) {
             if matches!(cmd, ToupCmd::Stop) {
                 let _ = cam.stop();
                 return;
+            }
+            // A resolution change restarts the stream (the SDK rejects
+            // put_eSize while running); options set earlier persist.
+            if let ToupCmd::SetResolution(idx) = cmd {
+                let _ = cam.stop();
+                let result = cam
+                    .set_resolution_index(idx)
+                    .and_then(|()| cam.start_pull_mode());
+                match result {
+                    Ok(()) => {
+                        let (w, h) = cam.size().unwrap_or((0, 0));
+                        let _ = log_tx.try_send(super::LogEntry::info(format!(
+                            "{}: resolution changed to {} × {}",
+                            cam_name, w, h
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = log_tx.try_send(super::LogEntry::error(format!(
+                            "{}: resolution change failed: {}",
+                            cam_name, e
+                        )));
+                        return;
+                    }
+                }
+                continue;
             }
             if let Err(e) = apply_cmd(&cam, cmd) {
                 let _ = log_tx.try_send(super::LogEntry::error(format!(

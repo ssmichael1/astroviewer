@@ -9,6 +9,8 @@ pub struct NamedStar {
 }
 
 /// ~150 brightest named stars (mag < ~3.6), sorted by magnitude.
+// Sarin's magnitude really is 3.14; it is not an approximation of π.
+#[allow(clippy::approx_constant)]
 pub static NAMED_STARS: &[NamedStar] = &[
     NamedStar { name: "Sirius",               ra_deg: 101.287, dec_deg: -16.716, mag: -1.46 },
     NamedStar { name: "Canopus",              ra_deg:  95.988, dec_deg: -52.696, mag: -0.74 },

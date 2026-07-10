@@ -896,6 +896,9 @@ fn capture_loop(ctx: CaptureCtx) {
                 }
                 let mut frame_data = super::process_image(img, bit_depth);
                 frame_data.channel_hists = channel_hists;
+                // The pixels only carry the mosaic if superpixel didn't
+                // average it away (hardware binning already covered above).
+                frame_data.cfa = if superpixel { None } else { cfa_live.map(|p| p.label()) };
                 if frame_tx.try_send(frame_data).is_err() && frame_tx.is_empty() {
                     // Receiver dropped — the UI is gone.
                     let _ = cam.stop();

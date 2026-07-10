@@ -46,6 +46,11 @@ struct FrameData {
     /// color sensors streaming RAW with the pattern intact. Binned identically
     /// to `hist` so the curves overlay directly.
     channel_hists: Option<[histogram::Histogram; 3]>,
+    /// Bayer pattern name ("RGGB", …) when the pixel data itself still carries
+    /// an intact mosaic — i.e. a color sensor with no hardware or superpixel
+    /// binning applied. Recorded as the FITS BAYERPAT keyword so calibration
+    /// software can auto-demosaic.
+    cfa: Option<&'static str>,
     mean: f32,
     stddev: f32,
     bit_depth: u8,
@@ -57,7 +62,7 @@ impl FrameData {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         let hist = compute_histogram(&mono, 256, 0.0, range_max);
         let (mean, stddev) = compute_stats(&mono);
-        FrameData { mono, width, height, hist, channel_hists: None, mean, stddev, bit_depth }
+        FrameData { mono, width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
 
@@ -140,7 +145,21 @@ enum BottomTab {
 // ── Recording ───────────────────────────────────────────────────────────────
 
 enum RecordMsg {
-    Frame { mono: Vec<f32>, width: u32, height: u32, date_obs: String, exptime_s: f64 },
+    Frame {
+        mono: Vec<f32>,
+        width: u32,
+        height: u32,
+        date_obs: String,
+        exptime_s: f64,
+        /// Bayer pattern of the pixel data, when it carries an intact mosaic.
+        cfa: Option<&'static str>,
+        /// Camera gain setting, in the camera's native units.
+        gain: Option<f64>,
+        /// Sensor temperature, °C.
+        ccd_temp: Option<f64>,
+        /// Cooler setpoint, °C (only when the cooler is on).
+        set_temp: Option<f64>,
+    },
     Stop,
 }
 
@@ -898,17 +917,26 @@ impl ViewerApp {
         let log_tx = self.log_tx.clone();
         let full_path = filepath.display().to_string();
         let fname = full_path.clone();
+        // Camera name for INSTRUME; file playback isn't an instrument.
+        let instrume = match &self.camera_source {
+            CameraSource::None | CameraSource::FitsFile(_) => None,
+            #[allow(unreachable_patterns)]
+            _ => Some(self.source_label()),
+        };
 
         thread::spawn(move || {
             use fitskit::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
 
             let mut fits = FitsFile::with_empty_primary();
             fits.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
+            if let Some(name) = instrume {
+                fits.primary_mut().header.set("INSTRUME", HeaderValue::String(name), Some("camera"));
+            }
             let mut frame_count: u32 = 0;
 
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s } => {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, ccd_temp, set_temp } => {
                         // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
                         let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
                             let clamped = v.clamp(0.0, 65535.0) as u16;
@@ -924,6 +952,23 @@ impl ViewerApp {
                         hdu.header.set("BSCALE", HeaderValue::Float(1.0), Some("default scaling"));
                         hdu.header.set("DATE-OBS", HeaderValue::String(date_obs), Some("estimated mid-exposure UTC"));
                         hdu.header.set("EXPTIME", HeaderValue::Float(exptime_s), Some("exposure time in seconds"));
+                        // Only written when the pixels still carry an intact
+                        // mosaic (no hardware or superpixel binning) so
+                        // calibration software never demosaics mono data.
+                        if let Some(pat) = cfa {
+                            hdu.header.set("BAYERPAT", HeaderValue::String(pat.into()), Some("CFA order of pixel (0,0)"));
+                            hdu.header.set("XBAYROFF", HeaderValue::Integer(0), Some("CFA X phase offset"));
+                            hdu.header.set("YBAYROFF", HeaderValue::Integer(0), Some("CFA Y phase offset"));
+                        }
+                        if let Some(g) = gain {
+                            hdu.header.set("GAIN", HeaderValue::Float(g), Some("camera gain setting"));
+                        }
+                        if let Some(t) = ccd_temp {
+                            hdu.header.set("CCD-TEMP", HeaderValue::Float(t), Some("sensor temperature (C)"));
+                        }
+                        if let Some(t) = set_temp {
+                            hdu.header.set("SET-TEMP", HeaderValue::Float(t), Some("cooler setpoint (C)"));
+                        }
                         fits.push_extension(hdu);
                         frame_count += 1;
                     }
@@ -969,15 +1014,24 @@ impl ViewerApp {
 
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
-            // Estimate exposure time from camera controls (microseconds)
+            // Exposure, gain, and temperatures from the active camera's controls.
             #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
             let mut exposure_us: f64 = 0.0;
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
+            let mut gain: Option<f64> = None;
+            #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
+            let mut ccd_temp: Option<f64> = None;
+            #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
+            let mut set_temp: Option<f64> = None;
             #[cfg(feature = "svbony")]
             if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
                 exposure_us = control_values.iter()
                     .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
                     .map(|(_, v, _)| *v as f64)
                     .unwrap_or(0.0);
+                gain = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::Gain)
+                    .map(|(_, v, _)| *v as f64);
             }
             #[cfg(feature = "gev")]
             if let CaptureState::Gev { ref controls, .. } = self.capture_state {
@@ -986,10 +1040,14 @@ impl ViewerApp {
                     .find(|c| c.name == "ExposureTime")
                     .map(|c| c.fvalue)
                     .unwrap_or(0.0);
+                gain = controls.iter().find(|c| c.name == "Gain").map(|c| c.fvalue);
             }
             #[cfg(feature = "toupcam")]
             if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
                 exposure_us = controls.exposure_us as f64;
+                gain = Some(controls.gain as f64);
+                ccd_temp = controls.temperature_c.map(|t| t as f64);
+                set_temp = controls.tec_on.then_some(controls.tec_target_c as f64);
             }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
@@ -1002,6 +1060,10 @@ impl ViewerApp {
                 height: frame.height,
                 date_obs,
                 exptime_s,
+                cfa: frame.cfa,
+                gain,
+                ccd_temp,
+                set_temp,
             };
             if tx.try_send(msg).is_ok() {
                 self.rec_frame_count += 1;

@@ -99,6 +99,9 @@ enum CameraSource {
     /// ToupTek camera, identified by its opaque enumeration id.
     #[cfg(feature = "toupcam")]
     Toupcam(String),
+    /// INDI/INDIGO server address ("host" or "host:port").
+    #[cfg(feature = "indi")]
+    Indi(String),
 }
 
 impl CameraSource {
@@ -113,6 +116,8 @@ impl CameraSource {
             CameraSource::Gev(id) => Some(format!("gev:{}", id)),
             #[cfg(feature = "toupcam")]
             CameraSource::Toupcam(id) => Some(format!("toupcam:{}", id)),
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => Some(format!("indi:{}", host)),
         }
     }
 
@@ -154,8 +159,20 @@ impl CameraSource {
                 return Err("this build has no GigE support (rebuild with --features gev)".into());
             }
         }
-        if s.starts_with("indi:") {
-            return Err("INDI sources are not supported yet".into());
+        if let Some(host) = s.strip_prefix("indi:") {
+            #[cfg(feature = "indi")]
+            {
+                let host = host.trim_start_matches("//");
+                if host.is_empty() {
+                    return Err("indi: needs a server address (indi:host[:port])".into());
+                }
+                return Ok(CameraSource::Indi(host.to_string()));
+            }
+            #[cfg(not(feature = "indi"))]
+            {
+                let _ = host;
+                return Err("this build has no INDI support (rebuild with --features indi)".into());
+            }
         }
         // A bare existing path means a FITS file (drag-onto-app, `open with`).
         if std::path::Path::new(s).exists() {
@@ -195,10 +212,25 @@ mod source_descriptor_tests {
     }
 
     #[test]
-    fn unknown_and_reserved_schemes_error() {
-        assert!(CameraSource::parse_descriptor("indi://host/CCD").is_err());
+    fn unknown_schemes_error() {
         assert!(CameraSource::parse_descriptor("bogus:thing").is_err());
         assert!(CameraSource::parse_descriptor("/no/such/path.fits").is_err());
+        #[cfg(not(feature = "indi"))]
+        assert!(CameraSource::parse_descriptor("indi:localhost").is_err());
+    }
+
+    #[cfg(feature = "indi")]
+    #[test]
+    fn indi_roundtrip() {
+        let src = CameraSource::parse_descriptor("indi:astro.local:7624").unwrap();
+        assert_eq!(src, CameraSource::Indi("astro.local:7624".into()));
+        assert_eq!(src.descriptor().unwrap(), "indi:astro.local:7624");
+        // The scheme also accepts the // form.
+        assert_eq!(
+            CameraSource::parse_descriptor("indi://astro.local").unwrap(),
+            CameraSource::Indi("astro.local".into())
+        );
+        assert!(CameraSource::parse_descriptor("indi:").is_err());
     }
 
     #[cfg(feature = "toupcam")]
@@ -237,6 +269,18 @@ enum CaptureState {
         // control mirror are much larger than the other variants.
         handle: Box<toupcam_camera::ToupHandle>,
         controls: Box<toupcam_camera::ToupControls>,
+    },
+    #[cfg(feature = "indi")]
+    Indi {
+        handle: indi_camera::IndiHandle,
+        /// Latest property snapshot from the reader thread.
+        props: Vec<indi_camera::IndiProperty>,
+        /// Selected INDI device (a server can host several drivers).
+        device: String,
+        /// Exposure used by the Single/Live capture buttons, in seconds.
+        exposure_s: f64,
+        /// Whether the live re-trigger loop is on.
+        live: bool,
     },
     Stopped,
 }
@@ -423,7 +467,13 @@ struct ViewerApp {
     gev_filter: String,
     #[cfg(feature = "toupcam")]
     discovered_toupcam: Vec<toupcam::DeviceInfo>,
-    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    /// INDI server address ("host" or "host:port") for the connect field.
+    #[cfg(feature = "indi")]
+    indi_host: String,
+    /// Substring filter for the INDI properties panel.
+    #[cfg(feature = "indi")]
+    indi_filter: String,
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
     camera_error: Option<String>,
 }
 
@@ -556,7 +606,7 @@ impl ViewerApp {
         #[cfg(feature = "toupcam")]
         let discovered_toupcam = toupcam_camera::enumerate();
 
-        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
         let camera_error: Option<String> = None;
 
         // The app is built idle; the startup source (CLI argument or the
@@ -644,7 +694,11 @@ impl ViewerApp {
             gev_filter: String::new(),
             #[cfg(feature = "toupcam")]
             discovered_toupcam,
-            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            #[cfg(feature = "indi")]
+            indi_host: "localhost".to_string(),
+            #[cfg(feature = "indi")]
+            indi_filter: String::new(),
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
             camera_error,
         };
 
@@ -925,6 +979,8 @@ impl ViewerApp {
                 .find(|d| d.id == *id)
                 .map(|d| d.display_name.clone())
                 .unwrap_or_else(|| "ToupTek camera".to_string()),
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => format!("INDI: {}", host),
         }
     }
 
@@ -1122,7 +1178,7 @@ impl ViewerApp {
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
             // Exposure, gain, and temperatures from the active camera's controls.
-            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi")), allow(unused_mut))]
             let mut exposure_us: f64 = 0.0;
             #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
             let mut gain: Option<f64> = None;
@@ -1165,6 +1221,12 @@ impl ViewerApp {
                     .map(|c| c.value as f64);
                 ccd_temp = controls.temperature_c.map(|t| t as f64);
                 set_temp = controls.tec_on.then_some(controls.tec_target_c as f64);
+            }
+            #[cfg(feature = "indi")]
+            if let CaptureState::Indi { exposure_s, .. } = self.capture_state {
+                // Use the requested exposure — the driver's CCD_EXPOSURE value
+                // counts down during the exposure, so it isn't the duration.
+                exposure_us = exposure_s * 1_000_000.0;
             }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
@@ -1217,6 +1279,10 @@ impl ViewerApp {
                 if let Some(jh) = handle.join_handle.take() {
                     let _ = jh.join();
                 }
+            }
+            #[cfg(feature = "indi")]
+            CaptureState::Indi { mut handle, .. } => {
+                handle.stop();
             }
             CaptureState::Stopped => {}
         }
@@ -1432,6 +1498,47 @@ impl ViewerApp {
                     },
                 }
             }
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => {
+                self.indi_host = host;
+                self.start_indi();
+            }
+        }
+    }
+
+    /// Connect to an INDI server using the address in `indi_host`. Frames only
+    /// start once the user connects a device and starts an exposure from the
+    /// Controls tab, so switch there on success.
+    #[cfg(feature = "indi")]
+    fn start_indi(&mut self) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        let addr = self.indi_host.trim().to_string();
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+            _ => (addr.clone(), indi_camera::DEFAULT_PORT),
+        };
+        match indi_camera::start_client(&host, port, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok(handle) => {
+                self.add_log(LogEntry::info(format!("INDI: connected to {host}:{port}")));
+                self.capture_state = CaptureState::Indi {
+                    handle,
+                    props: Vec::new(),
+                    device: String::new(),
+                    exposure_s: 1.0,
+                    live: false,
+                };
+                self.camera_source = CameraSource::Indi(addr);
+                self.capture_running = true;
+                self.bottom_tab = BottomTab::Controls;
+                self.persist_last_source();
+            }
+            Err(e) => {
+                let msg = format!("INDI connect failed: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
         }
     }
 
@@ -1539,6 +1646,19 @@ impl ViewerApp {
                 if let Some(f) = controls.focuser.as_mut() {
                     if let Some(p) = t.focuser_position { f.position = p; }
                     if let Some(m) = t.focuser_moving { f.moving = m; }
+                }
+            }
+        }
+        // Refresh INDI property snapshots; default the device picker to the
+        // first device the server defines.
+        #[cfg(feature = "indi")]
+        if let CaptureState::Indi { ref handle, ref mut props, ref mut device, .. } = self.capture_state {
+            while let Ok(snap) = handle.props_rx.try_recv() {
+                *props = snap;
+            }
+            if device.is_empty() {
+                if let Some(p) = props.first() {
+                    *device = p.device.clone();
                 }
             }
         }
@@ -1718,7 +1838,7 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
@@ -1739,6 +1859,8 @@ impl ViewerApp {
                 CameraSource::Gev(_) => {}
                 #[cfg(feature = "toupcam")]
                 CameraSource::Toupcam(_) => {}
+                #[cfg(feature = "indi")]
+                CameraSource::Indi(_) => {}
             }
 
             // GigE: connect directly by IP (needed when a camera is reachable by
@@ -1768,6 +1890,20 @@ impl ViewerApp {
                             ));
                         }
                     }
+                }
+            }
+
+            // INDI: connect to an indiserver by host[:port].
+            #[cfg(feature = "indi")]
+            {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("INDI:");
+                    ui.add(egui::TextEdit::singleline(&mut self.indi_host)
+                        .hint_text("localhost:7624").desired_width(140.0));
+                });
+                if widgets::styled_button(ui, "Connect to INDI", &pal) {
+                    self.start_indi();
                 }
             }
 
@@ -2143,7 +2279,7 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
         #[cfg(feature = "gev")]
         if matches!(self.capture_state, CaptureState::Gev { .. }) {
@@ -2153,6 +2289,11 @@ impl ViewerApp {
         #[cfg(feature = "toupcam")]
         if matches!(self.capture_state, CaptureState::Toupcam { .. }) {
             self.toupcam_controls_content(ui);
+            return;
+        }
+        #[cfg(feature = "indi")]
+        if matches!(self.capture_state, CaptureState::Indi { .. }) {
+            self.indi_controls_content(ui);
             return;
         }
         #[cfg(feature = "svbony")]
@@ -2961,6 +3102,170 @@ impl ViewerApp {
         }
     }
 
+    /// Render the INDI device's properties: a device picker with connection
+    /// state, a capture block (exposure, Single / Live), then the generic
+    /// property vectors grouped by the driver's own groups — the same
+    /// collapsible-grid pattern as the GigE panel.
+    #[cfg(feature = "indi")]
+    fn indi_controls_content(&mut self, ui: &mut egui::Ui) {
+        use indi_camera::{BlobMode, IndiCmd, IndiProperty, IndiValue, PropState};
+        let pal = self.pal();
+        if !matches!(self.capture_state, CaptureState::Indi { .. }) { return }
+
+        // Filter box first — self.indi_filter can't be borrowed once
+        // capture_state is destructured below.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.indi_filter)
+                    .hint_text("Filter properties…")
+                    .desired_width(180.0),
+            );
+            if !self.indi_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.indi_filter.clear();
+            }
+        });
+        let filter = self.indi_filter.trim().to_lowercase();
+        let filtering = !filter.is_empty();
+
+        let CaptureState::Indi {
+            ref handle, ref mut props, ref mut device, ref mut exposure_s, ref mut live,
+        } = self.capture_state else { return };
+
+        if props.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Waiting for INDI properties…").color(pal.text_secondary));
+            });
+            return;
+        }
+
+        // Device row: picker + connection state.
+        let mut devices: Vec<String> = Vec::new();
+        for p in props.iter() {
+            if !devices.contains(&p.device) { devices.push(p.device.clone()); }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Device").color(pal.text_secondary));
+            egui::ComboBox::from_id_salt("indi_device")
+                .selected_text(device.clone())
+                .show_ui(ui, |ui| {
+                    for d in &devices {
+                        if ui.selectable_label(*d == *device, d).clicked() {
+                            *device = d.clone();
+                        }
+                    }
+                });
+            let connected = props.iter().any(|p| {
+                p.device == *device
+                    && p.name == indi_camera::PROP_CONNECTION
+                    && p.elements.iter().any(|el| {
+                        el.name == "CONNECT" && matches!(el.value, IndiValue::Switch(true))
+                    })
+            });
+            if connected {
+                ui.label(egui::RichText::new("● connected")
+                    .color(egui::Color32::from_rgb(34, 197, 94)).small());
+                if ui.small_button("Disconnect").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::SetSwitch {
+                        device: device.clone(),
+                        property: indi_camera::PROP_CONNECTION.to_string(),
+                        values: vec![("CONNECT".into(), false), ("DISCONNECT".into(), true)],
+                    });
+                }
+            } else if ui.small_button("Connect").clicked() {
+                let _ = handle.cmd_tx.send(IndiCmd::Connect { device: device.clone() });
+                let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                    device: device.clone(), mode: BlobMode::Also,
+                });
+            }
+        });
+
+        // Capture block — INDI exposures are one-shot; Live re-triggers on
+        // each received frame.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Exposure (s)").color(pal.text_secondary));
+            ui.add(egui::DragValue::new(exposure_s).speed(0.1).range(0.001..=3600.0));
+            if *live {
+                if ui.button("Stop Live").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::StopLive);
+                    *live = false;
+                }
+            } else {
+                if ui.button("Single").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                        device: device.clone(), mode: BlobMode::Also,
+                    });
+                    let _ = handle.cmd_tx.send(IndiCmd::StartExposure {
+                        device: device.clone(), seconds: *exposure_s, live: false,
+                    });
+                }
+                if ui.button("Live").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                        device: device.clone(), mode: BlobMode::Also,
+                    });
+                    let _ = handle.cmd_tx.send(IndiCmd::StartExposure {
+                        device: device.clone(), seconds: *exposure_s, live: true,
+                    });
+                    *live = true;
+                }
+            }
+            let exposing = props.iter().any(|p| {
+                p.device == *device
+                    && p.name == indi_camera::PROP_EXPOSURE
+                    && p.state == PropState::Busy
+            });
+            if exposing {
+                ui.label(egui::RichText::new("exposing…").color(pal.accent).small());
+            }
+        });
+
+        // Property groups (CONNECTION is handled by the device row above).
+        let matches = |p: &IndiProperty| {
+            !filtering
+                || p.label.to_lowercase().contains(&filter)
+                || p.name.to_lowercase().contains(&filter)
+                || p.elements.iter().any(|el| el.label.to_lowercase().contains(&filter))
+        };
+        let mut groups: Vec<String> = Vec::new();
+        for p in props.iter().filter(|p| p.device == *device) {
+            if !groups.contains(&p.group) { groups.push(p.group.clone()); }
+        }
+
+        for group in &groups {
+            if !props.iter().any(|p| {
+                p.device == *device && &p.group == group
+                    && p.name != indi_camera::PROP_CONNECTION && matches(p)
+            }) {
+                continue;
+            }
+            ui.add_space(2.0);
+            let title = if group.is_empty() { "Other" } else { group.as_str() };
+            let mut header = egui::CollapsingHeader::new(
+                egui::RichText::new(title).strong().color(pal.accent),
+            )
+            .default_open(group.contains("Main"));
+            if filtering {
+                header = header.open(Some(true)); // reveal matches; reverts when cleared
+            }
+            header.show(ui, |ui| {
+                egui::Grid::new(format!("indi_prop_{group}"))
+                    .num_columns(3)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        for prop in props.iter_mut().filter(|p| {
+                            p.device == *device && &p.group == group
+                                && p.name != indi_camera::PROP_CONNECTION
+                        }) {
+                            if !matches(prop) { continue }
+                            indi_property_rows(ui, prop, &handle.cmd_tx, &pal);
+                        }
+                    });
+            });
+        }
+    }
+
     #[cfg(feature = "svbony")]
     fn draw_control(
         ui: &mut egui::Ui,
@@ -3411,7 +3716,7 @@ fn gev_category_default_open(cat: &str) -> bool {
 
 /// Format a GenICam float for telemetry display: integers plain, otherwise
 /// precision scaled to magnitude.
-#[cfg(feature = "gev")]
+#[cfg(any(feature = "gev", feature = "indi"))]
 fn fmt_gev_float(v: f64) -> String {
     let a = v.abs();
     if v == v.trunc() && a < 1e7 {
@@ -3423,6 +3728,200 @@ fn fmt_gev_float(v: f64) -> String {
     } else {
         format!("{v:.5}")
     }
+}
+
+/// Render the grid rows for one INDI property vector (label | widget | state).
+/// Numbers and text commit the *whole* vector at end-of-edit — INDI expects
+/// full-vector writes, and per-tick sends would spam the wire. Switches send
+/// immediately; a OneOfMany switch vector renders as a single combo row.
+#[cfg(feature = "indi")]
+fn indi_property_rows(
+    ui: &mut egui::Ui,
+    prop: &mut indi_camera::IndiProperty,
+    cmd_tx: &Sender<indi_camera::IndiCmd>,
+    pal: &widgets::Palette,
+) {
+    use indi_camera::{IndiCmd, IndiValue, PropPerm, PropState, SwitchRule};
+
+    let writable = prop.perm != PropPerm::Ro;
+    let state_dot = |ui: &mut egui::Ui, state: PropState| {
+        let (color, name) = match state {
+            PropState::Idle => (pal.text_secondary, "idle"),
+            PropState::Ok => (egui::Color32::from_rgb(34, 197, 94), "ok"),
+            PropState::Busy => (egui::Color32::from_rgb(245, 158, 11), "busy"),
+            PropState::Alert => (egui::Color32::from_rgb(239, 68, 68), "alert"),
+        };
+        ui.label(egui::RichText::new("●").color(color).small()).on_hover_text(name);
+    };
+    let ro_text = |ui: &mut egui::Ui, text: String| {
+        ui.label(egui::RichText::new(text).monospace().color(pal.text_primary));
+    };
+
+    // Vectors are homogeneous by protocol; the first element sets the type.
+    let Some(first) = prop.elements.first() else { return };
+
+    // OneOfMany switch vectors are radio groups → single combo row.
+    if matches!(first.value, IndiValue::Switch(_)) && prop.rule == Some(SwitchRule::OneOfMany) {
+        ui.label(egui::RichText::new(&prop.label).color(pal.text_secondary))
+            .on_hover_text(&prop.name);
+        let on_idx = prop.elements.iter()
+            .position(|el| matches!(el.value, IndiValue::Switch(true)));
+        let cur = on_idx.map(|i| prop.elements[i].label.clone()).unwrap_or_default();
+        if writable {
+            let mut pick: Option<usize> = None;
+            egui::ComboBox::from_id_salt(("indi_sw", &prop.device, &prop.name))
+                .selected_text(cur)
+                .show_ui(ui, |ui| {
+                    for (i, el) in prop.elements.iter().enumerate() {
+                        if ui.selectable_label(Some(i) == on_idx, &el.label).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = pick {
+                for (j, el) in prop.elements.iter_mut().enumerate() {
+                    el.value = IndiValue::Switch(i == j);
+                }
+                let _ = cmd_tx.send(IndiCmd::SetSwitch {
+                    device: prop.device.clone(),
+                    property: prop.name.clone(),
+                    values: indi_switch_payload(prop),
+                });
+            }
+        } else {
+            ro_text(ui, cur);
+        }
+        state_dot(ui, prop.state);
+        ui.end_row();
+        return;
+    }
+
+    let n = prop.elements.len();
+    let (pdev, pname, plabel, pstate) =
+        (prop.device.clone(), prop.name.clone(), prop.label.clone(), prop.state);
+    let mut commit_numbers = false;
+    let mut commit_texts = false;
+    let mut commit_switches = false;
+
+    for idx in 0..n {
+        let el_label = {
+            let el = &prop.elements[idx];
+            if n == 1 || el.label == plabel {
+                plabel.clone()
+            } else {
+                format!("{} · {}", plabel, el.label)
+            }
+        };
+        let hover = format!("{}.{}", pname, prop.elements[idx].name);
+        ui.label(egui::RichText::new(el_label).color(pal.text_secondary)).on_hover_text(hover);
+
+        let el = &mut prop.elements[idx];
+        match &mut el.value {
+            IndiValue::Number { value, min, max, step, .. } => {
+                if writable {
+                    let id = egui::Id::new(("indi_num", &pdev, &pname, &el.name));
+                    let speed = if *step > 0.0 {
+                        *step
+                    } else if *max > *min {
+                        (*max - *min) / 1000.0
+                    } else {
+                        0.1
+                    };
+                    let mut dv = egui::DragValue::new(value).speed(speed);
+                    if *max > *min { dv = dv.range(*min..=*max); }
+                    let r = ui.add(dv);
+                    let mut dirty: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+                    dirty |= r.changed();
+                    let active = r.dragged() || r.has_focus();
+                    if dirty && !active {
+                        commit_numbers = true;
+                        dirty = false;
+                    }
+                    ui.data_mut(|d| d.insert_temp(id, dirty));
+                } else {
+                    ro_text(ui, fmt_gev_float(*value));
+                }
+            }
+            IndiValue::Switch(on) => {
+                if writable {
+                    let mut v = *on;
+                    if ui.add(egui::Checkbox::new(&mut v, "")).changed() {
+                        *on = v;
+                        commit_switches = true;
+                    }
+                } else {
+                    ro_text(ui, if *on { "On".into() } else { "Off".into() });
+                }
+            }
+            IndiValue::Text(t) => {
+                if writable {
+                    // Edit a temp buffer while focused; commit on Enter so
+                    // half-typed values never hit the wire.
+                    let id = egui::Id::new(("indi_text", &pdev, &pname, &el.name));
+                    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| t.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0));
+                    if r.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && buf != *t {
+                            *t = buf;
+                            commit_texts = true;
+                        }
+                        ui.data_mut(|d| d.remove::<String>(id));
+                    } else if r.has_focus() {
+                        ui.data_mut(|d| d.insert_temp(id, buf));
+                    }
+                } else {
+                    ro_text(ui, t.clone());
+                }
+            }
+            IndiValue::Light(s) => state_dot(ui, *s),
+            IndiValue::Blob { format, size } => {
+                let text = if *size > 0 {
+                    format!("{} ({} bytes)", format, size)
+                } else if format.is_empty() {
+                    "—".to_string()
+                } else {
+                    format.clone()
+                };
+                ro_text(ui, text);
+            }
+        }
+        if idx == 0 { state_dot(ui, pstate); } else { ui.label(""); }
+        ui.end_row();
+    }
+
+    if commit_numbers {
+        let values = prop.elements.iter().filter_map(|el| match el.value {
+            IndiValue::Number { value, .. } => Some((el.name.clone(), value)),
+            _ => None,
+        }).collect();
+        let _ = cmd_tx.send(IndiCmd::SetNumber {
+            device: pdev.clone(), property: pname.clone(), values,
+        });
+    }
+    if commit_texts {
+        let values = prop.elements.iter().filter_map(|el| match &el.value {
+            IndiValue::Text(t) => Some((el.name.clone(), t.clone())),
+            _ => None,
+        }).collect();
+        let _ = cmd_tx.send(IndiCmd::SetText {
+            device: pdev.clone(), property: pname.clone(), values,
+        });
+    }
+    if commit_switches {
+        let _ = cmd_tx.send(IndiCmd::SetSwitch {
+            device: pdev, property: pname, values: indi_switch_payload(prop),
+        });
+    }
+}
+
+/// All switch elements of a property as (name, on) pairs — INDI switch writes
+/// send the full vector so the driver can apply its rule atomically.
+#[cfg(feature = "indi")]
+fn indi_switch_payload(prop: &indi_camera::IndiProperty) -> Vec<(String, bool)> {
+    prop.elements.iter().filter_map(|el| match el.value {
+        indi_camera::IndiValue::Switch(on) => Some((el.name.clone(), on)),
+        _ => None,
+    }).collect()
 }
 
 #[cfg(feature = "svbony")]
@@ -3861,13 +4360,13 @@ impl eframe::App for ViewerApp {
                         match self.bottom_tab {
                             BottomTab::Histogram => self.histogram_content(ui),
                             BottomTab::Controls => {
-                                #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+                                #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
                                 {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
                                         self.controls_content(ui);
                                     });
                                 }
-                                #[cfg(not(any(feature = "svbony", feature = "gev", feature = "toupcam")))]
+                                #[cfg(not(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi")))]
                                 ui.label("Camera support not compiled in");
                             }
                             #[cfg(feature = "starsolve")]
@@ -4244,7 +4743,8 @@ fn main() -> Result<()> {
              \x20 file:<path>      FITS file\n\
              \x20 toupcam:<id>     ToupTek camera (requires the `toupcam` feature)\n\
              \x20 svb:<id>         SVBony camera (requires the `svbony` feature)\n\
-             \x20 gev:<ip-or-id>   GigE Vision camera (requires the `gev` feature)\n\n\
+             \x20 gev:<ip-or-id>   GigE Vision camera (requires the `gev` feature)\n\
+             \x20 indi:<host[:port]>  INDI/INDIGO server (requires the `indi` feature)\n\n\
              With no SOURCE, the viewer reconnects to the last source used\n\
              (remembered across runs); if there is none, it starts idle —\n\
              pick a source from the Source menu."

@@ -16,13 +16,6 @@
 //!   property store, decodes BLOBs, and pushes property snapshots to the UI.
 //! - `IndiCmd::Stop` shuts down the socket, which unblocks the reader.
 //!
-//! UI integration (not yet wired — next steps):
-//! - `CameraSource::Indi(host)` + `CaptureState::Indi { handle }` in main.rs
-//! - Side panel: host:port field + Connect, device picker from snapshots
-//! - Controls tab: render `IndiProperty` list generically (the GevControl
-//!   pattern), special-casing CONNECTION, CCD_EXPOSURE, and CCD_GAIN
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use quick_xml::events::{BytesStart, Event};
@@ -87,7 +80,16 @@ impl SwitchRule {
 /// One element (member) of a property vector.
 #[derive(Clone, Debug)]
 pub enum IndiValue {
-    Number { value: f64, min: f64, max: f64, step: f64, format: String },
+    Number {
+        value: f64,
+        min: f64,
+        max: f64,
+        step: f64,
+        /// printf-style display format from the driver (may be sexagesimal,
+        /// e.g. "%10.6m"); kept for future formatted display.
+        #[allow(dead_code)]
+        format: String,
+    },
     Switch(bool),
     Text(String),
     Light(PropState),
@@ -120,6 +122,7 @@ pub struct IndiProperty {
 // ── Commands (UI thread → writer thread) ────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Never/Only are part of the protocol even if the UI only uses Also
 pub enum BlobMode { Never, Also, Only }
 
 impl BlobMode {
@@ -680,7 +683,9 @@ fn parse_indi_number(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_indi_number;
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
 
     #[test]
     fn numbers() {
@@ -688,5 +693,104 @@ mod tests {
         assert_eq!(parse_indi_number("-12:30"), Some(-12.5));
         assert_eq!(parse_indi_number("12 30 36"), Some(12.51));
         assert_eq!(parse_indi_number(""), None);
+    }
+
+    /// 80-char FITS header card.
+    fn card(s: &str) -> Vec<u8> {
+        let mut c = s.as_bytes().to_vec();
+        c.resize(80, b' ');
+        c
+    }
+
+    /// Minimal valid FITS: 4x4 image, 16-bit, values 100..=115.
+    fn tiny_fits() -> Vec<u8> {
+        let mut fits = Vec::new();
+        for s in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                   16",
+            "NAXIS   =                    2",
+            "NAXIS1  =                    4",
+            "NAXIS2  =                    4",
+            "END",
+        ] {
+            fits.extend(card(s));
+        }
+        fits.resize(2880, b' ');
+        for i in 0..16i16 {
+            fits.extend((100 + i).to_be_bytes());
+        }
+        fits.resize(2880 * 2, 0);
+        fits
+    }
+
+    /// End-to-end against a fake in-process INDI server: property definitions
+    /// land in the snapshot channel, and a FITS BLOB decodes to a FrameData.
+    #[test]
+    fn client_receives_props_and_frame() {
+        use base64::Engine;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Consume the client's getProperties before pushing.
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+
+            let blob = base64::engine::general_purpose::STANDARD.encode(tiny_fits());
+            let xml = format!(
+                concat!(
+                    "<defSwitchVector device=\"Test CCD\" name=\"CONNECTION\" ",
+                    "label=\"Connection\" group=\"Main Control\" state=\"Idle\" ",
+                    "perm=\"rw\" rule=\"OneOfMany\">\n",
+                    "  <defSwitch name=\"CONNECT\" label=\"Connect\">Off</defSwitch>\n",
+                    "  <defSwitch name=\"DISCONNECT\" label=\"Disconnect\">On</defSwitch>\n",
+                    "</defSwitchVector>\n",
+                    "<defNumberVector device=\"Test CCD\" name=\"CCD_EXPOSURE\" ",
+                    "label=\"Expose\" group=\"Main Control\" state=\"Idle\" perm=\"rw\">\n",
+                    "  <defNumber name=\"CCD_EXPOSURE_VALUE\" label=\"Duration (s)\" ",
+                    "format=\"%5.2f\" min=\"0\" max=\"3600\" step=\"0.1\">1.0</defNumber>\n",
+                    "</defNumberVector>\n",
+                    "<setBLOBVector device=\"Test CCD\" name=\"CCD1\" state=\"Ok\">\n",
+                    "  <oneBLOB name=\"CCD1\" size=\"{}\" format=\".fits\">{}</oneBLOB>\n",
+                    "</setBLOBVector>\n",
+                ),
+                blob.len(),
+                blob
+            );
+            sock.write_all(xml.as_bytes()).unwrap();
+            // Hold the connection open until the client shuts it down.
+            while sock.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+
+        let (frame_tx, frame_rx) = bounded(4);
+        let (log_tx, _log_rx) = bounded(64);
+        let mut handle = start_client("127.0.0.1", port, frame_tx, log_tx).unwrap();
+
+        // Property snapshots: wait until both definitions have arrived.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut props = Vec::new();
+        while props.len() < 2 && std::time::Instant::now() < deadline {
+            props = handle.props_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let conn = props.iter().find(|p| p.name == "CONNECTION").unwrap();
+        assert_eq!(conn.device, "Test CCD");
+        assert_eq!(conn.rule, Some(SwitchRule::OneOfMany));
+        assert!(conn.elements.iter().any(|el| {
+            el.name == "DISCONNECT" && matches!(el.value, IndiValue::Switch(true))
+        }));
+        let exp = props.iter().find(|p| p.name == "CCD_EXPOSURE").unwrap();
+        assert!(matches!(exp.elements[0].value,
+            IndiValue::Number { value, max, .. } if value == 1.0 && max == 3600.0));
+
+        // BLOB → FrameData.
+        let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((frame.width, frame.height), (4, 4));
+        assert_eq!(frame.mono[0], 100.0);
+        assert_eq!(frame.mono[15], 115.0);
+
+        handle.stop();
+        server.join().unwrap();
     }
 }

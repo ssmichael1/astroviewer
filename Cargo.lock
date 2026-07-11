@@ -4133,6 +4133,8 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 [[package]]
 name = "toupcam"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ce721df7a6637c340efa1ff8976f88c07d40ee17b3ce04f16904c65d130e49c"
 dependencies = [
  "image",
  "thiserror 2.0.18",
@@ -4142,6 +4144,8 @@ dependencies = [
 [[package]]
 name = "toupcam-sys"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f79eaff4d997344f474f6c4bf714113c31fe36c532ddb59bcc41262182c21bb2"
 
 [[package]]
 name = "tracing"

@@ -1,0 +1,7 @@
+# Vendor SDK locations for the optional camera backends. Relative paths are
+# resolved against this project's root, so the expected layout is sibling
+# checkouts: ~/Projects/{astroviewer, toupcamsdk, SVBCameraSDK}. Override by
+# exporting the variable before building.
+[env]
+TOUPCAM_SDK_PATH = { value = "../toupcamsdk", relative = true }
+SVBCAMERA_SDK_PATH = { value = "../SVBCameraSDK", relative = true }

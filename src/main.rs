@@ -431,6 +431,9 @@ struct ViewerApp {
     capture_running: bool,
     recording: bool,
     rec_tx: Option<Sender<RecordMsg>>,
+    /// Recording writer thread; joined on stop/exit so the file is always
+    /// fully flushed before the process can go away.
+    rec_join: Option<thread::JoinHandle<()>>,
     rec_filename: String,
     rec_frame_count: u32,
 
@@ -671,6 +674,7 @@ impl ViewerApp {
             camera_source, capture_state, capture_running,
             recording: false,
             rec_tx: None,
+            rec_join: None,
             rec_filename: String::new(),
             rec_frame_count: 0,
             fits_fps: Arc::new(AtomicU32::new(10)),
@@ -1084,19 +1088,47 @@ impl ViewerApp {
             _ => Some(self.source_label()),
         };
 
-        thread::spawn(move || {
+        let join = thread::spawn(move || {
             use fitskit::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
+            use std::io::Write;
 
-            let mut fits = FitsFile::with_empty_primary();
-            fits.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
+            // Stream each HDU to disk as its frame arrives (a FITS file is a
+            // plain concatenation of HDUs). This keeps memory flat regardless
+            // of recording length and means the data is on disk continuously —
+            // the old accumulate-then-write design held gigabytes in RAM and
+            // wrote them only at Stop, so quitting during that final write
+            // truncated the file.
+            let file = match std::fs::File::create(&filepath) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = log_tx.send(LogEntry::error(format!("Failed to create {}: {}", fname, e)));
+                    // Drain until Stop so senders don't block on a full channel.
+                    while let Ok(msg) = rx.recv() {
+                        if matches!(msg, RecordMsg::Stop) { break; }
+                    }
+                    return;
+                }
+            };
+            let mut writer = std::io::BufWriter::new(file);
+
+            let mut primary = FitsFile::with_empty_primary();
+            primary.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
             if let Some(name) = instrume {
-                fits.primary_mut().header.set("INSTRUME", HeaderValue::String(name), Some("camera"));
+                primary.primary_mut().header.set("INSTRUME", HeaderValue::String(name), Some("camera"));
             }
+            // After the first error, keep draining frames (so the UI thread's
+            // sends don't back up) but stop writing; the error is reported at
+            // Stop.
+            let mut write_err: Option<String> =
+                primary.primary().write_to(&mut writer).err().map(|e| e.to_string());
             let mut frame_count: u32 = 0;
 
             while let Ok(msg) = rx.recv() {
                 match msg {
                     RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp } => {
+                        if write_err.is_some() {
+                            continue;
+                        }
                         // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
                         let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
                             let clamped = v.clamp(0.0, 65535.0) as u16;
@@ -1132,32 +1164,45 @@ impl ViewerApp {
                         if let Some(t) = set_temp {
                             hdu.header.set("SET-TEMP", HeaderValue::Float(t), Some("cooler setpoint (C)"));
                         }
-                        fits.push_extension(hdu);
-                        frame_count += 1;
+                        match hdu.write_to(&mut writer) {
+                            Ok(()) => frame_count += 1,
+                            Err(e) => write_err = Some(e.to_string()),
+                        }
                     }
                     RecordMsg::Stop => break,
                 }
             }
 
-            // Write file
-            if frame_count > 0 {
-                match fits.to_file(&filepath) {
-                    Ok(_) => {
-                        let _ = log_tx.send(LogEntry::info(
-                            format!("Recording saved: {} ({} frames)", fname, frame_count)
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = log_tx.send(LogEntry::error(
-                            format!("Failed to write {}: {}", fname, e)
-                        ));
-                    }
+            // Flush the buffered tail and force it to disk before claiming
+            // success — BufWriter's Drop silently ignores flush errors.
+            if write_err.is_none() {
+                let finished = writer
+                    .flush()
+                    .and_then(|()| writer.into_inner().map_err(|e| e.into_error())?.sync_all());
+                if let Err(e) = finished {
+                    write_err = Some(e.to_string());
                 }
-            } else {
-                let _ = log_tx.send(LogEntry::info("Recording cancelled (no frames)".to_string()));
+            }
+
+            match write_err {
+                Some(e) => {
+                    let _ = log_tx.send(LogEntry::error(
+                        format!("Failed to write {}: {} ({} frames written)", fname, e, frame_count)
+                    ));
+                }
+                None if frame_count > 0 => {
+                    let _ = log_tx.send(LogEntry::info(
+                        format!("Recording saved: {} ({} frames)", fname, frame_count)
+                    ));
+                }
+                None => {
+                    let _ = std::fs::remove_file(&filepath);
+                    let _ = log_tx.send(LogEntry::info("Recording cancelled (no frames)".to_string()));
+                }
             }
         });
 
+        self.rec_join = Some(join);
         self.rec_tx = Some(tx);
         self.rec_filename = filename.clone();
         self.rec_frame_count = 0;
@@ -1168,6 +1213,12 @@ impl ViewerApp {
     fn stop_recording(&mut self) {
         if let Some(tx) = self.rec_tx.take() {
             let _ = tx.send(RecordMsg::Stop);
+        }
+        // Wait for the writer to drain the queue, flush, and fsync — the
+        // "Recording saved" log line arrives only once the data is on disk,
+        // and quitting right after Stop can no longer truncate the file.
+        if let Some(jh) = self.rec_join.take() {
+            let _ = jh.join();
         }
         self.recording = false;
         self.add_log(LogEntry::info(format!(
@@ -4003,6 +4054,11 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str, pal: 
 
 impl eframe::App for ViewerApp {
     fn on_exit(&mut self) {
+        // Finish any in-flight recording first: the writer thread is joined
+        // so the FITS file is flushed and closed before the process exits.
+        if self.rec_tx.is_some() || self.rec_join.is_some() {
+            self.stop_recording();
+        }
         self.stop_capture();
         #[cfg(feature = "starsolve")]
         self.save_config();

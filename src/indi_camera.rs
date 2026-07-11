@@ -10,6 +10,20 @@
 //! - INDI CCDs are one-shot: write CCD_EXPOSURE, wait for the BLOB. "Live view"
 //!   is implemented here by re-triggering the exposure when each BLOB lands.
 //!
+//! INDIGO (indigo-astronomy.org) servers speak a backward-compatible
+//! extension of the same protocol. The client offers it in the handshake
+//! (`<getProperties version='1.7' switch='2.0'/>`); a legacy INDI server
+//! ignores the extra attribute, an INDIGO server replies
+//! `<switchProtocol version='2.0'/>`. Once negotiated:
+//! - BLOBs are requested in `URL` mode: `setBLOBVector` then carries a
+//!   `url`/`path` attribute and the frame is fetched as *raw binary* over
+//!   HTTP from the server — no base64 (skips the 33 % size overhead and the
+//!   encode/decode passes on both ends, which is what makes INDIGO framing
+//!   faster than classic INDI).
+//! - Well-known item names switch to the INDIGO dialect
+//!   (`CCD_EXPOSURE.EXPOSURE` instead of `CCD_EXPOSURE.CCD_EXPOSURE_VALUE`,
+//!   `CONNECTION.CONNECTED` instead of `CONNECTION.CONNECT`).
+//!
 //! Threading (mirrors `gev_camera`):
 //! - A *writer* thread owns the command channel and serializes `IndiCmd` → XML.
 //! - A *reader* thread blocks on the socket, parses elements, maintains the
@@ -33,6 +47,17 @@ pub const DEFAULT_PORT: u16 = 7624;
 pub const PROP_CONNECTION: &str = "CONNECTION";
 pub const PROP_EXPOSURE: &str = "CCD_EXPOSURE";
 pub const ELEM_EXPOSURE: &str = "CCD_EXPOSURE_VALUE";
+
+/// The exposure item name in the negotiated dialect (INDIGO renames the
+/// well-known items; property names are unchanged).
+fn exposure_item(indigo: bool) -> &'static str {
+    if indigo { "EXPOSURE" } else { ELEM_EXPOSURE }
+}
+
+/// `(connect, disconnect)` item names in the negotiated dialect.
+fn connection_items(indigo: bool) -> (&'static str, &'static str) {
+    if indigo { ("CONNECTED", "DISCONNECTED") } else { ("CONNECT", "DISCONNECT") }
+}
 
 // ── Protocol model ──────────────────────────────────────────────────────────
 
@@ -186,6 +211,8 @@ struct SharedState {
     live: AtomicBool,
     exposure_s: Mutex<f64>,
     live_device: Mutex<String>,
+    /// Server accepted the INDIGO 2.0 protocol extension (see module docs).
+    indigo: AtomicBool,
 }
 
 // ── Client startup ──────────────────────────────────────────────────────────
@@ -202,7 +229,10 @@ pub fn start_client(
     stream.set_nodelay(true).ok();
 
     let mut write_stream = stream.try_clone()?;
-    write_stream.write_all(b"<getProperties version=\"1.7\"/>\n")?;
+    // Offer the INDIGO protocol extension; legacy INDI servers ignore the
+    // extra attributes, INDIGO replies <switchProtocol version='2.0'/>.
+    write_stream
+        .write_all(b"<getProperties version=\"1.7\" client=\"AstroViewer\" switch=\"2.0\"/>\n")?;
 
     let (cmd_tx, cmd_rx) = bounded::<IndiCmd>(32);
     let (props_tx, props_rx) = bounded::<Vec<IndiProperty>>(4);
@@ -210,7 +240,10 @@ pub fn start_client(
         live: AtomicBool::new(false),
         exposure_s: Mutex::new(1.0),
         live_device: Mutex::new(String::new()),
+        indigo: AtomicBool::new(false),
     });
+    // Kept for resolving INDIGO's server-relative BLOB paths ("/blob/…").
+    let server_addr = format!("{host}:{port}");
 
     let writer_jh = {
         let shared = shared.clone();
@@ -221,7 +254,7 @@ pub fn start_client(
         let shared = shared.clone();
         let cmd_tx = cmd_tx.clone();
         std::thread::spawn(move || {
-            reader_loop(stream, frame_tx, props_tx, cmd_tx, shared, log_tx)
+            reader_loop(stream, server_addr, frame_tx, props_tx, cmd_tx, shared, log_tx)
         })
     };
 
@@ -266,31 +299,47 @@ fn writer_loop(
             IndiCmd::SetText { device, property, values } => {
                 write_new_vector(&mut stream, "Text", &device, &property, &values)
             }
-            IndiCmd::EnableBlob { device, mode } => stream.write_all(
-                format!(
-                    "<enableBLOB device=\"{}\">{}</enableBLOB>\n",
-                    xml_escape(&device),
+            IndiCmd::EnableBlob { device, mode } => {
+                // On INDIGO, upgrade any BLOB opt-in to URL mode: frames are
+                // then fetched as raw binary over HTTP instead of inline
+                // base64 (see module docs).
+                let mode_text = if mode != BlobMode::Never
+                    && shared.indigo.load(Ordering::Relaxed)
+                {
+                    "URL"
+                } else {
                     mode.as_str()
+                };
+                stream.write_all(
+                    format!(
+                        "<enableBLOB device=\"{}\">{}</enableBLOB>\n",
+                        xml_escape(&device),
+                        mode_text
+                    )
+                    .as_bytes(),
                 )
-                .as_bytes(),
-            ),
-            IndiCmd::Connect { device } => write_new_vector(
-                &mut stream,
-                "Switch",
-                &device,
-                PROP_CONNECTION,
-                &[("CONNECT".to_string(), "On".to_string())],
-            ),
+            }
+            IndiCmd::Connect { device } => {
+                let (connect, _) = connection_items(shared.indigo.load(Ordering::Relaxed));
+                write_new_vector(
+                    &mut stream,
+                    "Switch",
+                    &device,
+                    PROP_CONNECTION,
+                    &[(connect.to_string(), "On".to_string())],
+                )
+            }
             IndiCmd::StartExposure { device, seconds, live } => {
                 *shared.exposure_s.lock().unwrap() = seconds;
                 *shared.live_device.lock().unwrap() = device.clone();
                 shared.live.store(live, Ordering::Relaxed);
+                let item = exposure_item(shared.indigo.load(Ordering::Relaxed));
                 write_new_vector(
                     &mut stream,
                     "Number",
                     &device,
                     PROP_EXPOSURE,
-                    &[(ELEM_EXPOSURE.to_string(), format!("{seconds}"))],
+                    &[(item.to_string(), format!("{seconds}"))],
                 )
             }
             IndiCmd::StopLive => {
@@ -349,6 +398,7 @@ struct RawChild {
 
 fn reader_loop(
     stream: TcpStream,
+    server_addr: String,
     frame_tx: Sender<super::FrameData>,
     props_tx: Sender<Vec<IndiProperty>>,
     cmd_tx: Sender<IndiCmd>,
@@ -376,16 +426,16 @@ fn reader_loop(
                     }
                 };
                 handle_element(
-                    &tag, attrs, children, &mut store, &frame_tx, &props_tx, &cmd_tx,
-                    &shared, &log_tx,
+                    &tag, attrs, children, &mut store, &server_addr, &frame_tx, &props_tx,
+                    &cmd_tx, &shared, &log_tx,
                 );
             }
             Ok(Event::Empty(e)) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let attrs = attr_map(&e);
                 handle_element(
-                    &tag, attrs, Vec::new(), &mut store, &frame_tx, &props_tx, &cmd_tx,
-                    &shared, &log_tx,
+                    &tag, attrs, Vec::new(), &mut store, &server_addr, &frame_tx, &props_tx,
+                    &cmd_tx, &shared, &log_tx,
                 );
             }
             Ok(Event::Eof) => {
@@ -461,6 +511,7 @@ fn handle_element(
     attrs: HashMap<String, String>,
     children: Vec<RawChild>,
     store: &mut HashMap<(String, String), IndiProperty>,
+    server_addr: &str,
     frame_tx: &Sender<super::FrameData>,
     props_tx: &Sender<Vec<IndiProperty>>,
     cmd_tx: &Sender<IndiCmd>,
@@ -469,6 +520,13 @@ fn handle_element(
 ) {
     let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
     match tag {
+        // INDIGO accepted the 2.0 extension offered in getProperties.
+        "switchProtocol" => {
+            shared.indigo.store(true, Ordering::Relaxed);
+            let _ = log_tx.try_send(super::LogEntry::info(
+                "INDIGO protocol 2.0 negotiated — raw (non-base64) BLOB transfer enabled".into(),
+            ));
+        }
         "defNumberVector" | "defSwitchVector" | "defTextVector" | "defLightVector"
         | "defBLOBVector" => {
             let prop = IndiProperty {
@@ -493,7 +551,7 @@ fn handle_element(
             // BLOBs: decode straight to the frame channel; don't hold pixels
             // in the property store.
             for child in children.iter().filter(|c| c.tag == "oneBLOB") {
-                handle_blob(child, frame_tx, cmd_tx, shared, log_tx);
+                handle_blob(child, server_addr, frame_tx, cmd_tx, shared, log_tx);
             }
             if let Some(prop) = store.get_mut(&key) {
                 if let Some(s) = attrs.get("state") {
@@ -588,19 +646,28 @@ fn push_snapshot(
 
 fn handle_blob(
     child: &RawChild,
+    server_addr: &str,
     frame_tx: &Sender<super::FrameData>,
     cmd_tx: &Sender<IndiCmd>,
     shared: &SharedState,
     log_tx: &Sender<super::LogEntry>,
 ) {
-    let format = child.attrs.get("format").map(String::as_str).unwrap_or("");
-    if !format.contains("fits") {
-        let _ = log_tx.try_send(super::LogEntry::error(format!(
-            "INDI: unsupported BLOB format {format:?} (only FITS is handled)"
-        )));
-        return;
-    }
-    match decode_fits_blob(&child.text) {
+    // INDIGO URL mode: the element carries a `url` (absolute) or `path`
+    // (server-relative) attribute and no inline data — fetch raw binary.
+    let by_ref = child.attrs.get("url").or_else(|| child.attrs.get("path"));
+    let result = if let Some(loc) = by_ref {
+        http_fetch(server_addr, loc).and_then(|bytes| decode_fits_bytes(&bytes))
+    } else {
+        let format = child.attrs.get("format").map(String::as_str).unwrap_or("");
+        if !format.contains("fits") {
+            let _ = log_tx.try_send(super::LogEntry::error(format!(
+                "INDI: unsupported BLOB format {format:?} (only FITS is handled)"
+            )));
+            return;
+        }
+        decode_fits_blob(&child.text)
+    };
+    match result {
         Ok(frame) => {
             let _ = frame_tx.try_send(frame);
         }
@@ -612,12 +679,61 @@ fn handle_blob(
     if shared.live.load(Ordering::Relaxed) {
         let device = shared.live_device.lock().unwrap().clone();
         let seconds = *shared.exposure_s.lock().unwrap();
+        let item = exposure_item(shared.indigo.load(Ordering::Relaxed));
         let _ = cmd_tx.try_send(IndiCmd::SetNumber {
             device,
             property: PROP_EXPOSURE.to_string(),
-            values: vec![(ELEM_EXPOSURE.to_string(), seconds)],
+            values: vec![(item.to_string(), seconds)],
         });
     }
+}
+
+/// Minimal HTTP/1.1 GET returning the response body — used only to pull
+/// INDIGO BLOBs, which the server exposes at `http://host:port/blob/…`.
+/// `loc` is either an absolute `http://…` URL or a server-relative path.
+fn http_fetch(server_addr: &str, loc: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let (host_port, path) = if let Some(rest) = loc.strip_prefix("http://") {
+        match rest.split_once('/') {
+            Some((hp, p)) => (hp.to_string(), format!("/{p}")),
+            None => (rest.to_string(), "/".to_string()),
+        }
+    } else {
+        (server_addr.to_string(), loc.to_string())
+    };
+    let host_port = if host_port.contains(':') { host_port } else { format!("{host_port}:80") };
+
+    let mut stream = TcpStream::connect(&host_port)
+        .map_err(|e| anyhow!("BLOB fetch connect {host_port}: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).ok();
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let header_end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("BLOB fetch: malformed HTTP response"))?;
+    let header = String::from_utf8_lossy(&response[..header_end]).into_owned();
+    let status_ok = header.lines().next().is_some_and(|l| l.contains(" 200 "));
+    if !status_ok {
+        bail!("BLOB fetch {path}: {}", header.lines().next().unwrap_or("no status"));
+    }
+    let mut body = response.split_off(header_end + 4);
+    // Trust Content-Length when present (Connection: close bounds it anyway).
+    let content_length = header.lines().find_map(|l| {
+        l.to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    if let Some(len) = content_length {
+        body.truncate(len);
+    }
+    Ok(body)
 }
 
 /// Base64 text → FITS → mono `FrameData` (first image HDU).
@@ -626,8 +742,12 @@ fn decode_fits_blob(b64: &str) -> Result<super::FrameData> {
     // Servers wrap base64 in newlines; strip all whitespace before decoding.
     let cleaned: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let data = base64::engine::general_purpose::STANDARD.decode(&cleaned)?;
+    decode_fits_bytes(&data)
+}
 
-    let fits = fitskit::FitsFile::from_bytes(&data)?;
+/// Raw FITS bytes → mono `FrameData` (first image HDU).
+fn decode_fits_bytes(data: &[u8]) -> Result<super::FrameData> {
+    let fits = fitskit::FitsFile::from_bytes(data)?;
     for hdu in fits.iter() {
         let img = match &hdu.data {
             fitskit::HduData::Image(im) if im.axes.len() >= 2 => im,
@@ -792,5 +912,80 @@ mod tests {
 
         handle.stop();
         server.join().unwrap();
+    }
+
+    /// INDIGO variant: the server accepts the 2.0 handshake, the client
+    /// upgrades enableBLOB to URL mode, and the frame is fetched raw over
+    /// HTTP — no base64 anywhere.
+    #[test]
+    fn indigo_url_blob_roundtrip() {
+        // Mini HTTP server: one GET, replies with the FITS bytes.
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_port = http.local_addr().unwrap().port();
+        let http_thread = std::thread::spawn(move || {
+            let (mut sock, _) = http.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let body = tiny_fits();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(&body).unwrap();
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap();
+            let hello = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(hello.contains("switch=\"2.0\""), "client must offer INDIGO: {hello}");
+            // Accept the INDIGO protocol.
+            sock.write_all(b"<switchProtocol version='2.0'/>\n").unwrap();
+
+            // Wait for the client's enableBLOB — must be upgraded to URL mode.
+            let mut req = String::new();
+            while !req.contains("</enableBLOB>") && !req.contains("enableBLOB") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 { panic!("client closed before enableBLOB"); }
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            assert!(req.contains(">URL<"), "expected URL BLOB mode, got: {req}");
+
+            // Announce the frame by URL (absolute form, INDIGO style).
+            let xml = format!(
+                concat!(
+                    "<setBLOBVector device=\"Test CCD\" name=\"CCD_IMAGE\" state=\"Ok\">\n",
+                    "  <oneBLOB name=\"IMAGE\" url=\"http://127.0.0.1:{}/blob/0x1.fits?1\"/>\n",
+                    "</setBLOBVector>\n",
+                ),
+                http_port
+            );
+            sock.write_all(xml.as_bytes()).unwrap();
+            while sock.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+
+        let (frame_tx, frame_rx) = bounded(4);
+        let (log_tx, _log_rx) = bounded(64);
+        let mut handle = start_client("127.0.0.1", port, frame_tx, log_tx).unwrap();
+
+        // Give the reader a moment to process switchProtocol, then opt in.
+        std::thread::sleep(Duration::from_millis(200));
+        handle
+            .cmd_tx
+            .send(IndiCmd::EnableBlob { device: "Test CCD".into(), mode: BlobMode::Also })
+            .unwrap();
+
+        let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!((frame.width, frame.height), (4, 4));
+        assert_eq!(frame.mono[0], 100.0);
+        assert_eq!(frame.mono[15], 115.0);
+
+        handle.stop();
+        server.join().unwrap();
+        http_thread.join().unwrap();
     }
 }

@@ -81,7 +81,11 @@ impl ScaleMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistDrag { Min, Max }
 
-#[derive(Clone, PartialEq, Eq)]
+/// Identity of an input source. Every variant has a stable string form (the
+/// *descriptor*, e.g. `toupcam:<id>`, `file:<path>`) used as the CLI argument
+/// format, the persistence format, and the unified picker's key — one scheme
+/// per backend, with room for `indi://…` later.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum CameraSource {
     None,
     FitsFile(std::path::PathBuf),
@@ -92,6 +96,124 @@ enum CameraSource {
     /// ToupTek camera, identified by its opaque enumeration id.
     #[cfg(feature = "toupcam")]
     Toupcam(String),
+}
+
+impl CameraSource {
+    /// The stable string form of this source; `None` for `Self::None`.
+    fn descriptor(&self) -> Option<String> {
+        match self {
+            CameraSource::None => None,
+            CameraSource::FitsFile(p) => Some(format!("file:{}", p.display())),
+            #[cfg(feature = "svbony")]
+            CameraSource::SVBony(id) => Some(format!("svb:{}", id)),
+            #[cfg(feature = "gev")]
+            CameraSource::Gev(id) => Some(format!("gev:{}", id)),
+            #[cfg(feature = "toupcam")]
+            CameraSource::Toupcam(id) => Some(format!("toupcam:{}", id)),
+        }
+    }
+
+    /// Parse a descriptor or a bare FITS path. Schemes for backends this
+    /// binary was built without are named in the error rather than treated
+    /// as unknown.
+    fn parse_descriptor(s: &str) -> Result<CameraSource, String> {
+        let s = s.trim();
+        if let Some(path) = s.strip_prefix("file:") {
+            return Ok(CameraSource::FitsFile(path.into()));
+        }
+        if let Some(id) = s.strip_prefix("svb:") {
+            #[cfg(feature = "svbony")]
+            return id
+                .parse()
+                .map(CameraSource::SVBony)
+                .map_err(|_| format!("invalid SVBony camera id '{}'", id));
+            #[cfg(not(feature = "svbony"))]
+            {
+                let _ = id;
+                return Err("this build has no SVBony support (rebuild with --features svbony)".into());
+            }
+        }
+        if let Some(id) = s.strip_prefix("toupcam:") {
+            #[cfg(feature = "toupcam")]
+            return Ok(CameraSource::Toupcam(id.to_string()));
+            #[cfg(not(feature = "toupcam"))]
+            {
+                let _ = id;
+                return Err("this build has no ToupTek support (rebuild with --features toupcam)".into());
+            }
+        }
+        if let Some(id) = s.strip_prefix("gev:") {
+            #[cfg(feature = "gev")]
+            return Ok(CameraSource::Gev(id.to_string()));
+            #[cfg(not(feature = "gev"))]
+            {
+                let _ = id;
+                return Err("this build has no GigE support (rebuild with --features gev)".into());
+            }
+        }
+        if s.starts_with("indi:") {
+            return Err("INDI sources are not supported yet".into());
+        }
+        // A bare existing path means a FITS file (drag-onto-app, `open with`).
+        if std::path::Path::new(s).exists() {
+            return Ok(CameraSource::FitsFile(s.into()));
+        }
+        Err(format!(
+            "unrecognized source '{}' (expected a FITS path or svb:/toupcam:/gev:/file:)",
+            s
+        ))
+    }
+}
+
+#[cfg(test)]
+mod source_descriptor_tests {
+    use super::CameraSource;
+
+    #[test]
+    fn file_roundtrip() {
+        let src = CameraSource::parse_descriptor("file:/tmp/x.fits").unwrap();
+        assert_eq!(src, CameraSource::FitsFile("/tmp/x.fits".into()));
+        assert_eq!(src.descriptor().unwrap(), "file:/tmp/x.fits");
+    }
+
+    #[test]
+    fn bare_existing_path_is_fits() {
+        // Any path that exists parses as a FITS source.
+        let dir = std::env::temp_dir().join("astroviewer_desc_test.fits");
+        std::fs::write(&dir, b"x").unwrap();
+        let src = CameraSource::parse_descriptor(dir.to_str().unwrap()).unwrap();
+        assert!(matches!(src, CameraSource::FitsFile(_)));
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn none_has_no_descriptor() {
+        assert_eq!(CameraSource::None.descriptor(), None);
+    }
+
+    #[test]
+    fn unknown_and_reserved_schemes_error() {
+        assert!(CameraSource::parse_descriptor("indi://host/CCD").is_err());
+        assert!(CameraSource::parse_descriptor("bogus:thing").is_err());
+        assert!(CameraSource::parse_descriptor("/no/such/path.fits").is_err());
+    }
+
+    #[cfg(feature = "toupcam")]
+    #[test]
+    fn toupcam_roundtrip() {
+        let src = CameraSource::parse_descriptor("toupcam:abc-123").unwrap();
+        assert_eq!(src, CameraSource::Toupcam("abc-123".into()));
+        assert_eq!(src.descriptor().unwrap(), "toupcam:abc-123");
+    }
+
+    #[cfg(feature = "svbony")]
+    #[test]
+    fn svbony_roundtrip() {
+        let src = CameraSource::parse_descriptor("svb:3").unwrap();
+        assert_eq!(src, CameraSource::SVBony(3));
+        assert_eq!(src.descriptor().unwrap(), "svb:3");
+        assert!(CameraSource::parse_descriptor("svb:not-a-number").is_err());
+    }
 }
 
 enum CaptureState {
@@ -420,10 +542,8 @@ impl ViewerApp {
         let (frame_tx, frame_rx) = bounded(2);
         let (log_tx, log_rx) = bounded(64);
 
-        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
-        let mut log = vec![LogEntry::info("Viewer started".to_string())];
+        let log = vec![LogEntry::info("Viewer started".to_string())];
 
-        // Try to start with an SVBony camera if available
         #[cfg(feature = "svbony")]
         let discovered_cameras = camera::enumerate();
 
@@ -434,55 +554,13 @@ impl ViewerApp {
         let discovered_toupcam = toupcam_camera::enumerate();
 
         #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
-        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
-        let mut camera_error: Option<String> = None;
+        let camera_error: Option<String> = None;
 
-        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
-        let mut camera_source = CameraSource::None;
-        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
-        let mut capture_state = CaptureState::Stopped;
-        #[cfg_attr(not(any(feature = "svbony", feature = "toupcam")), allow(unused_mut))]
-        let mut capture_running = false;
-
-        #[cfg(feature = "svbony")]
-        if let Some(info) = discovered_cameras.first() {
-            match camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
-                Ok(handle) => {
-                    let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
-                        .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
-                        .collect();
-                    log.push(LogEntry::info(format!("Camera opened: {}", info.name)));
-                    camera_source = CameraSource::SVBony(info.camera_id);
-                    capture_state = CaptureState::SVBony { handle, control_values };
-                    capture_running = true;
-                }
-                Err(e) => {
-                    let msg = format!("Failed to open camera: {}", e);
-                    log.push(LogEntry::error(msg.clone()));
-                    camera_error = Some(msg);
-                }
-            }
-        }
-
-        // Fall back to the first ToupTek camera if nothing is streaming yet.
-        #[cfg(feature = "toupcam")]
-        if !capture_running {
-            if let Some(info) = discovered_toupcam.first() {
-                match toupcam_camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
-                    Ok((handle, controls)) => {
-                        log.push(LogEntry::info(format!("Camera opened: {}", info.display_name)));
-                        camera_source = CameraSource::Toupcam(info.id.clone());
-                        capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
-                        capture_running = true;
-                    }
-                    Err(e) => {
-                        let msg = format!("Failed to open camera: {}", e);
-                        log.push(LogEntry::error(msg.clone()));
-                        camera_error = Some(msg);
-                    }
-                }
-            }
-        }
+        // The app is built idle; the startup source (CLI argument or the
+        // remembered last source) is opened after construction, below.
+        let camera_source = CameraSource::None;
+        let capture_state = CaptureState::Stopped;
+        let capture_running = false;
 
         let ui_theme = widgets::UiTheme::Dark;
 
@@ -569,6 +647,27 @@ impl ViewerApp {
 
         #[cfg(feature = "starsolve")]
         app.load_config();
+
+        // Startup source precedence: an explicit CLI descriptor (or bare FITS
+        // path) wins; otherwise reconnect to the last source used; otherwise
+        // stay idle and let the user pick from the Source menu.
+        if let Some(arg) = std::env::args().nth(1) {
+            match CameraSource::parse_descriptor(&arg) {
+                Ok(src) => app.open_source(src),
+                Err(e) => app.add_log(LogEntry::error(format!("Command-line source: {}", e))),
+            }
+        } else if let Ok(desc) = std::fs::read_to_string(Self::last_source_path()) {
+            let desc = desc.trim();
+            if !desc.is_empty() {
+                match CameraSource::parse_descriptor(desc) {
+                    Ok(src) => {
+                        app.add_log(LogEntry::info(format!("Reconnecting to last source: {}", desc)));
+                        app.open_source(src);
+                    }
+                    Err(e) => app.add_log(LogEntry::error(format!("Remembered source: {}", e))),
+                }
+            }
+        }
 
         app
     }
@@ -1170,6 +1269,7 @@ impl ViewerApp {
                         start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps.clone());
                         self.capture_state = CaptureState::Fits { _stop_tx: stop_tx };
                         self.capture_running = true;
+                        self.persist_last_source();
                         self.add_log(LogEntry::info(format!(
                             "FITS: {} ({}x{}, {}-bit, {} frames)",
                             path.file_name().unwrap_or_default().to_string_lossy(), w, h, bd, nframes
@@ -1228,6 +1328,7 @@ impl ViewerApp {
                 self.capture_state = CaptureState::SVBony { handle, control_values };
                 self.camera_source = CameraSource::SVBony(camera_id);
                 self.capture_running = true;
+                self.persist_last_source();
             }
             Err(e) => {
                 let msg = format!("Failed to open camera: {}", e);
@@ -1249,6 +1350,7 @@ impl ViewerApp {
                 self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
                 self.camera_source = CameraSource::Toupcam(id);
                 self.capture_running = true;
+                self.persist_last_source();
             }
             Err(e) => {
                 let msg = format!("Failed to open camera: {}", e);
@@ -1271,12 +1373,136 @@ impl ViewerApp {
                 self.capture_state = CaptureState::Gev { handle, controls };
                 self.camera_source = CameraSource::Gev(id);
                 self.capture_running = true;
+                self.persist_last_source();
             }
             Err(e) => {
                 let msg = format!("Failed to open GigE camera: {}", e);
                 self.camera_error = Some(msg.clone());
                 self.add_log(LogEntry::error(msg));
             }
+        }
+    }
+
+    /// Open any source by identity — the single entry point used by the CLI
+    /// argument, last-source reconnect, and the Source menu. Cameras absent
+    /// from the discovered list trigger one re-enumeration before failing.
+    fn open_source(&mut self, source: CameraSource) {
+        match source {
+            CameraSource::None => {}
+            CameraSource::FitsFile(path) => self.start_fits(path),
+            #[cfg(feature = "svbony")]
+            CameraSource::SVBony(id) => {
+                if self.discovered_cameras.iter().all(|c| c.camera_id != id) {
+                    self.discovered_cameras = camera::enumerate();
+                }
+                match self.discovered_cameras.iter().find(|c| c.camera_id == id).cloned() {
+                    Some(info) => self.start_svbony(&info),
+                    None => self.source_not_found(format!("svb:{}", id)),
+                }
+            }
+            #[cfg(feature = "toupcam")]
+            CameraSource::Toupcam(id) => {
+                if self.discovered_toupcam.iter().all(|d| d.id != id) {
+                    self.discovered_toupcam = toupcam_camera::enumerate();
+                }
+                match self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
+                    Some(info) => self.start_toupcam(&info),
+                    None => self.source_not_found(format!("toupcam:{}", id)),
+                }
+            }
+            #[cfg(feature = "gev")]
+            CameraSource::Gev(id) => {
+                if self.discovered_gev.iter().all(|c| c.id != id) {
+                    self.discovered_gev = gev_camera::enumerate();
+                }
+                match self.discovered_gev.iter().find(|c| c.id == id).cloned() {
+                    Some(info) => self.start_gev(&info),
+                    // A raw IP works even when broadcast discovery doesn't.
+                    None => match id.parse::<std::net::Ipv4Addr>() {
+                        Ok(ip) => self.start_gev(&gev_camera::GevDeviceInfo {
+                            ip,
+                            model: String::new(),
+                            manufacturer: String::new(),
+                            id: ip.to_string(),
+                        }),
+                        Err(_) => self.source_not_found(format!("gev:{}", id)),
+                    },
+                }
+            }
+        }
+    }
+
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn source_not_found(&mut self, descriptor: String) {
+        let msg = format!("Source not found: {}", descriptor);
+        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+        {
+            self.camera_error = Some(msg.clone());
+        }
+        self.add_log(LogEntry::error(msg));
+    }
+
+    /// Re-enumerate every camera backend (the Source menu's Refresh).
+    fn refresh_sources(&mut self) {
+        #[cfg(feature = "svbony")]
+        {
+            self.discovered_cameras = camera::enumerate();
+        }
+        #[cfg(feature = "gev")]
+        {
+            self.discovered_gev = gev_camera::enumerate();
+        }
+        #[cfg(feature = "toupcam")]
+        {
+            self.discovered_toupcam = toupcam_camera::enumerate();
+        }
+    }
+
+    /// Every discovered source across all backends with kind-tagged labels —
+    /// the unified list the Source menu presents.
+    fn discovered_source_list(&self) -> Vec<(CameraSource, String)> {
+        #[cfg_attr(
+            not(any(feature = "svbony", feature = "gev", feature = "toupcam")),
+            allow(unused_mut)
+        )]
+        let mut list: Vec<(CameraSource, String)> = Vec::new();
+        #[cfg(feature = "svbony")]
+        for c in &self.discovered_cameras {
+            list.push((
+                CameraSource::SVBony(c.camera_id),
+                format!("{} ({}) — SVBony", c.name, c.serial),
+            ));
+        }
+        #[cfg(feature = "toupcam")]
+        for d in &self.discovered_toupcam {
+            list.push((
+                CameraSource::Toupcam(d.id.clone()),
+                format!("{} — ToupTek", d.display_name),
+            ));
+        }
+        #[cfg(feature = "gev")]
+        for g in &self.discovered_gev {
+            list.push((
+                CameraSource::Gev(g.id.clone()),
+                format!("{} ({}) — GigE", g.display_name(), g.ip),
+            ));
+        }
+        list
+    }
+
+    /// File remembering the last successfully opened source's descriptor.
+    fn last_source_path() -> std::path::PathBuf {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("last_source")
+    }
+
+    /// Called after each successful open so the next launch reconnects.
+    fn persist_last_source(&self) {
+        if let Some(desc) = self.camera_source.descriptor() {
+            let _ = std::fs::write(Self::last_source_path(), desc);
         }
     }
 
@@ -3419,8 +3645,11 @@ impl eframe::App for ViewerApp {
                         }
                     });
 
-                    // ── Camera ──────────────────────────────────────────
-                    ui.menu_button("Camera", |ui| {
+                    // ── Source ──────────────────────────────────────────
+                    // One flat, kind-tagged list across all camera backends;
+                    // non-enumerable sources (FITS, GigE-by-IP) have their own
+                    // entries. Everything opens through open_source().
+                    ui.menu_button("Source", |ui| {
                         if self.capture_running {
                             if ui.button("Stop").clicked() {
                                 self.stop_capture();
@@ -3428,84 +3657,34 @@ impl eframe::App for ViewerApp {
                             }
                         } else {
                             if ui.button("Play").clicked() {
-                                match &self.camera_source.clone() {
-                                    CameraSource::None => {}
-                                    CameraSource::FitsFile(path) => {
-                                        let path = path.clone();
-                                        self.start_fits(path);
-                                    }
-                                    #[cfg(feature = "svbony")]
-                                    CameraSource::SVBony(cam_id) => {
-                                        let cam_id = *cam_id;
-                                        if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
-                                            self.start_svbony(&info);
-                                        }
-                                    }
-                                    #[cfg(feature = "gev")]
-                                    CameraSource::Gev(id) => {
-                                        let id = id.clone();
-                                        if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
-                                            self.start_gev(&info);
-                                        }
-                                    }
-                                    #[cfg(feature = "toupcam")]
-                                    CameraSource::Toupcam(id) => {
-                                        let id = id.clone();
-                                        if let Some(info) = self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
-                                            self.start_toupcam(&info);
-                                        }
-                                    }
-                                }
+                                let source = self.camera_source.clone();
+                                self.open_source(source);
                                 ui.close();
                             }
                         }
-                        #[cfg(feature = "svbony")]
-                        {
-                            ui.separator();
-                            if ui.button("Refresh Cameras").clicked() {
-                                self.discovered_cameras = camera::enumerate();
-                            }
-                            for cam_info in &self.discovered_cameras.clone() {
-                                let is_this = matches!(&self.camera_source, CameraSource::SVBony(id) if *id == cam_info.camera_id);
-                                let label = format!("{} ({})", cam_info.name, cam_info.serial);
-                                if menu_radio(ui, is_this, &label) && !is_this {
-                                    self.start_svbony(cam_info);
-                                    ui.close();
-                                }
+                        ui.separator();
+                        if ui.button("Refresh Sources").clicked() {
+                            self.refresh_sources();
+                        }
+                        let sources = self.discovered_source_list();
+                        if sources.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No cameras found"));
+                        }
+                        for (source, label) in sources {
+                            let is_this = self.camera_source == source;
+                            if menu_radio(ui, is_this, &label) && !is_this {
+                                self.open_source(source);
+                                ui.close();
                             }
                         }
-                        #[cfg(feature = "gev")]
-                        {
-                            ui.separator();
-                            // To connect by IP, use the "GigE IP" field in the
-                            // side-panel Camera section (text entry inside a menu
-                            // is unreliable in egui).
-                            if ui.button("Refresh GigE Cameras").clicked() {
-                                self.discovered_gev = gev_camera::enumerate();
-                            }
-                            for gev_info in &self.discovered_gev.clone() {
-                                let is_this = matches!(&self.camera_source, CameraSource::Gev(id) if *id == gev_info.id);
-                                let label = format!("{} ({})", gev_info.display_name(), gev_info.ip);
-                                if menu_radio(ui, is_this, &label) && !is_this {
-                                    self.start_gev(gev_info);
-                                    ui.close();
-                                }
-                            }
+                        ui.separator();
+                        let dialog_pending = self.pending_fits_path.is_some();
+                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
+                            self.open_fits_dialog();
+                            ui.close();
                         }
-                        #[cfg(feature = "toupcam")]
-                        {
-                            ui.separator();
-                            if ui.button("Refresh ToupTek Cameras").clicked() {
-                                self.discovered_toupcam = toupcam_camera::enumerate();
-                            }
-                            for dev in &self.discovered_toupcam.clone() {
-                                let is_this = matches!(&self.camera_source, CameraSource::Toupcam(id) if *id == dev.id);
-                                if menu_radio(ui, is_this, &dev.display_name) && !is_this {
-                                    self.start_toupcam(dev);
-                                    ui.close();
-                                }
-                            }
-                        }
+                        // GigE-by-IP entry lives in the side panel (text entry
+                        // inside a menu is unreliable in egui).
                     });
 
                     // ── Theme ───────────────────────────────────────────
@@ -3546,34 +3725,8 @@ impl eframe::App for ViewerApp {
                             self.stop_capture();
                         }
                     } else if widgets::primary_button(ui, "\u{25B6}  Play", &pal) {
-                        match &self.camera_source.clone() {
-                            CameraSource::None => {}
-                            CameraSource::FitsFile(path) => {
-                                let path = path.clone();
-                                self.start_fits(path);
-                            }
-                            #[cfg(feature = "svbony")]
-                            CameraSource::SVBony(cam_id) => {
-                                let cam_id = *cam_id;
-                                if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
-                                    self.start_svbony(&info);
-                                }
-                            }
-                            #[cfg(feature = "gev")]
-                            CameraSource::Gev(id) => {
-                                let id = id.clone();
-                                if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
-                                    self.start_gev(&info);
-                                }
-                            }
-                            #[cfg(feature = "toupcam")]
-                            CameraSource::Toupcam(id) => {
-                                let id = id.clone();
-                                if let Some(info) = self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
-                                    self.start_toupcam(&info);
-                                }
-                            }
-                        }
+                        let source = self.camera_source.clone();
+                        self.open_source(source);
                     }
                     ui.separator();
                     // The record/stop control. Red record semantics (filled
@@ -4081,6 +4234,20 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "usage: astroviewer [SOURCE]\n\n\
+             SOURCE selects the input at startup: a FITS file path, or a descriptor\n\
+             \x20 file:<path>      FITS file\n\
+             \x20 toupcam:<id>     ToupTek camera (requires the `toupcam` feature)\n\
+             \x20 svb:<id>         SVBony camera (requires the `svbony` feature)\n\
+             \x20 gev:<ip-or-id>   GigE Vision camera (requires the `gev` feature)\n\n\
+             With no SOURCE, the viewer reconnects to the last source used\n\
+             (remembered across runs); if there is none, it starts idle —\n\
+             pick a source from the Source menu."
+        );
+        return Ok(());
+    }
     // cameleon_genapi logs an ERROR every time it constructs an error, even for
     // ones we handle (e.g. probing chunk-backed features we then skip) — keep
     // its internal logging out; failures we care about are reported by our code.

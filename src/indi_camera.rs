@@ -184,9 +184,12 @@ pub enum IndiCmd {
 /// Handle to a running INDI client. Mirrors `GevHandle`.
 pub struct IndiHandle {
     pub cmd_tx: Sender<IndiCmd>,
-    /// Full property snapshots pushed by the reader thread whenever anything
-    /// changes; the UI drains and keeps the last (same pattern as `GevHandle`).
-    pub props_rx: Receiver<Vec<IndiProperty>>,
+    /// Latest full property snapshot, replaced wholesale by the reader thread.
+    /// A mailbox slot rather than a channel: a server's initial enumeration is
+    /// a burst of hundreds of updates, and a bounded channel drops the later
+    /// (complete) snapshots once full — the UI would be stuck on a stale
+    /// early one. `take()` it each frame.
+    pub props: Arc<Mutex<Option<Vec<IndiProperty>>>>,
     reader_jh: Option<JoinHandle<()>>,
     writer_jh: Option<JoinHandle<()>>,
 }
@@ -235,7 +238,7 @@ pub fn start_client(
         .write_all(b"<getProperties version=\"1.7\" client=\"AstroViewer\" switch=\"2.0\"/>\n")?;
 
     let (cmd_tx, cmd_rx) = bounded::<IndiCmd>(32);
-    let (props_tx, props_rx) = bounded::<Vec<IndiProperty>>(4);
+    let props: Arc<Mutex<Option<Vec<IndiProperty>>>> = Arc::new(Mutex::new(None));
     let shared = Arc::new(SharedState {
         live: AtomicBool::new(false),
         exposure_s: Mutex::new(1.0),
@@ -253,14 +256,15 @@ pub fn start_client(
     let reader_jh = {
         let shared = shared.clone();
         let cmd_tx = cmd_tx.clone();
+        let props = props.clone();
         std::thread::spawn(move || {
-            reader_loop(stream, server_addr, frame_tx, props_tx, cmd_tx, shared, log_tx)
+            reader_loop(stream, server_addr, frame_tx, props, cmd_tx, shared, log_tx)
         })
     };
 
     Ok(IndiHandle {
         cmd_tx,
-        props_rx,
+        props,
         reader_jh: Some(reader_jh),
         writer_jh: Some(writer_jh),
     })
@@ -400,7 +404,7 @@ fn reader_loop(
     stream: TcpStream,
     server_addr: String,
     frame_tx: Sender<super::FrameData>,
-    props_tx: Sender<Vec<IndiProperty>>,
+    props_slot: Arc<Mutex<Option<Vec<IndiProperty>>>>,
     cmd_tx: Sender<IndiCmd>,
     shared: Arc<SharedState>,
     log_tx: Sender<super::LogEntry>,
@@ -426,7 +430,7 @@ fn reader_loop(
                     }
                 };
                 handle_element(
-                    &tag, attrs, children, &mut store, &server_addr, &frame_tx, &props_tx,
+                    &tag, attrs, children, &mut store, &server_addr, &frame_tx, &props_slot,
                     &cmd_tx, &shared, &log_tx,
                 );
             }
@@ -434,7 +438,7 @@ fn reader_loop(
                 let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let attrs = attr_map(&e);
                 handle_element(
-                    &tag, attrs, Vec::new(), &mut store, &server_addr, &frame_tx, &props_tx,
+                    &tag, attrs, Vec::new(), &mut store, &server_addr, &frame_tx, &props_slot,
                     &cmd_tx, &shared, &log_tx,
                 );
             }
@@ -513,7 +517,7 @@ fn handle_element(
     store: &mut HashMap<(String, String), IndiProperty>,
     server_addr: &str,
     frame_tx: &Sender<super::FrameData>,
-    props_tx: &Sender<Vec<IndiProperty>>,
+    props_slot: &Mutex<Option<Vec<IndiProperty>>>,
     cmd_tx: &Sender<IndiCmd>,
     shared: &SharedState,
     log_tx: &Sender<super::LogEntry>,
@@ -543,7 +547,7 @@ fn handle_element(
                 elements: children.iter().map(parse_def_element).collect(),
             };
             store.insert((prop.device.clone(), prop.name.clone()), prop);
-            push_snapshot(store, props_tx);
+            push_snapshot(store, props_slot);
         }
         "setNumberVector" | "setSwitchVector" | "setTextVector" | "setLightVector"
         | "setBLOBVector" => {
@@ -563,7 +567,7 @@ fn handle_element(
                         update_element(el, child);
                     }
                 }
-                push_snapshot(store, props_tx);
+                push_snapshot(store, props_slot);
             }
         }
         "delProperty" => {
@@ -574,7 +578,7 @@ fn handle_element(
             } else {
                 store.remove(&(device, name));
             }
-            push_snapshot(store, props_tx);
+            push_snapshot(store, props_slot);
         }
         "message" => {
             let msg = get("message");
@@ -631,15 +635,15 @@ fn update_element(el: &mut IndiElement, child: &RawChild) {
     }
 }
 
-/// Push a snapshot of all properties to the UI (dropped if the channel is
-/// full — the next change will push a fresher one anyway).
+/// Publish the current property snapshot into the UI's mailbox slot,
+/// replacing any unconsumed older one.
 fn push_snapshot(
     store: &HashMap<(String, String), IndiProperty>,
-    props_tx: &Sender<Vec<IndiProperty>>,
+    props_slot: &Mutex<Option<Vec<IndiProperty>>>,
 ) {
     let mut snapshot: Vec<IndiProperty> = store.values().cloned().collect();
     snapshot.sort_by(|a, b| (&a.device, &a.group, &a.name).cmp(&(&b.device, &b.group, &b.name)));
-    let _ = props_tx.try_send(snapshot);
+    *props_slot.lock().unwrap() = Some(snapshot);
 }
 
 // ── BLOB → FrameData ────────────────────────────────────────────────────────
@@ -892,7 +896,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut props = Vec::new();
         while props.len() < 2 && std::time::Instant::now() < deadline {
-            props = handle.props_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(snap) = handle.props.lock().unwrap().take() {
+                props = snap;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         let conn = props.iter().find(|p| p.name == "CONNECTION").unwrap();
         assert_eq!(conn.device, "Test CCD");
@@ -987,5 +994,107 @@ mod tests {
         handle.stop();
         server.join().unwrap();
         http_thread.join().unwrap();
+    }
+
+    /// End-to-end against a *real* INDI or INDIGO server — ignored by default
+    /// since it needs one running. Start e.g.:
+    ///   indigo_server indigo_ccd_simulator
+    /// then:
+    ///   cargo test --features indi -- --ignored live_server
+    /// Env: INDI_TEST_ADDR (default 127.0.0.1:7624), INDI_TEST_DEVICE
+    /// (default: first device defining CCD_EXPOSURE after connect).
+    #[test]
+    #[ignore]
+    fn live_server_frames() {
+        let addr = std::env::var("INDI_TEST_ADDR").unwrap_or_else(|_| "127.0.0.1:7624".into());
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+            _ => (addr.clone(), DEFAULT_PORT),
+        };
+
+        let (frame_tx, frame_rx) = bounded(8);
+        let (log_tx, log_rx) = bounded(1024);
+        let mut handle = start_client(&host, port, frame_tx, log_tx).expect("connect");
+
+        let dump_logs = |log_rx: &Receiver<crate::LogEntry>| {
+            while let Ok(e) = log_rx.try_recv() {
+                eprintln!("[log] {}", e.message);
+            }
+        };
+
+        // Collect devices as definitions stream in; connect the CCD.
+        let want_device = std::env::var("INDI_TEST_DEVICE").ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut props: Vec<IndiProperty> = Vec::new();
+        let mut device: Option<String> = None;
+        let mut connect_sent = false;
+        let mut exposure_started = false;
+        let mut frames = 0u32;
+        let mut dims = (0u32, 0u32);
+
+        while std::time::Instant::now() < deadline && frames < 3 {
+            if let Some(snap) = handle.props.lock().unwrap().take() {
+                props = snap;
+            }
+            dump_logs(&log_rx);
+
+            if device.is_none() {
+                // Prefer the requested device, else anything with a CONNECTION
+                // property whose name suggests a camera, else the first device.
+                let candidates: Vec<&IndiProperty> =
+                    props.iter().filter(|p| p.name == PROP_CONNECTION).collect();
+                device = match &want_device {
+                    Some(w) => candidates.iter().find(|p| p.device == *w).map(|p| p.device.clone()),
+                    None => candidates
+                        .iter()
+                        .find(|p| {
+                            let d = p.device.to_ascii_lowercase();
+                            d.contains("ccd") || d.contains("imager") || d.contains("camera")
+                        })
+                        .or(candidates.first())
+                        .map(|p| p.device.clone()),
+                };
+            }
+            if let Some(dev) = &device {
+                if !connect_sent {
+                    eprintln!("[test] connecting device {dev:?}");
+                    handle.cmd_tx.send(IndiCmd::Connect { device: dev.clone() }).unwrap();
+                    handle
+                        .cmd_tx
+                        .send(IndiCmd::EnableBlob { device: dev.clone(), mode: BlobMode::Also })
+                        .unwrap();
+                    connect_sent = true;
+                }
+                // CCD_EXPOSURE only appears once the driver is connected.
+                let has_exposure =
+                    props.iter().any(|p| p.device == *dev && p.name == PROP_EXPOSURE);
+                if has_exposure && !exposure_started {
+                    eprintln!("[test] starting 0.2 s live exposures");
+                    handle
+                        .cmd_tx
+                        .send(IndiCmd::StartExposure { device: dev.clone(), seconds: 0.2, live: true })
+                        .unwrap();
+                    exposure_started = true;
+                }
+            }
+
+            if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(200)) {
+                frames += 1;
+                dims = (frame.width, frame.height);
+                eprintln!(
+                    "[test] frame {}: {}x{} mean {:.1}",
+                    frames, frame.width, frame.height, frame.mean
+                );
+            }
+        }
+
+        let _ = handle.cmd_tx.send(IndiCmd::StopLive);
+        dump_logs(&log_rx);
+        handle.stop();
+
+        assert!(connect_sent, "no INDI device discovered within the deadline");
+        assert!(exposure_started, "CCD_EXPOSURE never appeared (device did not connect?)");
+        assert!(frames >= 2, "expected repeated live frames, got {frames}");
+        assert!(dims.0 > 0 && dims.1 > 0);
     }
 }

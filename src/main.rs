@@ -1701,14 +1701,19 @@ impl ViewerApp {
             }
         }
         // Refresh INDI property snapshots; default the device picker to the
-        // first device the server defines.
+        // first device with a CONNECTION property (skipping e.g. INDIGO's
+        // virtual "Server" device).
         #[cfg(feature = "indi")]
         if let CaptureState::Indi { ref handle, ref mut props, ref mut device, .. } = self.capture_state {
-            while let Ok(snap) = handle.props_rx.try_recv() {
+            if let Some(snap) = handle.props.lock().unwrap().take() {
                 *props = snap;
             }
             if device.is_empty() {
-                if let Some(p) = props.first() {
+                if let Some(p) = props
+                    .iter()
+                    .find(|p| p.name == indi_camera::PROP_CONNECTION)
+                    .or(props.first())
+                {
                     *device = p.device.clone();
                 }
             }
@@ -3207,13 +3212,25 @@ impl ViewerApp {
                         }
                     }
                 });
-            let connected = props.iter().any(|p| {
-                p.device == *device
-                    && p.name == indi_camera::PROP_CONNECTION
-                    && p.elements.iter().any(|el| {
-                        el.name == "CONNECT" && matches!(el.value, IndiValue::Switch(true))
-                    })
+            // Item names differ by dialect: INDI uses CONNECT/DISCONNECT,
+            // INDIGO (protocol 2.0) CONNECTED/DISCONNECTED — read them from
+            // the property definition instead of assuming.
+            let conn = props.iter().find(|p| {
+                p.device == *device && p.name == indi_camera::PROP_CONNECTION
             });
+            let connected = conn.is_some_and(|p| {
+                p.elements.iter().any(|el| {
+                    (el.name == "CONNECT" || el.name == "CONNECTED")
+                        && matches!(el.value, IndiValue::Switch(true))
+                })
+            });
+            let indigo_names = conn
+                .is_some_and(|p| p.elements.iter().any(|el| el.name == "CONNECTED"));
+            let (on_item, off_item) = if indigo_names {
+                ("CONNECTED", "DISCONNECTED")
+            } else {
+                ("CONNECT", "DISCONNECT")
+            };
             if connected {
                 ui.label(egui::RichText::new("● connected")
                     .color(egui::Color32::from_rgb(34, 197, 94)).small());
@@ -3221,7 +3238,7 @@ impl ViewerApp {
                     let _ = handle.cmd_tx.send(IndiCmd::SetSwitch {
                         device: device.clone(),
                         property: indi_camera::PROP_CONNECTION.to_string(),
-                        values: vec![("CONNECT".into(), false), ("DISCONNECT".into(), true)],
+                        values: vec![(on_item.into(), false), (off_item.into(), true)],
                     });
                 }
             } else if ui.small_button("Connect").clicked() {

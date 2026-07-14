@@ -1393,9 +1393,15 @@ impl ViewerApp {
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label(gamma_label); });
                 ui.horizontal(|ui| {
-                    let mut log_gamma = self.display_params.gamma.log10();
+                    // Asinh softening benefits from much larger values than gamma:
+                    // faint-end boost is alpha/asinh(alpha), so alpha ~1000 gives ~130x.
+                    let log_max = match self.display_params.transfer {
+                        imageview::TransferFn::Linear => 1.0,
+                        imageview::TransferFn::Asinh => 3.0,
+                    };
+                    let mut log_gamma = self.display_params.gamma.log10().min(log_max);
                     ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
-                        widgets::styled_slider_bare(ui, &mut log_gamma, -1.0..=1.0, &pal);
+                        widgets::styled_slider_bare(ui, &mut log_gamma, -1.0..=log_max, &pal);
                     });
                     self.display_params.gamma = 10.0_f32.powf(log_gamma);
                     ui.label(egui::RichText::new(format!("{:.2}", self.display_params.gamma)).monospace().size(12.0));

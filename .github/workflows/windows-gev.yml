@@ -42,7 +42,18 @@ jobs:
 
       - name: Fetch dependencies
         shell: bash
-        run: cargo fetch --locked || cargo fetch
+        run: |
+          set -x
+          if ! cargo fetch --verbose 2> fetch-err.txt; then
+            echo "::group::cargo fetch stderr"
+            cat fetch-err.txt
+            echo "::endgroup::"
+            # Surface each error line as an annotation (readable without admin).
+            while IFS= read -r line; do
+              echo "::error::FETCH: ${line}"
+            done < <(grep -iE 'error|failed|unable|denied|could not|timed out|resolve|refused' fetch-err.txt | head -20)
+            exit 1
+          fi
 
       - name: Build
         shell: bash

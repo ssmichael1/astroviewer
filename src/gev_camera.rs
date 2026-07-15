@@ -944,6 +944,7 @@ fn capture_loop(
     // Optionally open a datalink (BPF) capture as the stream source, below the
     // EDR/VPN filter that drops the UDP stream at the socket. If it fails (e.g.
     // /dev/bpf not readable), log and fall back to the UDP socket.
+    #[cfg(unix)]
     let mut bpf = match bpf_cfg {
         Some((ref name, cam, port)) => match open_bpf_capture(name, cam, port) {
             Ok(cap) => {
@@ -962,6 +963,10 @@ fn capture_loop(
         },
         None => None,
     };
+    // The BPF/pcap workaround is unix-only; on other platforms (Windows) the
+    // stream always comes from the UDP socket below.
+    #[cfg(not(unix))]
+    let _ = bpf_cfg;
 
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
     // the stream transport — required by FLIR/Point Grey before frames flow.
@@ -1069,6 +1074,7 @@ fn capture_loop(
 
         // 3. Receive GVSP packets until a frame completes or the poll window
         // expires — from the BPF capture when active, else the UDP socket.
+        #[cfg(unix)]
         let completed = if let Some(cap) = bpf.as_mut() {
             receive_until_frame_bpf(cap, &mut assembly, &mut geom, packet_payload, &mut rx)
         } else {
@@ -1076,6 +1082,10 @@ fn capture_loop(
                 &socket, &mut buf, &mut assembly, &mut geom, packet_payload, &mut rx,
             ))
         };
+        #[cfg(not(unix))]
+        let completed = rt.block_on(receive_until_frame(
+            &socket, &mut buf, &mut assembly, &mut geom, packet_payload, &mut rx,
+        ));
 
         if let Some((payload, g)) = completed {
             if let Some((mono, w, h, bit_depth)) = decode_payload(&payload, &g) {
@@ -1212,6 +1222,10 @@ async fn receive_until_frame(
 /// Ethernet/IP/UDP headers off each captured frame and feeds the GVSP payload
 /// through the same assembly path. Returns a finished frame or `None` when the
 /// poll window elapses.
+///
+/// Unix-only: the datalink (BPF) workaround relies on `pcap`, which is a
+/// `cfg(unix)` dependency. On Windows the stream is read from the UDP socket.
+#[cfg(unix)]
 fn receive_until_frame_bpf(
     cap: &mut pcap::Capture<pcap::Active>,
     assembly: &mut Option<FrameAssembly>,
@@ -1246,6 +1260,9 @@ fn receive_until_frame_bpf(
 /// skipping the Ethernet header (with optional 802.1Q VLAN tag), the IPv4
 /// header (variable length), and the 8-byte UDP header. Returns None for
 /// non-IPv4/non-UDP or truncated frames.
+///
+/// Unix-only: consumed by the `pcap`-based BPF capture path.
+#[cfg(unix)]
 fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
     if frame.len() < 14 {
         return None;
@@ -1282,6 +1299,9 @@ fn udp_payload(frame: &[u8]) -> Option<&[u8]> {
 /// camera's GVSP stream (its source IP → our stream port). Immediate mode +
 /// a short read timeout keep the capture responsive so the loop can still
 /// service commands and the heartbeat.
+///
+/// Unix-only: see [`receive_until_frame_bpf`].
+#[cfg(unix)]
 fn open_bpf_capture(if_name: &str, cam_ip: Ipv4Addr, local_port: u16) -> anyhow::Result<pcap::Capture<pcap::Active>> {
     let mut cap = pcap::Capture::from_device(if_name)?
         .immediate_mode(true)

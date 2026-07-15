@@ -1,0 +1,47 @@
+name: Windows GigE build
+
+# Convenience build: compiles a 64-bit Windows (x64) binary of the viewer with
+# the GigE Vision (`gev`) feature and uploads it as a downloadable artifact, so
+# it can be run on another Windows machine without installing a Rust toolchain.
+#
+# Unlike release.yml this needs NO secrets or repository variables: the `gev`
+# build pulls in no vendor SDK (viva-gige is pure Rust) and no Gaia catalog
+# (the plate solver / starsolve feature is not enabled), and produces a single
+# self-contained viewer.exe with no extra runtime DLLs to bundle.
+#
+# Runs on every push to the working branch below and can also be triggered
+# manually from the Actions tab (Run workflow).
+
+on:
+  push:
+    branches: [gev-win-build, gev-netfix]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: windows-x64 (gev)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --features gev
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/viewer-windows-gev | Out-Null
+          Copy-Item target/release/viewer.exe dist/viewer-windows-gev/
+          Compress-Archive -Path dist/viewer-windows-gev/* `
+            -DestinationPath dist/viewer-windows-gev.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: viewer-windows-gev
+          path: dist/viewer-windows-gev.zip
+          retention-days: 14

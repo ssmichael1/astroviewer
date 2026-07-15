@@ -10,9 +10,7 @@ name: Windows GigE build
 # self-contained viewer.exe with no extra runtime DLLs to bundle.
 #
 # Runs on every push to the working branch below and can also be triggered
-# manually from the Actions tab (Run workflow). The build is split into named
-# steps (diagnostics -> fetch -> build) so a failure is pinpointed by which
-# step goes red, even without downloading the full log.
+# manually from the Actions tab (Run workflow).
 
 on:
   push:
@@ -32,38 +30,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Diagnostics
-        shell: bash
-        run: |
-          set -euxo pipefail
-          rustc --version
-          cargo --version
-          rustup show
-
-      - name: Fetch dependencies
-        shell: bash
-        run: |
-          set -x
-          if ! cargo fetch --verbose 2> fetch-err.txt; then
-            echo "::group::cargo fetch stderr"
-            cat fetch-err.txt
-            echo "::endgroup::"
-            # Surface every stderr line as an annotation (readable without admin).
-            # Strip ANSI escapes so the text is clean.
-            n=0
-            while IFS= read -r line; do
-              clean=$(printf '%s' "$line" | sed -E 's/\x1b\[[0-9;]*m//g')
-              [ -z "$clean" ] && continue
-              echo "::error::FETCH[$n]: ${clean}"
-              n=$((n+1))
-              [ "$n" -ge 30 ] && break
-            done < fetch-err.txt
-            exit 1
-          fi
-
       - name: Build
-        shell: bash
-        run: cargo build --release --features gev --verbose
+        run: cargo build --release --features gev
 
       - name: Package
         shell: pwsh
@@ -79,20 +47,3 @@ jobs:
           name: viewer-windows-gev
           path: dist/viewer-windows-gev.zip
           retention-days: 14
-
-      # On failure, capture the build log as a downloadable artifact so the
-      # error is retrievable without repo-admin log access.
-      - name: Upload build log on failure
-        if: failure()
-        shell: bash
-        run: |
-          set -eux
-          cargo build --release --features gev --verbose 2> build-error.log || true
-      - name: Upload build log artifact
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-error-log
-          path: build-error.log
-          retention-days: 14
-          if-no-files-found: ignore

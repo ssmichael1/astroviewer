@@ -48,10 +48,16 @@ jobs:
             echo "::group::cargo fetch stderr"
             cat fetch-err.txt
             echo "::endgroup::"
-            # Surface each error line as an annotation (readable without admin).
+            # Surface every stderr line as an annotation (readable without admin).
+            # Strip ANSI escapes so the text is clean.
+            n=0
             while IFS= read -r line; do
-              echo "::error::FETCH: ${line}"
-            done < <(grep -iE 'error|failed|unable|denied|could not|timed out|resolve|refused' fetch-err.txt | head -20)
+              clean=$(printf '%s' "$line" | sed -E 's/\x1b\[[0-9;]*m//g')
+              [ -z "$clean" ] && continue
+              echo "::error::FETCH[$n]: ${clean}"
+              n=$((n+1))
+              [ "$n" -ge 30 ] && break
+            done < fetch-err.txt
             exit 1
           fi
 

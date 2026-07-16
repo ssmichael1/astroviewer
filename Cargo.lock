@@ -2517,12 +2517,13 @@ dependencies = [
 
 [[package]]
 name = "numeris"
-version = "0.5.12"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0225c114a2219690166bf3be79b9375cada439e54a17ada07f21c9d55b3d69c8"
+checksum = "5ade2b2f9c2f4a689eb8c5d6d8280a955006b3e29056ae9cf88fe7d2450dd001"
 dependencies = [
  "num-complex",
  "num-traits",
+ "rayon",
  "serde",
 ]
 
@@ -3944,13 +3945,14 @@ dependencies = [
 
 [[package]]
 name = "tetra3"
-version = "0.7.3"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fd0bbadcb05daffc8aecdbc313e4369b5ba6681dfd6ce81cc8318b40e12e612"
+checksum = "fae37d04774232aa25c4eeccf4638019063b33bdb1ce4e333a124ad87cce6c6a"
 dependencies = [
  "image",
  "numeris",
  "postcard",
+ "rayon",
  "serde",
  "thiserror 2.0.18",
  "tracing",

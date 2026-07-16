@@ -3872,9 +3872,9 @@ dependencies = [
 
 [[package]]
 name = "svbony"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce819f58289730dae25bf9f9206f18cb28a88cf585e2cd45829bc0aa0c3a5f0"
+checksum = "8189614e8b4aa0353944f1158d5c3209a1a1cec9de30510fa343c2dd18fef6a5"
 dependencies = [
  "image",
  "svbony-sys",
@@ -3883,9 +3883,9 @@ dependencies = [
 
 [[package]]
 name = "svbony-sys"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9ef00fdb1092968c7e31642428ada049ed14c0019a2e5dcb0ef31ea45b921a5"
+checksum = "c251267431b000a142435a885ddfca61ee197c8679389a9a33fc0e5299a556e7"
 
 [[package]]
 name = "syn"

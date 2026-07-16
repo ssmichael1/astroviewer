@@ -1,19 +1,23 @@
 name: Build & Release
 
 # Builds packaged binaries for macOS (Apple Silicon), Windows (x64), and
-# Linux (x64 + arm64), bundling the SVBony runtime libraries. Uploads a
-# per-platform archive artifact on every push/PR, and attaches them to a
-# GitHub Release when a `v*` tag is pushed.
+# Linux (x64 + arm64) with every driver feature enabled, bundling the SVBony
+# and ToupTek runtime libraries. Uploads a per-platform archive artifact on
+# every push/PR, and attaches them to a GitHub Release when a `v*` tag is
+# pushed.
 #
-# Requires three repository variables (Settings -> Secrets and variables ->
-# Actions -> Variables) pointing at hosted SVBony SDK zips:
-#   SVB_SDK_URL_MACOS    - macOS SDK zip   (contains lib/arm64/...)
-#   SVB_SDK_URL_WINDOWS  - Windows SDK zip (contains lib/x64/...)
-#   SVB_SDK_URL_LINUX    - Linux SDK zip   (contains lib/x64 and lib/armv8/...)
+# Requires these repository variables (Settings -> Secrets and variables ->
+# Actions -> Variables) pointing at hosted vendor SDK zips:
+#   SVB_SDK_URL_MACOS    - macOS SVBony SDK zip   (contains lib/arm64/...)
+#   SVB_SDK_URL_WINDOWS  - Windows SVBony SDK zip (contains lib/x64/...)
+#   SVB_SDK_URL_LINUX    - Linux SVBony SDK zip   (contains lib/x64 and lib/armv8/...)
+#   TOUPCAM_SDK_URL      - ToupTek SDK zip, one archive for all platforms
+#                          (contains inc/, mac/, win/x64, linux/x64,
+#                          linux/arm64/glibc)
 # And one for the Gaia star catalog bundled into every package (the app builds
 # the plate-solver database from it on first run):
 #   GAIA_MERGED          - direct URL to the gaia_merged.bin catalog (~17 MB)
-# Both downloads are cached; bump the matching *_CACHE_VERSION below to refresh.
+# All downloads are cached; bump the matching *_CACHE_VERSION below to refresh.
 #
 # Note: Linux GUI binaries are not fully self-contained. They bundle libusb,
 # but the target machine must already provide system libraries (OpenGL,
@@ -28,8 +32,11 @@ on:
   workflow_dispatch:
 
 env:
-  FEATURES: "svbony,starsolve"
+  # 'all' enables every driver backend (svbony, toupcam, gev, indi) plus the
+  # tetra3 plate solver — see [features] in Cargo.toml.
+  FEATURES: "all"
   SDK_CACHE_VERSION: "v1"
+  TOUPCAM_SDK_CACHE_VERSION: "v1"
   CATALOG_CACHE_VERSION: "v1"
 
 jobs:
@@ -54,9 +61,11 @@ jobs:
           - name: linux-x64
             os: ubuntu-22.04
             libdir: x64
+            touplibdir: linux/x64
           - name: linux-arm64
             os: ubuntu-22.04-arm
             libdir: armv8
+            touplibdir: linux/arm64/glibc
 
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +123,45 @@ jobs:
           echo "SVBCAMERA_SDK_PATH=$ABS" >> "$GITHUB_ENV"
           echo "Using SVBCAMERA_SDK_PATH=$ABS"
 
+      - name: Cache ToupTek SDK
+        id: toupsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: toupsdk
+          key: toupsdk-${{ env.TOUPCAM_SDK_CACHE_VERSION }}
+
+      - name: Download ToupTek SDK
+        if: steps.toupsdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          SDK_URL: ${{ vars.TOUPCAM_SDK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SDK_URL:-}" ]; then
+            echo "::error::Repository variable TOUPCAM_SDK_URL (ToupTek SDK zip) is not set."
+            echo "::error::Set it under Settings -> Secrets and variables -> Actions -> Variables."
+            exit 1
+          fi
+          PY=$(command -v python3 || command -v python)
+          curl -fL "$SDK_URL" -o toupsdk.zip
+          mkdir -p toupsdk
+          "$PY" -c "import zipfile; zipfile.ZipFile('toupsdk.zip').extractall('toupsdk')"
+
+      - name: Locate ToupTek SDK root
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          HDR=$(find toupsdk -type f -path '*/inc/toupcam.h' | head -n1)
+          if [ -z "$HDR" ]; then
+            echo "::error::Could not find inc/toupcam.h inside the extracted ToupTek SDK."
+            exit 1
+          fi
+          ROOT=$(dirname "$(dirname "$HDR")")
+          ABS=$("$PY" -c "import os,sys;print(os.path.abspath(sys.argv[1]))" "$ROOT")
+          echo "TOUPCAM_SDK_PATH=$ABS" >> "$GITHUB_ENV"
+          echo "Using TOUPCAM_SDK_PATH=$ABS"
+
       - name: Cache Gaia catalog
         id: catalog-cache
         uses: actions/cache@v4
@@ -150,8 +198,10 @@ jobs:
           cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
           cp packaging/macos/AppIcon.icns "$APP/Contents/Resources/"
           cp "$SVBCAMERA_SDK_PATH/lib/arm64/libusb-1.0.0.dylib" "$APP/Contents/Frameworks/"
+          cp "$TOUPCAM_SDK_PATH/mac/libtoupcam.dylib" "$APP/Contents/Frameworks/"
           cp catalog/gaia_merged.bin "$APP/Contents/Resources/"
-          # Sanity-check that the only non-system dylib dependency is the bundled libusb.
+          # Sanity-check that the only non-system dylib dependencies are the
+          # bundled libusb and libtoupcam.
           otool -L "$APP/Contents/MacOS/viewer" || true
 
       - name: Import signing certificate (macOS)
@@ -174,10 +224,11 @@ jobs:
           IDENTITY=$(security find-identity -v -p codesigning \
             | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/')
           echo "Signing with: $IDENTITY"
-          # Sign inner Mach-O first (the bundled libusb), then the app, both with
+          # Sign inner Mach-Os first (the bundled dylibs), then the app, all with
           # the hardened runtime + secure timestamp that notarization requires.
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" \
-            "$APP/Contents/Frameworks/libusb-1.0.0.dylib"
+          for DYLIB in "$APP"/Contents/Frameworks/*.dylib; do
+            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$DYLIB"
+          done
           codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -206,8 +257,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/viewer-windows | Out-Null
           Copy-Item target/release/viewer.exe dist/viewer-windows/
-          # Ship every DLL the SDK provides (SVBCameraSDK.dll plus any libusb).
+          # Ship every DLL the SDKs provide (SVBCameraSDK.dll plus any libusb,
+          # and the ToupTek toupcam.dll).
           Copy-Item "$env:SVBCAMERA_SDK_PATH/lib/x64/*.dll" dist/viewer-windows/
+          Copy-Item "$env:TOUPCAM_SDK_PATH/win/x64/toupcam.dll" dist/viewer-windows/
           Copy-Item catalog/gaia_merged.bin dist/viewer-windows/
           Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
           "ASSET=dist/viewer-windows.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -220,12 +273,14 @@ jobs:
           OUT="viewer-${{ matrix.name }}"
           mkdir -p "dist/$OUT"
           cp target/release/viewer "dist/$OUT/viewer"
-          # The SDK is statically linked; only libusb is dynamic. Copy the
-          # versioned .so files + symlinks (-P preserves the symlinks) for the
-          # build's architecture. The `$ORIGIN` rpath makes them resolve.
+          # The SVBony SDK is statically linked; only libusb is dynamic. Copy
+          # the versioned .so files + symlinks (-P preserves the symlinks) for
+          # the build's architecture. The ToupTek SDK is a dynamic libtoupcam.so.
+          # The `$ORIGIN` rpath makes them all resolve.
           cp -P "$SVBCAMERA_SDK_PATH/lib/${{ matrix.libdir }}"/libusb-1.0.so* "dist/$OUT/"
+          cp "$TOUPCAM_SDK_PATH/${{ matrix.touplibdir }}/libtoupcam.so" "dist/$OUT/"
           cp catalog/gaia_merged.bin "dist/$OUT/"
-          ldd "dist/$OUT/viewer" | grep -i usb || true
+          ldd "dist/$OUT/viewer" | grep -iE 'usb|toupcam' || true
           tar -czf "dist/$OUT.tar.gz" -C dist "$OUT"
           echo "ASSET=dist/$OUT.tar.gz" >> "$GITHUB_ENV"
 

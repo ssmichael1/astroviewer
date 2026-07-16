@@ -44,6 +44,7 @@ toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
 gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
 indi = ["dep:quick-xml", "dep:base64"]
+all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
 
 [[example]]
 name = "gev_spike"

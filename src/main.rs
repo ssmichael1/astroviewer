@@ -606,6 +606,13 @@ impl ViewerApp {
         #[cfg(feature = "gev")]
         let discovered_gev = gev_camera::enumerate();
 
+        // Pre-fill the manual GigE connect field with the last IP we connected
+        // to, so a reachable-by-unicast camera is one click away on relaunch.
+        #[cfg(feature = "gev")]
+        let gev_manual_ip = std::fs::read_to_string(Self::gev_last_ip_path())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
         #[cfg(feature = "toupcam")]
         let discovered_toupcam = toupcam_camera::enumerate();
 
@@ -693,7 +700,7 @@ impl ViewerApp {
             #[cfg(feature = "gev")]
             discovered_gev,
             #[cfg(feature = "gev")]
-            gev_manual_ip: String::new(),
+            gev_manual_ip,
             #[cfg(feature = "gev")]
             gev_filter: String::new(),
             #[cfg(feature = "toupcam")]
@@ -1494,6 +1501,10 @@ impl ViewerApp {
                 self.camera_source = CameraSource::Gev(id);
                 self.capture_running = true;
                 self.persist_last_source();
+                // Remember this IP so the manual connect field is pre-filled
+                // on the next launch (and reflects the live connection now).
+                self.gev_manual_ip = info.ip.to_string();
+                let _ = std::fs::write(Self::gev_last_ip_path(), info.ip.to_string());
             }
             Err(e) => {
                 let msg = format!("Failed to open GigE camera: {}", e);
@@ -1665,6 +1676,17 @@ impl ViewerApp {
         if let Some(desc) = self.camera_source.descriptor() {
             let _ = std::fs::write(Self::last_source_path(), desc);
         }
+    }
+
+    /// Path of the remembered last-connected GigE IP, used to pre-fill the
+    /// manual "Connect to IP" field on the next launch.
+    #[cfg(feature = "gev")]
+    fn gev_last_ip_path() -> std::path::PathBuf {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("gev_last_ip")
     }
 
     fn poll_frame(&mut self) {

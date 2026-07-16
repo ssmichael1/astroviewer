@@ -1,6 +1,6 @@
 use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
 
-use crate::colormaps::Colormap;
+use crate::colormaps::{Colormap, ColormapKind};
 use crate::overlays::{self, OverlayItem};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,12 +49,45 @@ pub struct ImageViewResponse {
     pub hovered_value: Option<f32>,
 }
 
+/// Everything `rgba_buf` is derived from. A repaint whose key equals the
+/// cached one skips the O(pixels) rebuild and the GPU texture upload — the
+/// egui repaint rate (mouse moves, 60 Hz during capture) is otherwise far
+/// higher than the rate at which frames or display settings actually change.
+#[derive(Clone, Copy, PartialEq)]
+pub struct RgbaKey {
+    /// Frame identity: the app bumps a serial whenever the displayed pixel
+    /// buffer is replaced (dimensions alone can't distinguish frames).
+    pub frame_serial: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale_min: f32,
+    pub scale_max: f32,
+    pub gamma: f32,
+    pub transfer: TransferFn,
+    pub colormap: ColormapKind,
+}
+
+impl RgbaKey {
+    pub fn new(frame_serial: u64, width: u32, height: u32, params: &DisplayParams, colormap: &Colormap) -> Self {
+        Self {
+            frame_serial,
+            width,
+            height,
+            scale_min: params.scale_min,
+            scale_max: params.scale_max,
+            gamma: params.gamma,
+            transfer: params.transfer,
+            colormap: colormap.kind,
+        }
+    }
+}
+
 /// Holds the texture and cached rendering state.
 pub struct ImageViewer {
     texture: Option<TextureHandle>,
     rgba_buf: Vec<u8>,
-    cached_width: u32,
-    cached_height: u32,
+    /// Key the current `rgba_buf`/texture were computed from.
+    rgba_key: Option<RgbaKey>,
     /// ROI drag state
     roi_start: Option<Pos2>,
     pub roi_rect: Option<[u32; 4]>,
@@ -65,18 +98,19 @@ impl ImageViewer {
         Self {
             texture: None,
             rgba_buf: Vec::new(),
-            cached_width: 0,
-            cached_height: 0,
+            rgba_key: None,
             roi_start: None,
             roi_rect: None,
         }
     }
 
-    /// Render the image widget. `mono_data` is row-major pixel values.
+    /// Render the image widget. `mono_data` is row-major pixel values;
+    /// `frame_serial` identifies it so unchanged repaints skip recoloring.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         mono_data: &[f32],
+        frame_serial: u64,
         width: u32,
         height: u32,
         params: &DisplayParams,
@@ -93,22 +127,24 @@ impl ImageViewer {
             return response;
         }
 
-        // Rebuild RGBA buffer
-        self.update_rgba(mono_data, width, height, params, colormap);
-
-        // Upload texture
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            &self.rgba_buf,
-        );
-        match &mut self.texture {
-            Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
-            None => {
-                self.texture = Some(ui.ctx().load_texture(
-                    "camera_image",
-                    color_image,
-                    TextureOptions::NEAREST,
-                ));
+        // Recolor and re-upload only when the frame or display params changed.
+        let key = RgbaKey::new(frame_serial, width, height, params, colormap);
+        if self.rgba_key != Some(key) || self.texture.is_none() {
+            self.rgba_key = Some(key);
+            self.update_rgba(mono_data, width, height, params, colormap);
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &self.rgba_buf,
+            );
+            match &mut self.texture {
+                Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
+                None => {
+                    self.texture = Some(ui.ctx().load_texture(
+                        "camera_image",
+                        color_image,
+                        TextureOptions::NEAREST,
+                    ));
+                }
             }
         }
 
@@ -272,11 +308,8 @@ impl ImageViewer {
         colormap: &Colormap,
     ) {
         let npix = (width * height) as usize;
-        if self.rgba_buf.len() != npix * 4 || self.cached_width != width || self.cached_height != height
-        {
+        if self.rgba_buf.len() != npix * 4 {
             self.rgba_buf.resize(npix * 4, 255);
-            self.cached_width = width;
-            self.cached_height = height;
         }
 
         let range = params.scale_max - params.scale_min;

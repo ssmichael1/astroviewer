@@ -10,6 +10,7 @@ mod fits_source;
 mod histogram;
 mod imageview;
 mod overlays;
+mod sources;
 mod widgets;
 
 #[cfg(feature = "svbony")]
@@ -37,11 +38,16 @@ use std::time::Instant;
 use colormaps::{Colormap, ColormapKind};
 use histogram::{compute_histogram, compute_stats};
 use imageview::{DisplayParams, ImageViewer};
+use sources::CameraSource;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
 struct FrameData {
-    mono: Vec<f32>,
+    /// Shared so the plate-solve worker and the recorder can hold the pixels
+    /// without copying them — at full sensor resolution this buffer is ~100 MB.
+    /// Mutate via `Arc::make_mut`, which is free while the frame is still
+    /// uniquely owned (i.e. before it is handed to either).
+    mono: Arc<Vec<f32>>,
     width: u32,
     height: u32,
     hist: histogram::Histogram,
@@ -65,7 +71,7 @@ impl FrameData {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         let hist = compute_histogram(&mono, 256, 0.0, range_max);
         let (mean, stddev) = compute_stats(&mono);
-        FrameData { mono, width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
+        FrameData { mono: Arc::new(mono), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
 
@@ -84,171 +90,17 @@ impl ScaleMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistDrag { Min, Max }
 
-/// Identity of an input source. Every variant has a stable string form (the
-/// *descriptor*, e.g. `toupcam:<id>`, `file:<path>`) used as the CLI argument
-/// format, the persistence format, and the unified picker's key — one scheme
-/// per backend, with room for `indi://…` later.
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum CameraSource {
-    None,
-    FitsFile(std::path::PathBuf),
-    #[cfg(feature = "svbony")]
-    SVBony(i32),
-    #[cfg(feature = "gev")]
-    Gev(String),
-    /// ToupTek camera, identified by its opaque enumeration id.
-    #[cfg(feature = "toupcam")]
-    Toupcam(String),
-    /// INDI/INDIGO server address ("host" or "host:port").
-    #[cfg(feature = "indi")]
-    Indi(String),
-}
-
-impl CameraSource {
-    /// The stable string form of this source; `None` for `Self::None`.
-    fn descriptor(&self) -> Option<String> {
-        match self {
-            CameraSource::None => None,
-            CameraSource::FitsFile(p) => Some(format!("file:{}", p.display())),
-            #[cfg(feature = "svbony")]
-            CameraSource::SVBony(id) => Some(format!("svb:{}", id)),
-            #[cfg(feature = "gev")]
-            CameraSource::Gev(id) => Some(format!("gev:{}", id)),
-            #[cfg(feature = "toupcam")]
-            CameraSource::Toupcam(id) => Some(format!("toupcam:{}", id)),
-            #[cfg(feature = "indi")]
-            CameraSource::Indi(host) => Some(format!("indi:{}", host)),
-        }
-    }
-
-    /// Parse a descriptor or a bare FITS path. Schemes for backends this
-    /// binary was built without are named in the error rather than treated
-    /// as unknown.
-    fn parse_descriptor(s: &str) -> Result<CameraSource, String> {
-        let s = s.trim();
-        if let Some(path) = s.strip_prefix("file:") {
-            return Ok(CameraSource::FitsFile(path.into()));
-        }
-        if let Some(id) = s.strip_prefix("svb:") {
-            #[cfg(feature = "svbony")]
-            return id
-                .parse()
-                .map(CameraSource::SVBony)
-                .map_err(|_| format!("invalid SVBony camera id '{}'", id));
-            #[cfg(not(feature = "svbony"))]
-            {
-                let _ = id;
-                return Err("this build has no SVBony support (rebuild with --features svbony)".into());
-            }
-        }
-        if let Some(id) = s.strip_prefix("toupcam:") {
-            #[cfg(feature = "toupcam")]
-            return Ok(CameraSource::Toupcam(id.to_string()));
-            #[cfg(not(feature = "toupcam"))]
-            {
-                let _ = id;
-                return Err("this build has no ToupTek support (rebuild with --features toupcam)".into());
-            }
-        }
-        if let Some(id) = s.strip_prefix("gev:") {
-            #[cfg(feature = "gev")]
-            return Ok(CameraSource::Gev(id.to_string()));
-            #[cfg(not(feature = "gev"))]
-            {
-                let _ = id;
-                return Err("this build has no GigE support (rebuild with --features gev)".into());
-            }
-        }
-        if let Some(host) = s.strip_prefix("indi:") {
-            #[cfg(feature = "indi")]
-            {
-                let host = host.trim_start_matches("//");
-                if host.is_empty() {
-                    return Err("indi: needs a server address (indi:host[:port])".into());
-                }
-                return Ok(CameraSource::Indi(host.to_string()));
-            }
-            #[cfg(not(feature = "indi"))]
-            {
-                let _ = host;
-                return Err("this build has no INDI support (rebuild with --features indi)".into());
-            }
-        }
-        // A bare existing path means a FITS file (drag-onto-app, `open with`).
-        if std::path::Path::new(s).exists() {
-            return Ok(CameraSource::FitsFile(s.into()));
-        }
-        Err(format!(
-            "unrecognized source '{}' (expected a FITS path or svb:/toupcam:/gev:/file:)",
-            s
-        ))
-    }
-}
-
-#[cfg(test)]
-mod source_descriptor_tests {
-    use super::CameraSource;
-
-    #[test]
-    fn file_roundtrip() {
-        let src = CameraSource::parse_descriptor("file:/tmp/x.fits").unwrap();
-        assert_eq!(src, CameraSource::FitsFile("/tmp/x.fits".into()));
-        assert_eq!(src.descriptor().unwrap(), "file:/tmp/x.fits");
-    }
-
-    #[test]
-    fn bare_existing_path_is_fits() {
-        // Any path that exists parses as a FITS source.
-        let dir = std::env::temp_dir().join("astroviewer_desc_test.fits");
-        std::fs::write(&dir, b"x").unwrap();
-        let src = CameraSource::parse_descriptor(dir.to_str().unwrap()).unwrap();
-        assert!(matches!(src, CameraSource::FitsFile(_)));
-        let _ = std::fs::remove_file(&dir);
-    }
-
-    #[test]
-    fn none_has_no_descriptor() {
-        assert_eq!(CameraSource::None.descriptor(), None);
-    }
-
-    #[test]
-    fn unknown_schemes_error() {
-        assert!(CameraSource::parse_descriptor("bogus:thing").is_err());
-        assert!(CameraSource::parse_descriptor("/no/such/path.fits").is_err());
-        #[cfg(not(feature = "indi"))]
-        assert!(CameraSource::parse_descriptor("indi:localhost").is_err());
-    }
-
-    #[cfg(feature = "indi")]
-    #[test]
-    fn indi_roundtrip() {
-        let src = CameraSource::parse_descriptor("indi:astro.local:7624").unwrap();
-        assert_eq!(src, CameraSource::Indi("astro.local:7624".into()));
-        assert_eq!(src.descriptor().unwrap(), "indi:astro.local:7624");
-        // The scheme also accepts the // form.
-        assert_eq!(
-            CameraSource::parse_descriptor("indi://astro.local").unwrap(),
-            CameraSource::Indi("astro.local".into())
-        );
-        assert!(CameraSource::parse_descriptor("indi:").is_err());
-    }
-
-    #[cfg(feature = "toupcam")]
-    #[test]
-    fn toupcam_roundtrip() {
-        let src = CameraSource::parse_descriptor("toupcam:abc-123").unwrap();
-        assert_eq!(src, CameraSource::Toupcam("abc-123".into()));
-        assert_eq!(src.descriptor().unwrap(), "toupcam:abc-123");
-    }
-
-    #[cfg(feature = "svbony")]
-    #[test]
-    fn svbony_roundtrip() {
-        let src = CameraSource::parse_descriptor("svb:3").unwrap();
-        assert_eq!(src, CameraSource::SVBony(3));
-        assert_eq!(src.descriptor().unwrap(), "svb:3");
-        assert!(CameraSource::parse_descriptor("svb:not-a-number").is_err());
-    }
+/// Everything the zoom window's texture derives from; an unchanged key skips
+/// the per-repaint ROI recolor + upload while the window is open.
+#[derive(Clone, Copy, PartialEq)]
+struct ZoomKey {
+    frame_serial: u64,
+    roi: [u32; 4],
+    scale_min: f32,
+    scale_max: f32,
+    gamma: f32,
+    transfer: imageview::TransferFn,
+    colormap: ColormapKind,
 }
 
 enum CaptureState {
@@ -315,7 +167,8 @@ enum BottomTab {
 
 enum RecordMsg {
     Frame {
-        mono: Vec<f32>,
+        /// Shared with the live frame rather than copied; see [`FrameData::mono`].
+        mono: Arc<Vec<f32>>,
         width: u32,
         height: u32,
         date_obs: String,
@@ -373,6 +226,12 @@ struct ViewerApp {
     image_viewer: ImageViewer,
     zoom_texture: Option<egui::TextureHandle>,
     zoom_rgba: Vec<u8>,
+    /// Key the current zoom texture was computed from; an unchanged key skips
+    /// the per-repaint ROI recolor + upload.
+    zoom_key: Option<ZoomKey>,
+    /// Bumped whenever `current_frame` is replaced — the frame-identity half
+    /// of the image/zoom recolor cache keys.
+    frame_serial: u64,
 
     ui_theme: widgets::UiTheme,
 
@@ -414,8 +273,18 @@ struct ViewerApp {
     show_build_prompt: bool,
     #[cfg(feature = "starsolve")]
     fov_estimate_deg: f32,
+    /// Job sender for the long-lived extract+solve worker.
     #[cfg(feature = "starsolve")]
-    solve_rx: Option<Receiver<tetra3::SolveResult>>,
+    solve_tx: Sender<SolveJob>,
+    #[cfg(feature = "starsolve")]
+    solve_rx: Receiver<SolveOutput>,
+    /// Whether the worker is mid-job; new frames are skipped rather than queued.
+    #[cfg(feature = "starsolve")]
+    solve_busy: bool,
+    /// Centroids from the worker's last completed frame — the source for the
+    /// overlay and the index space `matched_centroid_indices` refers to.
+    #[cfg(feature = "starsolve")]
+    last_centroids: Vec<tetra3::Centroid>,
     #[cfg(feature = "starsolve")]
     last_solve: Option<tetra3::SolveResult>,
     #[cfg(feature = "starsolve")]
@@ -459,24 +328,22 @@ struct ViewerApp {
     // Async FITS loading result (path, source, optional background)
     pending_fits_load: Option<Receiver<FitsLoadResult>>,
 
-    #[cfg(feature = "svbony")]
-    discovered_cameras: Vec<svbony::CameraInfo>,
-    #[cfg(feature = "gev")]
-    discovered_gev: Vec<gev_camera::GevDeviceInfo>,
-    #[cfg(feature = "gev")]
-    gev_manual_ip: String,
+    /// Every discovered device across all backends, in registry order — the
+    /// unified list behind the Source menu, `source_label`, and `open_source`.
+    discovered: Vec<sources::DiscoveredSource>,
+    /// Whether the Connect-to-Source window is showing.
+    connect_dialog_open: bool,
+    /// Text of each backend's address-entry field in the Connect dialog,
+    /// keyed by descriptor scheme ("gev" → last typed IP).
+    manual_inputs: std::collections::HashMap<&'static str, String>,
     /// Substring filter for the GigE controls panel.
     #[cfg(feature = "gev")]
     gev_filter: String,
-    #[cfg(feature = "toupcam")]
-    discovered_toupcam: Vec<toupcam::DeviceInfo>,
-    /// INDI server address ("host" or "host:port") for the connect field.
-    #[cfg(feature = "indi")]
-    indi_host: String,
     /// Substring filter for the INDI properties panel.
     #[cfg(feature = "indi")]
     indi_filter: String,
-    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
+    /// Error from the last connect attempt (device open, manual-address
+    /// parse), shown in the Connect dialog and the side panel.
     camera_error: Option<String>,
 }
 
@@ -595,29 +462,41 @@ impl ViewerApp {
         // Theme colors are applied each frame by apply_theme()
         cc.egui_ctx.set_global_style(style);
 
-        let (frame_tx, frame_rx) = bounded(2);
+        // Producers send into a pump thread that forwards to the UI channel
+        // and wakes egui, so a frame repaints the moment it lands instead of
+        // waiting on a polled tick.
+        let (frame_tx, pump_rx) = bounded::<FrameData>(2);
+        let (pump_tx, frame_rx) = bounded::<FrameData>(2);
+        let pump_ctx = cc.egui_ctx.clone();
+        thread::spawn(move || {
+            while let Ok(frame) = pump_rx.recv() {
+                // Same drop-when-full semantics producers had sending directly.
+                let _ = pump_tx.try_send(frame);
+                pump_ctx.request_repaint();
+            }
+        });
         let (log_tx, log_rx) = bounded(64);
 
         let log = vec![LogEntry::info("Viewer started".to_string())];
 
-        #[cfg(feature = "svbony")]
-        let discovered_cameras = camera::enumerate();
+        let discovered = sources::discover_all();
 
-        #[cfg(feature = "gev")]
-        let discovered_gev = gev_camera::enumerate();
-
+        // Each addressed backend's connect field starts at its registry
+        // default ("localhost" for INDI, empty for GigE).
+        #[allow(unused_mut)]
+        let mut manual_inputs: std::collections::HashMap<&'static str, String> = sources::backends()
+            .iter()
+            .filter_map(|b| b.manual.as_ref().map(|m| (b.scheme, m.default.to_string())))
+            .collect();
         // Pre-fill the manual GigE connect field with the last IP we connected
         // to, so a reachable-by-unicast camera is one click away on relaunch.
         #[cfg(feature = "gev")]
-        let gev_manual_ip = std::fs::read_to_string(Self::gev_last_ip_path())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-
-        #[cfg(feature = "toupcam")]
-        let discovered_toupcam = toupcam_camera::enumerate();
-
-        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
-        let camera_error: Option<String> = None;
+        if let Ok(ip) = std::fs::read_to_string(Self::gev_last_ip_path()) {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                manual_inputs.insert("gev", ip);
+            }
+        }
 
         // The app is built idle; the startup source (CLI argument or the
         // remembered last source) is opened after construction, below.
@@ -626,6 +505,9 @@ impl ViewerApp {
         let capture_running = false;
 
         let ui_theme = widgets::UiTheme::Dark;
+
+        #[cfg(feature = "starsolve")]
+        let (solve_tx, solve_rx) = spawn_solve_worker();
 
         #[allow(unused_mut)]
         let mut app = Self {
@@ -637,6 +519,8 @@ impl ViewerApp {
             image_viewer: ImageViewer::new(),
             zoom_texture: None,
             zoom_rgba: Vec::new(),
+            zoom_key: None,
+            frame_serial: 0,
             ui_theme,
             cursor_pixel: None, cursor_value: None,
             hist_drag: None,
@@ -670,7 +554,13 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             fov_estimate_deg: 15.0,
             #[cfg(feature = "starsolve")]
-            solve_rx: None,
+            solve_tx,
+            #[cfg(feature = "starsolve")]
+            solve_rx,
+            #[cfg(feature = "starsolve")]
+            solve_busy: false,
+            #[cfg(feature = "starsolve")]
+            last_centroids: Vec::new(),
             #[cfg(feature = "starsolve")]
             last_solve: None,
             #[cfg(feature = "starsolve")]
@@ -695,22 +585,14 @@ impl ViewerApp {
             pending_bg: None,
             pending_fits_path: None,
             pending_fits_load: None,
-            #[cfg(feature = "svbony")]
-            discovered_cameras,
-            #[cfg(feature = "gev")]
-            discovered_gev,
-            #[cfg(feature = "gev")]
-            gev_manual_ip,
+            discovered,
+            connect_dialog_open: false,
+            manual_inputs,
             #[cfg(feature = "gev")]
             gev_filter: String::new(),
-            #[cfg(feature = "toupcam")]
-            discovered_toupcam,
-            #[cfg(feature = "indi")]
-            indi_host: "localhost".to_string(),
             #[cfg(feature = "indi")]
             indi_filter: String::new(),
-            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
-            camera_error,
+            camera_error: None,
         };
 
         #[cfg(feature = "starsolve")]
@@ -969,29 +851,17 @@ impl ViewerApp {
             CameraSource::FitsFile(path) => {
                 format!("FITS: {}", path.file_name().unwrap_or_default().to_string_lossy())
             }
-            #[cfg(feature = "svbony")]
-            CameraSource::SVBony(cam_id) => self
-                .discovered_cameras
-                .iter()
-                .find(|c| c.camera_id == *cam_id)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| format!("Camera {}", cam_id)),
-            #[cfg(feature = "gev")]
-            CameraSource::Gev(id) => self
-                .discovered_gev
-                .iter()
-                .find(|c| c.id == *id)
-                .map(|c| c.display_name())
-                .unwrap_or_else(|| format!("GigE {}", id)),
-            #[cfg(feature = "toupcam")]
-            CameraSource::Toupcam(id) => self
-                .discovered_toupcam
-                .iter()
-                .find(|d| d.id == *id)
-                .map(|d| d.display_name.clone())
-                .unwrap_or_else(|| "ToupTek camera".to_string()),
             #[cfg(feature = "indi")]
             CameraSource::Indi(host) => format!("INDI: {}", host),
+            // Discovered-device backends: name from the unified list, falling
+            // back to the descriptor for a device that is no longer visible.
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            other => self
+                .discovered
+                .iter()
+                .find(|d| d.source == *other)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| other.descriptor().unwrap_or_default()),
         }
     }
 
@@ -1503,7 +1373,7 @@ impl ViewerApp {
                 self.persist_last_source();
                 // Remember this IP so the manual connect field is pre-filled
                 // on the next launch (and reflects the live connection now).
-                self.gev_manual_ip = info.ip.to_string();
+                self.manual_inputs.insert("gev", info.ip.to_string());
                 let _ = std::fs::write(Self::gev_last_ip_path(), info.ip.to_string());
             }
             Err(e) => {
@@ -1521,62 +1391,63 @@ impl ViewerApp {
         match source {
             CameraSource::None => {}
             CameraSource::FitsFile(path) => self.start_fits(path),
-            #[cfg(feature = "svbony")]
-            CameraSource::SVBony(id) => {
-                if self.discovered_cameras.iter().all(|c| c.camera_id != id) {
-                    self.discovered_cameras = camera::enumerate();
-                }
-                match self.discovered_cameras.iter().find(|c| c.camera_id == id).cloned() {
-                    Some(info) => self.start_svbony(&info),
-                    None => self.source_not_found(format!("svb:{}", id)),
-                }
-            }
-            #[cfg(feature = "toupcam")]
-            CameraSource::Toupcam(id) => {
-                if self.discovered_toupcam.iter().all(|d| d.id != id) {
-                    self.discovered_toupcam = toupcam_camera::enumerate();
-                }
-                match self.discovered_toupcam.iter().find(|d| d.id == id).cloned() {
-                    Some(info) => self.start_toupcam(&info),
-                    None => self.source_not_found(format!("toupcam:{}", id)),
-                }
-            }
-            #[cfg(feature = "gev")]
-            CameraSource::Gev(id) => {
-                if self.discovered_gev.iter().all(|c| c.id != id) {
-                    self.discovered_gev = gev_camera::enumerate();
-                }
-                match self.discovered_gev.iter().find(|c| c.id == id).cloned() {
-                    Some(info) => self.start_gev(&info),
-                    // A raw IP works even when broadcast discovery doesn't.
-                    None => match id.parse::<std::net::Ipv4Addr>() {
-                        Ok(ip) => self.start_gev(&gev_camera::GevDeviceInfo {
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => self.start_indi(&host),
+            // Discovered-device backends, dispatched via the unified list.
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            source => {
+                // A raw GigE IP connects directly, without waiting on a
+                // broadcast re-enumeration it may never answer anyway.
+                #[cfg(feature = "gev")]
+                if let CameraSource::Gev(id) = &source {
+                    if let Ok(ip) = id.parse::<std::net::Ipv4Addr>() {
+                        self.start_gev(&gev_camera::GevDeviceInfo {
                             ip,
                             model: String::new(),
                             manufacturer: String::new(),
                             id: ip.to_string(),
-                        }),
-                        Err(_) => self.source_not_found(format!("gev:{}", id)),
-                    },
+                        });
+                        return;
+                    }
                 }
-            }
-            #[cfg(feature = "indi")]
-            CameraSource::Indi(host) => {
-                self.indi_host = host;
-                self.start_indi();
+                // A missing device warrants re-enumerating only its own
+                // backend, not sweeping every other backend's bus.
+                if self.discovered.iter().all(|d| d.source != source) {
+                    self.refresh_backend_of(&source);
+                }
+                match self.discovered.iter().find(|d| d.source == source) {
+                    Some(d) => {
+                        let info = d.info.clone();
+                        self.start_discovered(&info);
+                    }
+                    None => self.source_not_found(source.descriptor().unwrap_or_default()),
+                }
             }
         }
     }
 
-    /// Connect to an INDI server using the address in `indi_host`. Frames only
-    /// start once the user connects a device and starts an exposure from the
-    /// Controls tab, so switch there on success.
+    /// Open a discovered device with its backend's start function.
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn start_discovered(&mut self, info: &sources::SourceInfo) {
+        match info {
+            #[cfg(feature = "svbony")]
+            sources::SourceInfo::SVBony(info) => self.start_svbony(info),
+            #[cfg(feature = "toupcam")]
+            sources::SourceInfo::Toupcam(info) => self.start_toupcam(info),
+            #[cfg(feature = "gev")]
+            sources::SourceInfo::Gev(info) => self.start_gev(info),
+        }
+    }
+
+    /// Connect to the INDI server at `addr` ("host" or "host:port"). Frames
+    /// only start once the user connects a device and starts an exposure from
+    /// the Controls tab, so switch there on success.
     #[cfg(feature = "indi")]
-    fn start_indi(&mut self) {
+    fn start_indi(&mut self, addr: &str) {
         self.stop_capture();
         self.camera_error = None;
 
-        let addr = self.indi_host.trim().to_string();
+        let addr = addr.trim().to_string();
         let (host, port) = match addr.rsplit_once(':') {
             Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
             _ => (addr.clone(), indi_camera::DEFAULT_PORT),
@@ -1607,59 +1478,31 @@ impl ViewerApp {
     #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
     fn source_not_found(&mut self, descriptor: String) {
         let msg = format!("Source not found: {}", descriptor);
-        #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
-        {
-            self.camera_error = Some(msg.clone());
-        }
+        self.camera_error = Some(msg.clone());
         self.add_log(LogEntry::error(msg));
     }
 
     /// Re-enumerate every camera backend (the Source menu's Refresh).
     fn refresh_sources(&mut self) {
-        #[cfg(feature = "svbony")]
-        {
-            self.discovered_cameras = camera::enumerate();
-        }
-        #[cfg(feature = "gev")]
-        {
-            self.discovered_gev = gev_camera::enumerate();
-        }
-        #[cfg(feature = "toupcam")]
-        {
-            self.discovered_toupcam = toupcam_camera::enumerate();
-        }
+        self.discovered = sources::discover_all();
+    }
+
+    /// Re-enumerate only `source`'s backend, splicing its fresh rows into
+    /// `discovered` in place of that backend's old ones.
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn refresh_backend_of(&mut self, source: &CameraSource) {
+        let Some(b) = sources::backends().iter().find(|b| Some(b.scheme) == source.scheme())
+        else {
+            return;
+        };
+        self.discovered.retain(|d| d.backend != b.name);
+        self.discovered.extend(b.discover_devices());
     }
 
     /// Every discovered source across all backends with kind-tagged labels —
     /// the unified list the Source menu presents.
     fn discovered_source_list(&self) -> Vec<(CameraSource, String)> {
-        #[cfg_attr(
-            not(any(feature = "svbony", feature = "gev", feature = "toupcam")),
-            allow(unused_mut)
-        )]
-        let mut list: Vec<(CameraSource, String)> = Vec::new();
-        #[cfg(feature = "svbony")]
-        for c in &self.discovered_cameras {
-            list.push((
-                CameraSource::SVBony(c.camera_id),
-                format!("{} ({}) — SVBony", c.name, c.serial),
-            ));
-        }
-        #[cfg(feature = "toupcam")]
-        for d in &self.discovered_toupcam {
-            list.push((
-                CameraSource::Toupcam(d.id.clone()),
-                format!("{} — ToupTek", d.display_name),
-            ));
-        }
-        #[cfg(feature = "gev")]
-        for g in &self.discovered_gev {
-            list.push((
-                CameraSource::Gev(g.id.clone()),
-                format!("{} ({}) — GigE", g.display_name(), g.ip),
-            ));
-        }
-        list
+        self.discovered.iter().map(|d| (d.source.clone(), d.label())).collect()
     }
 
     /// File remembering the last successfully opened source's descriptor.
@@ -1740,6 +1583,25 @@ impl ViewerApp {
                 }
             }
         }
+        // Collect the solve worker's last completed frame. Done on every UI
+        // update rather than only when a camera frame arrives, so `solve_busy`
+        // (and the "Solving…" indicator) reflects the worker, not the frame rate.
+        // Centroids and solve arrive together, so matched indices stay aligned.
+        #[cfg(feature = "starsolve")]
+        if let Ok(out) = self.solve_rx.try_recv() {
+            self.solve_busy = false;
+            self.centroid_time_ms = out.extract_ms;
+            self.centroid_count = out.centroids.len();
+            self.last_centroids = out.centroids;
+            if let Some(result) = out.solve {
+                // Update FOV estimate from successful solve
+                if let Ok(ref sol) = result {
+                    self.fov_estimate_deg = sol.fov_rad.to_degrees();
+                }
+                self.last_solve = Some(result);
+            }
+        }
+
         let mut latest = None;
         loop {
             match self.frame_rx.try_recv() {
@@ -1753,7 +1615,9 @@ impl ViewerApp {
             if self.bg_subtract_enabled {
                 if let Some(bg) = &self.bg_image {
                     if bg.len() == frame.mono.len() {
-                        for (px, bg_val) in frame.mono.iter_mut().zip(bg.iter()) {
+                        // Free: the frame is still uniquely owned here, ahead of
+                        // the solve-worker dispatch and the recorder.
+                        for (px, bg_val) in Arc::make_mut(&mut frame.mono).iter_mut().zip(bg.iter()) {
                             *px -= bg_val;
                         }
                         // Recompute histogram and stats on subtracted data
@@ -1804,59 +1668,47 @@ impl ViewerApp {
                 let dt = self.frame_times.last().unwrap().duration_since(self.frame_times[0]);
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
-            // Extract centroids inline (same frame, zero latency) and reuse for solve.
+            // Hand this frame to the worker (skipped while it is still busy).
             #[cfg(feature = "starsolve")]
-            {
-                let t0 = Instant::now();
-                let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
-                    &frame.mono, frame.width, frame.height, &self.centroid_config,
-                )
-                .map(|result| result.centroids)
-                .unwrap_or_default();
-                self.centroid_time_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                self.centroid_count = centroids.len();
-                if self.show_centroids {
-                    self.overlay_items = centroids.iter().map(overlays::centroid_to_overlay).collect();
-                } else {
-                    self.overlay_items.clear();
-                }
+            self.maybe_dispatch_solve(frame.mono.clone(), frame.width, frame.height);
 
-                // Auto plate-solve if database is loaded
-                self.maybe_auto_solve(centroids, frame.width, frame.height);
-            }
-
-            // Poll solve result
+            // Rebuild overlays from the most recent completed extraction. These
+            // may lag the displayed frame by a job; at these frame rates the
+            // difference is not visible, and it keeps the UI thread free.
+            //
+            // Capped: each centroid tessellates to a ~360-index ellipse, and
+            // wgpu aborts the process past a 256 MB buffer (~180k centroids).
+            // A daylight frame on a large sensor can fragment into far more —
+            // draw only the first (brightest; tetra3 sorts by mass) few
+            // thousand. Extraction and solving still see the full list.
             #[cfg(feature = "starsolve")]
-            if let Some(rx) = &self.solve_rx {
-                if let Ok(result) = rx.try_recv() {
-                    // Update FOV estimate from successful solve
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        if let Some(fov) = result.fov_rad {
-                            self.fov_estimate_deg = fov.to_degrees();
-                        }
-                    }
-                    self.last_solve = Some(result);
-                    self.solve_rx = None;
-                }
+            if self.show_centroids {
+                const MAX_CENTROID_OVERLAYS: usize = 4000;
+                self.overlay_items = self
+                    .last_centroids
+                    .iter()
+                    .take(MAX_CENTROID_OVERLAYS)
+                    .map(overlays::centroid_to_overlay)
+                    .collect();
+            } else {
+                self.overlay_items.clear();
             }
 
             // Append matched star markers from last solve (every frame)
             #[cfg(feature = "starsolve")]
             if self.show_matched_stars {
-                if let Some(ref result) = self.last_solve {
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        // Use matched centroid indices to mark which centroids were matched
-                        let n_centroids = self.overlay_items.len();
-                        for &cent_idx in &result.matched_centroid_indices {
-                            if cent_idx < n_centroids {
-                                if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
-                                    self.overlay_items.push(overlays::OverlayItem::Marker {
-                                        x: *x,
-                                        y: *y,
-                                        kind: overlays::MarkerKind::Crosshair,
-                                        label: None,
-                                    });
-                                }
+                if let Some(Ok(ref sol)) = self.last_solve {
+                    // Use matched centroid indices to mark which centroids were matched
+                    let n_centroids = self.overlay_items.len();
+                    for &cent_idx in &sol.matched_centroid_indices {
+                        if cent_idx < n_centroids {
+                            if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
+                                self.overlay_items.push(overlays::OverlayItem::Marker {
+                                    x: *x,
+                                    y: *y,
+                                    kind: overlays::MarkerKind::Crosshair,
+                                    label: None,
+                                });
                             }
                         }
                     }
@@ -1866,22 +1718,20 @@ impl ViewerApp {
             // Append named bright star labels from last solve
             #[cfg(feature = "starsolve")]
             if self.show_star_names && self.show_matched_stars && self.show_centroids {
-                if let Some(ref result) = self.last_solve {
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        let hw = frame.width as f32 / 2.0;
-                        let hh = frame.height as f32 / 2.0;
-                        for star in bright_stars::NAMED_STARS {
-                            if let Some((px, py)) = result.world_to_pixel(star.ra_deg, star.dec_deg) {
-                                let px = px as f32;
-                                let py = py as f32;
-                                if px.abs() < hw && py.abs() < hh {
-                                    self.overlay_items.push(overlays::OverlayItem::Marker {
-                                        x: px,
-                                        y: py,
-                                        kind: overlays::MarkerKind::Label,
-                                        label: Some(star.name.to_string()),
-                                    });
-                                }
+                if let Some(Ok(ref sol)) = self.last_solve {
+                    let hw = frame.width as f32 / 2.0;
+                    let hh = frame.height as f32 / 2.0;
+                    for star in bright_stars::NAMED_STARS {
+                        if let Some((px, py)) = sol.world_to_pixel(star.ra_deg, star.dec_deg) {
+                            let px = px as f32;
+                            let py = py as f32;
+                            if px.abs() < hw && py.abs() < hh {
+                                self.overlay_items.push(overlays::OverlayItem::Marker {
+                                    x: px,
+                                    y: py,
+                                    kind: overlays::MarkerKind::Label,
+                                    label: Some(star.name.to_string()),
+                                });
                             }
                         }
                     }
@@ -1894,6 +1744,7 @@ impl ViewerApp {
             }
 
             self.current_frame = Some(frame);
+            self.frame_serial += 1;
         }
     }
 
@@ -1916,80 +1767,24 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
 
             // Source-specific settings
-            match &self.camera_source {
-                CameraSource::None => {}
-                CameraSource::FitsFile(_) => {
-                    ui.add_space(4.0);
-                    let mut fps = self.fits_fps.load(Ordering::Relaxed);
-                    if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
-                        self.fits_fps.store(fps, Ordering::Relaxed);
-                    }
-                }
-                #[cfg(feature = "svbony")]
-                CameraSource::SVBony(_) => {}
-                #[cfg(feature = "gev")]
-                CameraSource::Gev(_) => {}
-                #[cfg(feature = "toupcam")]
-                CameraSource::Toupcam(_) => {}
-                #[cfg(feature = "indi")]
-                CameraSource::Indi(_) => {}
-            }
-
-            // GigE: connect directly by IP (needed when a camera is reachable by
-            // unicast but doesn't answer broadcast discovery).
-            #[cfg(feature = "gev")]
-            {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("GigE IP:");
-                    ui.add(egui::TextEdit::singleline(&mut self.gev_manual_ip)
-                        .hint_text("192.168.0.2").desired_width(120.0));
-                });
-                if widgets::styled_button(ui, "Connect to IP", &pal) {
-                    match self.gev_manual_ip.trim().parse::<std::net::Ipv4Addr>() {
-                        Ok(ip) => {
-                            let info = gev_camera::GevDeviceInfo {
-                                ip,
-                                model: String::new(),
-                                manufacturer: String::new(),
-                                id: ip.to_string(),
-                            };
-                            self.start_gev(&info);
-                        }
-                        Err(_) => {
-                            self.camera_error = Some(format!(
-                                "Invalid IP: '{}'", self.gev_manual_ip.trim()
-                            ));
-                        }
-                    }
+            if let CameraSource::FitsFile(_) = &self.camera_source {
+                ui.add_space(4.0);
+                let mut fps = self.fits_fps.load(Ordering::Relaxed);
+                if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
+                    self.fits_fps.store(fps, Ordering::Relaxed);
                 }
             }
 
-            // INDI: connect to an indiserver by host[:port].
-            #[cfg(feature = "indi")]
-            {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("INDI:");
-                    ui.add(egui::TextEdit::singleline(&mut self.indi_host)
-                        .hint_text("localhost:7624").desired_width(140.0));
-                });
-                if widgets::styled_button(ui, "Connect to INDI", &pal) {
-                    self.start_indi();
-                }
-            }
-
-            // Open FITS shortcut
-            ui.add_space(4.0);
-            let dialog_pending = self.pending_fits_path.is_some();
-            if !dialog_pending && widgets::styled_button(ui, "Open FITS...", &pal) {
-                self.open_fits_dialog();
+            // Everything about choosing a source — device lists, manual
+            // addresses, FITS files — lives in the Connect dialog.
+            ui.add_space(6.0);
+            if widgets::styled_button(ui, "Connect\u{2026}", &pal) {
+                self.connect_dialog_open = true;
             }
         });
 
@@ -3553,9 +3348,9 @@ impl ViewerApp {
             // Solve status
             if self.solver_db.is_some() {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(75.0, 18.0), egui::Sense::hover());
-                let (text, color) = if self.solve_rx.is_some() {
+                let (text, color) = if self.solve_busy {
                     ("Solving...", egui::Color32::from_rgb(217, 119, 6))
-                } else if self.last_solve.as_ref().map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound) {
+                } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                     ("Locked", egui::Color32::from_rgb(34, 197, 94))
                 } else {
                     ("Searching...", pal.text_secondary)
@@ -3720,57 +3515,52 @@ impl ViewerApp {
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(2.0);
-            if result.status == tetra3::SolveStatus::MatchFound {
-                ui.horizontal_wrapped(|ui| {
-                    let mono = egui::FontId::monospace(12.0);
-                    let dim = pal.text_secondary;
-                    let sp = 10.0;
-                    if let Some(crval) = result.crval_rad {
+            match result {
+                Ok(sol) => {
+                    ui.horizontal_wrapped(|ui| {
+                        let mono = egui::FontId::monospace(12.0);
+                        let dim = pal.text_secondary;
+                        let sp = 10.0;
+                        let crval = sol.crval_rad;
                         ui.label(egui::RichText::new("RA").color(dim));
                         ui.label(egui::RichText::new(format!("{:.4}°", crval[0].to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
                         ui.label(egui::RichText::new("Dec").color(dim));
                         ui.label(egui::RichText::new(format!("{:.4}°", crval[1].to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(fov) = result.fov_rad {
                         ui.label(egui::RichText::new("FOV").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.2}°", fov.to_degrees())).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.2}°", sol.fov_rad.to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                        let ifov = fov.to_degrees() as f64 / result.image_width.max(1) as f64 * 3600.0;
+                        let ifov = sol.fov_rad.to_degrees() as f64
+                            / sol.camera_model.image_width.max(1) as f64
+                            * 3600.0;
                         ui.label(egui::RichText::new("IFOV").color(dim));
                         ui.label(egui::RichText::new(format!("{:.2}\"/px", ifov)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(theta) = result.theta_rad {
                         ui.label(egui::RichText::new("Rot").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.2}°", theta.to_degrees())).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.2}°", sol.theta_rad.to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(n) = result.num_matches {
                         ui.label(egui::RichText::new("Stars").color(dim));
-                        ui.label(egui::RichText::new(format!("{}", n)).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{}", sol.num_matches)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(rmse) = result.rmse_rad {
                         ui.label(egui::RichText::new("RMSE").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.1}\"", rmse.to_degrees() * 3600.0)).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.1}\"", sol.rmse_rad.to_degrees() * 3600.0)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    ui.label(egui::RichText::new("Extract").color(dim));
-                    ui.label(egui::RichText::new(format!("{:.0}ms", self.centroid_time_ms)).font(mono.clone()));
-                    ui.add_space(sp);
-                    ui.label(egui::RichText::new("Solve").color(dim));
-                    ui.label(egui::RichText::new(format!("{:.0}ms", result.solve_time_ms)).font(mono));
-                });
-            } else {
-                let msg = match result.status {
-                    tetra3::SolveStatus::NoMatch => "No match",
-                    tetra3::SolveStatus::Timeout => "Timed out",
-                    tetra3::SolveStatus::TooFew => "Too few stars",
-                    _ => "",
-                };
-                ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+                        ui.label(egui::RichText::new("Extract").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.0}ms", self.centroid_time_ms)).font(mono.clone()));
+                        ui.add_space(sp);
+                        ui.label(egui::RichText::new("Solve").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.0}ms", sol.solve_time_ms)).font(mono));
+                    });
+                }
+                Err(fail) => {
+                    let msg = match fail.status {
+                        tetra3::SolveStatus::NoMatch => "No match",
+                        tetra3::SolveStatus::Timeout => "Timed out",
+                        tetra3::SolveStatus::TooFew => "Too few stars",
+                    };
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+                }
             }
         }
     }
@@ -4035,6 +3825,29 @@ fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {
     }
 }
 
+/// Semibold, letter-spaced uppercase eyebrow text — the section headers'
+/// voice. Tracking gives the small caps room to breathe instead of reading
+/// as a cramped run.
+fn eyebrow_job(title: &str, pal: &widgets::Palette) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &title.to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::new(11.0, strong_family()),
+            color: pal.section_header_text,
+            extra_letter_spacing: 1.2,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// Eyebrow labeling one backend's group in the Connect dialog.
+fn connect_group_header(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette) {
+    ui.label(eyebrow_job(title, pal));
+}
+
 fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(pal.section_body_fill)
@@ -4051,20 +3864,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
                 ui.painter().hline(rect.x_range(), rect.max.y, egui::Stroke::new(1.0, pal.section_border));
                 rect
             };
-            // Semibold, letter-spaced uppercase eyebrow — tracking gives the
-            // small caps room to breathe instead of reading as a cramped run.
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                &title.to_uppercase(),
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::new(11.0, strong_family()),
-                    color: pal.section_header_text,
-                    extra_letter_spacing: 1.2,
-                    ..Default::default()
-                },
-            );
-            let galley = ui.painter().layout_job(job);
+            let galley = ui.painter().layout_job(eyebrow_job(title, pal));
             let gy = header_rect.center().y - galley.size().y / 2.0;
             ui.painter().galley(egui::pos2(header_rect.min.x + 10.0, gy), galley, pal.section_header_text);
             ui.allocate_space(egui::vec2(0.0, header_h));
@@ -4119,7 +3919,11 @@ impl eframe::App for ViewerApp {
         self.poll_solver_generation();
         self.apply_theme(&ctx);
 
-        if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        if self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        // While capturing, frames wake the UI instantly via the pump thread;
+        // this slow tick only keeps telemetry, logs, and INDI property updates
+        // flowing between frames.
+        if self.capture_running { ctx.request_repaint_after(std::time::Duration::from_millis(200)); }
         // Keep repainting while the database builds so the elapsed timer ticks
         // and completion is detected promptly.
         #[cfg(feature = "starsolve")]
@@ -4266,6 +4070,11 @@ impl eframe::App for ViewerApp {
                             }
                         }
                         ui.separator();
+                        if ui.button("Connect\u{2026}").clicked() {
+                            self.connect_dialog_open = true;
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui.button("Refresh Sources").clicked() {
                             self.refresh_sources();
                         }
@@ -4286,8 +4095,6 @@ impl eframe::App for ViewerApp {
                             self.open_fits_dialog();
                             ui.close();
                         }
-                        // GigE-by-IP entry lives in the side panel (text entry
-                        // inside a menu is unreliable in egui).
                     });
 
                     // ── Theme ───────────────────────────────────────────
@@ -4410,12 +4217,10 @@ impl eframe::App for ViewerApp {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         #[cfg(feature = "starsolve")]
                         {
-                            if self.solve_rx.is_some() {
+                            if self.solve_busy {
                                 ui.label(egui::RichText::new("Solving…").size(small).monospace()
                                     .color(egui::Color32::from_rgb(217, 119, 6)));
-                            } else if self.last_solve.as_ref()
-                                .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound)
-                            {
+                            } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                                 ui.label(egui::RichText::new("Solved").size(small).monospace()
                                     .color(egui::Color32::from_rgb(34, 197, 94)));
                             }
@@ -4489,7 +4294,7 @@ impl eframe::App for ViewerApp {
             )
             .show_inside(ui, |ui| {
             if let Some(frame) = &self.current_frame {
-                let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
+                let resp = self.image_viewer.show(ui, &frame.mono, self.frame_serial, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;
                 self.cursor_value = resp.hovered_value;
             } else {
@@ -4527,61 +4332,240 @@ impl eframe::App for ViewerApp {
 
         // Zoom popup window
         self.show_zoom_window(&ctx);
+
+        // Connect-to-source window
+        self.connect_dialog(&ctx);
     }
 }
 
+/// Wall-clock budget for a single live plate-solve attempt.
+///
+/// Measured against real captures: a solve that is going to succeed lands well
+/// under this (0.5–6 ms), while one with no possible match runs until stopped —
+/// pattern combinations grow as C(n,4), so a few thousand read-noise centroids
+/// never terminate on their own. tetra3 honors this to the millisecond.
+#[cfg(feature = "starsolve")]
+const SOLVE_TIMEOUT_MS: u64 = 10;
+
+/// One frame's work for the plate-solve worker: extract centroids, then solve
+/// them if a database is loaded.
+#[cfg(feature = "starsolve")]
+struct SolveJob {
+    mono: Arc<Vec<f32>>,
+    width: u32,
+    height: u32,
+    centroid_config: tetra3::CentroidExtractionConfig,
+    /// `None` when no database is loaded — the worker still extracts, so the
+    /// centroid overlay and star count keep working without a solver.
+    solve: Option<SolveParams>,
+}
+
+/// Solver inputs, snapshotted on the UI thread at dispatch time.
+#[cfg(feature = "starsolve")]
+struct SolveParams {
+    db: Arc<tetra3::SolverDatabase>,
+    fov_rad: f32,
+    fov_max_error: Option<f32>,
+    attitude_hint: Option<tetra3::Quaternion>,
+    camera_model: Option<tetra3::CameraModel>,
+}
+
+/// One frame's results. Centroids travel with their solve so
+/// `matched_centroid_indices` always indexes the centroids it was solved from.
+#[cfg(feature = "starsolve")]
+struct SolveOutput {
+    centroids: Vec<tetra3::Centroid>,
+    extract_ms: f32,
+    solve: Option<tetra3::SolveResult>,
+}
+
+/// Long-lived worker running extraction and solving off the UI thread. One
+/// thread for the life of the app rather than one per frame: at full sensor
+/// resolution a single job is ~100 ms of work, and the UI must stay responsive
+/// throughout.
+#[cfg(feature = "starsolve")]
+fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
+    let (job_tx, job_rx) = bounded::<SolveJob>(1);
+    let (out_tx, out_rx) = bounded::<SolveOutput>(1);
+    thread::spawn(move || {
+        // Ends when the app drops the job sender.
+        while let Ok(job) = job_rx.recv() {
+            let t0 = Instant::now();
+            let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
+                &job.mono, job.width, job.height, &job.centroid_config,
+            )
+            .map(|r| r.centroids)
+            .unwrap_or_default();
+            let extract_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+            let solve = job.solve.map(|p| {
+                let mut cfg = tetra3::SolveConfig::new(p.fov_rad, job.width, job.height);
+                cfg.fov_max_error_rad = p.fov_max_error;
+                // Live tracking: a solve that cannot finish in a few ms is not
+                // worth finishing — the next frame is along shortly. Bounds the
+                // pathological case (thousands of read-noise centroids never
+                // matching, which otherwise burns a full core on every frame)
+                // without capping the centroid count real solves depend on.
+                cfg.solve_timeout_ms = Some(SOLVE_TIMEOUT_MS);
+                if let Some(cam) = p.camera_model {
+                    cfg.camera_model = cam;
+                }
+                if let Some(q) = p.attitude_hint {
+                    cfg.attitude_hint = Some(q);
+                    cfg.hint_uncertainty_rad = 2.0_f32.to_radians();
+                }
+                p.db.solve_from_centroids(&centroids, &cfg)
+            });
+
+            if out_tx.send(SolveOutput { centroids, extract_ms, solve }).is_err() {
+                break;
+            }
+        }
+    });
+    (job_tx, out_rx)
+}
+
 impl ViewerApp {
-    /// Auto-solve: dispatch to background thread if DB loaded and not already solving.
-    /// Called from poll_frame on each new frame. Takes ownership of the centroids
-    /// already extracted for overlay display, so we don't re-extract or clone pixels.
+    /// Hand this frame to the solve worker, unless it is still busy with the
+    /// previous one — in which case this frame is skipped rather than queued, so
+    /// the pipeline always works on recent data instead of falling behind.
     #[cfg(feature = "starsolve")]
-    fn maybe_auto_solve(&mut self, centroids: Vec<tetra3::Centroid>, w: u32, h: u32) {
-        // Only if DB loaded and not already solving
-        if self.solver_db.is_none() || self.solve_rx.is_some() {
+    fn maybe_dispatch_solve(&mut self, mono: Arc<Vec<f32>>, w: u32, h: u32) {
+        if self.solve_busy {
             return;
         }
 
-        let db = self.solver_db.as_ref().unwrap().clone();
-
-        // Use previous solve's FOV if available, otherwise user estimate
-        let prev_locked = self.last_solve.as_ref()
-            .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound);
-        let fov_rad = self.last_solve.as_ref()
-            .and_then(|s| s.fov_rad)
-            .unwrap_or_else(|| (self.fov_estimate_deg as f32).to_radians());
-
-        // Wide FOV tolerance for initial solve, tight once we have a lock
-        let fov_max_error = if prev_locked {
-            Some((2.0_f32).to_radians())
-        } else {
-            Some((10.0_f32).to_radians())
-        };
-
-        // Seed tracking-mode solve with previous attitude when locked.
-        let attitude_hint = self.last_solve.as_ref().and_then(|s| s.qicrs2cam);
-
-        let camera_model = self.camera_model.clone();
-
-        let (tx, rx) = bounded(1);
-        self.solve_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
-            solve_config.fov_max_error_rad = fov_max_error;
-            solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
-            if let Some(cam) = camera_model {
-                solve_config.camera_model = cam;
+        // Solver inputs, if a database is loaded. Without one the worker still
+        // extracts, so centroid overlays keep working.
+        let solve = self.solver_db.as_ref().map(|db| {
+            // Use previous solve's FOV if available, otherwise user estimate
+            let prev_solution = self.last_solve.as_ref().and_then(|s| s.as_ref().ok());
+            let prev_locked = prev_solution.is_some();
+            SolveParams {
+                db: db.clone(),
+                fov_rad: prev_solution
+                    .map(|s| s.fov_rad)
+                    .unwrap_or_else(|| self.fov_estimate_deg.to_radians()),
+                // Wide FOV tolerance for initial solve, tight once we have a lock
+                fov_max_error: Some(if prev_locked { 2.0_f32 } else { 10.0_f32 }.to_radians()),
+                // Seed tracking-mode solve with previous attitude when locked.
+                attitude_hint: prev_solution.map(|s| s.qicrs2cam),
+                camera_model: self.camera_model.clone(),
             }
-            if let Some(q) = attitude_hint {
-                solve_config.attitude_hint = Some(q);
-                solve_config.hint_uncertainty_rad = 2.0_f32.to_radians();
-            }
-            let result = db.solve_from_centroids(&centroids, &solve_config);
-            let _ = tx.send(result);
         });
+
+        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), solve };
+        if self.solve_tx.try_send(job).is_ok() {
+            self.solve_busy = true;
+        }
     }
 
 
+
+    /// The Connect window: every backend's discovered devices plus inline
+    /// address entry for addressed backends (GigE by IP, INDI server), all
+    /// grouped under one roof so the Source menu and side panel stay small.
+    fn connect_dialog(&mut self, ctx: &egui::Context) {
+        if !self.connect_dialog_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.connect_dialog_open = false;
+            return;
+        }
+        let pal = self.pal();
+        let mut keep_open = true;
+        // Actions are collected during the UI pass and applied after it, so
+        // the closure never re-enters &mut self.
+        let mut connect: Option<CameraSource> = None;
+        let mut manual_err: Option<String> = None;
+        let mut refresh = false;
+        let mut open_fits = false;
+
+        egui::Window::new("Connect to Source")
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+
+                if let Some(err) = &self.camera_error {
+                    ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
+                }
+
+                for b in sources::backends() {
+                    ui.add_space(2.0);
+                    connect_group_header(ui, b.name, &pal);
+
+                    let mut any = false;
+                    for d in self.discovered.iter().filter(|d| d.backend == b.name) {
+                        any = true;
+                        let text = d.title();
+                        let is_current = self.camera_source == d.source;
+                        if ui.selectable_label(is_current, egui::RichText::new(text).size(13.0)).clicked() {
+                            connect = Some(d.source.clone());
+                        }
+                    }
+                    if !any && b.discover.is_some() {
+                        ui.label(egui::RichText::new("none found").italics().size(12.0).color(pal.text_secondary));
+                    }
+
+                    if let Some(spec) = &b.manual {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(spec.label).size(13.0));
+                            let input = self.manual_inputs.entry(b.scheme).or_default();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(input)
+                                    .hint_text(spec.hint)
+                                    .desired_width(150.0),
+                            );
+                            let submitted =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if widgets::styled_button(ui, "Connect", &pal) || submitted {
+                                match (spec.make_source)(input) {
+                                    Ok(src) => connect = Some(src),
+                                    Err(e) => manual_err = Some(e),
+                                }
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(2.0);
+                connect_group_header(ui, "Files", &pal);
+                let dialog_pending = self.pending_fits_path.is_some();
+                if !dialog_pending && widgets::styled_button(ui, "Open FITS\u{2026}", &pal) {
+                    open_fits = true;
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                if widgets::styled_button(ui, "\u{27F3} Refresh", &pal) {
+                    refresh = true;
+                }
+            });
+
+        self.connect_dialog_open = keep_open;
+        if let Some(e) = manual_err {
+            self.camera_error = Some(e);
+        }
+        if refresh {
+            self.refresh_sources();
+        }
+        if open_fits {
+            self.open_fits_dialog();
+            self.connect_dialog_open = false;
+        }
+        if let Some(src) = connect {
+            self.camera_error = None;
+            self.open_source(src);
+            if self.camera_error.is_none() {
+                self.connect_dialog_open = false;
+            }
+        }
+    }
 
     fn show_zoom_window(&mut self, ctx: &egui::Context) {
         let roi = match self.image_viewer.roi_rect {
@@ -4598,50 +4582,65 @@ impl ViewerApp {
         let roi_h = (y1 - y0 + 1) as usize;
         if roi_w < 2 || roi_h < 2 { return; }
 
-        // Build zoomed RGBA from the ROI sub-region
-        let npix = roi_w * roi_h;
-        self.zoom_rgba.resize(npix * 4, 255);
+        // Recolor and re-upload only when the frame, ROI, or display params
+        // changed — repaints happen far more often than any of those.
+        let key = ZoomKey {
+            frame_serial: self.frame_serial,
+            roi,
+            scale_min: self.display_params.scale_min,
+            scale_max: self.display_params.scale_max,
+            gamma: self.display_params.gamma,
+            transfer: self.display_params.transfer,
+            colormap: self.colormap.kind,
+        };
+        if self.zoom_key != Some(key) || self.zoom_texture.is_none() {
+            self.zoom_key = Some(key);
 
-        let range = self.display_params.scale_max - self.display_params.scale_min;
-        let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
-        let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
-        let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
-        let asinh_alpha = self.display_params.gamma;
-        let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
-            let v = asinh_alpha.asinh();
-            if v > 0.0 { 1.0 / v } else { 1.0 }
-        } else { 1.0 };
+            // Build zoomed RGBA from the ROI sub-region
+            let npix = roi_w * roi_h;
+            self.zoom_rgba.resize(npix * 4, 255);
 
-        for ry in 0..roi_h {
-            for rx in 0..roi_w {
-                let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
-                let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
-                let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
-                match self.display_params.transfer {
-                    imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
-                    imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
+            let range = self.display_params.scale_max - self.display_params.scale_min;
+            let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
+            let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
+            let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
+            let asinh_alpha = self.display_params.gamma;
+            let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+                let v = asinh_alpha.asinh();
+                if v > 0.0 { 1.0 / v } else { 1.0 }
+            } else { 1.0 };
+
+            for ry in 0..roi_h {
+                for rx in 0..roi_w {
+                    let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
+                    let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
+                    let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
+                    match self.display_params.transfer {
+                        imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
+                        imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
+                    }
+                    let rgb = self.colormap.lookup(t);
+                    let off = (ry * roi_w + rx) * 4;
+                    self.zoom_rgba[off] = rgb[0];
+                    self.zoom_rgba[off + 1] = rgb[1];
+                    self.zoom_rgba[off + 2] = rgb[2];
+                    self.zoom_rgba[off + 3] = 255;
                 }
-                let rgb = self.colormap.lookup(t);
-                let off = (ry * roi_w + rx) * 4;
-                self.zoom_rgba[off] = rgb[0];
-                self.zoom_rgba[off + 1] = rgb[1];
-                self.zoom_rgba[off + 2] = rgb[2];
-                self.zoom_rgba[off + 3] = 255;
             }
-        }
 
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [roi_w, roi_h],
-            &self.zoom_rgba,
-        );
-        match &mut self.zoom_texture {
-            Some(tex) => tex.set(color_image, egui::TextureOptions::NEAREST),
-            None => {
-                self.zoom_texture = Some(ctx.load_texture(
-                    "zoom_image",
-                    color_image,
-                    egui::TextureOptions::NEAREST,
-                ));
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [roi_w, roi_h],
+                &self.zoom_rgba,
+            );
+            match &mut self.zoom_texture {
+                Some(tex) => tex.set(color_image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.zoom_texture = Some(ctx.load_texture(
+                        "zoom_image",
+                        color_image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
             }
         }
 
@@ -4837,6 +4836,19 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
+    // Capture panics to a file so a GUI crash is diagnosable even when the
+    // app wasn't launched from a terminal (Finder, `open`, crash-after-close).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let report = format!("{}\n\n{}", info, std::backtrace::Backtrace::force_capture());
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("last_panic.txt"), &report);
+        default_hook(info);
+    }));
+
     if std::env::args().any(|a| a == "-h" || a == "--help") {
         println!(
             "usage: astroviewer [SOURCE]\n\n\

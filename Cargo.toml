@@ -19,10 +19,17 @@ serde_json = "1"
 fitskit = "0.1"
 rfd = "0.17.2"
 svbony = { version = "0.1", features = ["image"], optional = true }
-tetra3 = { version = "0.7.3", features = [
+# ToupTek (toupcam) USB/GigE cameras and rebrands (Altair, Omegon, RisingCam, …).
+toupcam = { version = "0.1.0", features = ["image"], optional = true }
+tetra3 = { version = "0.9.0", features = [
     "image",
+    "parallel",
 ], optional = true }
 # tetra3 = { version = "0.7.2", features = ["image"], optional = true }
+
+# INDI client support (streaming XML over TCP; BLOBs decoded via fitskit).
+quick-xml = { version = "0.37", optional = true }
+base64 = { version = "0.22", optional = true }
 
 # GigE Vision support (pure-Rust transport + GenICam XML interpreter).
 viva-gige = { version = "0.2", optional = true }
@@ -34,8 +41,11 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"], opt
 [features]
 default = []
 svbony = ["dep:svbony"]
+toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
 gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
+indi = ["dep:quick-xml", "dep:base64"]
+all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
 
 [[example]]
 name = "gev_spike"

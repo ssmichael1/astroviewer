@@ -554,6 +554,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2511,12 +2517,13 @@ dependencies = [
 
 [[package]]
 name = "numeris"
-version = "0.5.12"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0225c114a2219690166bf3be79b9375cada439e54a17ada07f21c9d55b3d69c8"
+checksum = "5ade2b2f9c2f4a689eb8c5d6d8280a955006b3e29056ae9cf88fe7d2450dd001"
 dependencies = [
  "num-complex",
  "num-traits",
+ "rayon",
  "serde",
 ]
 
@@ -3196,6 +3203,15 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
@@ -3857,9 +3873,9 @@ dependencies = [
 
 [[package]]
 name = "svbony"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce819f58289730dae25bf9f9206f18cb28a88cf585e2cd45829bc0aa0c3a5f0"
+checksum = "8189614e8b4aa0353944f1158d5c3209a1a1cec9de30510fa343c2dd18fef6a5"
 dependencies = [
  "image",
  "svbony-sys",
@@ -3868,9 +3884,9 @@ dependencies = [
 
 [[package]]
 name = "svbony-sys"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9ef00fdb1092968c7e31642428ada049ed14c0019a2e5dcb0ef31ea45b921a5"
+checksum = "c251267431b000a142435a885ddfca61ee197c8679389a9a33fc0e5299a556e7"
 
 [[package]]
 name = "syn"
@@ -3929,13 +3945,14 @@ dependencies = [
 
 [[package]]
 name = "tetra3"
-version = "0.7.3"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fd0bbadcb05daffc8aecdbc313e4369b5ba6681dfd6ce81cc8318b40e12e612"
+checksum = "fae37d04774232aa25c4eeccf4638019063b33bdb1ce4e333a124ad87cce6c6a"
 dependencies = [
  "image",
  "numeris",
  "postcard",
+ "rayon",
  "serde",
  "thiserror 2.0.18",
  "tracing",
@@ -4114,6 +4131,23 @@ name = "toml_writer"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
+
+[[package]]
+name = "toupcam"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ce721df7a6637c340efa1ff8976f88c07d40ee17b3ce04f16904c65d130e49c"
+dependencies = [
+ "image",
+ "thiserror 2.0.18",
+ "toupcam-sys",
+]
+
+[[package]]
+name = "toupcam-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f79eaff4d997344f474f6c4bf714113c31fe36c532ddb59bcc41262182c21bb2"
 
 [[package]]
 name = "tracing"
@@ -4316,6 +4350,7 @@ name = "viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "cameleon-genapi",
  "chrono",
@@ -4326,12 +4361,14 @@ dependencies = [
  "egui_plot",
  "fitskit",
  "image",
+ "quick-xml 0.37.5",
  "rfd",
  "serde",
  "serde_json",
  "svbony",
  "tetra3",
  "tokio",
+ "toupcam",
  "tracing",
  "tracing-subscriber",
  "viva-gige",
@@ -4614,7 +4651,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c86287151a309799b821ca709b7345a048a2956af05957c89cb824ab919fa4e3"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.39.2",
  "quote",
 ]
 
@@ -5489,7 +5526,7 @@ version = "5.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8067892e940ed1727dea64690378601603b31d62dfde019a5335fbb7c0e0ed9"
 dependencies = [
- "quick-xml",
+ "quick-xml 0.39.2",
  "serde",
  "zbus_names",
  "zvariant",

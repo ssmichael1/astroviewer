@@ -1,6 +1,8 @@
 // Hide the console window on Windows in release builds (keep it in debug for logs).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(feature = "toupcam")]
+mod bayer;
 #[cfg(feature = "starsolve")]
 mod bright_stars;
 mod colormaps;
@@ -8,6 +10,7 @@ mod fits_source;
 mod histogram;
 mod imageview;
 mod overlays;
+mod sources;
 mod widgets;
 
 #[cfg(feature = "svbony")]
@@ -16,10 +19,16 @@ mod camera;
 #[cfg(feature = "gev")]
 mod gev_camera;
 
+#[cfg(feature = "indi")]
+mod indi_camera;
+
+#[cfg(feature = "toupcam")]
+mod toupcam_camera;
+
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use eframe::egui;
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 use image::DynamicImage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,14 +38,28 @@ use std::time::Instant;
 use colormaps::{Colormap, ColormapKind};
 use histogram::{compute_histogram, compute_stats};
 use imageview::{DisplayParams, ImageViewer};
+use sources::CameraSource;
 
 // ── Data types ──────────────────────────────────────────────────────────────
 
 struct FrameData {
-    mono: Vec<f32>,
+    /// Shared so the plate-solve worker and the recorder can hold the pixels
+    /// without copying them — at full sensor resolution this buffer is ~100 MB.
+    /// Mutate via `Arc::make_mut`, which is free while the frame is still
+    /// uniquely owned (i.e. before it is handed to either).
+    mono: Arc<Vec<f32>>,
     width: u32,
     height: u32,
     hist: histogram::Histogram,
+    /// Per-channel R/G/B histograms of the raw CFA mosaic, present only for
+    /// color sensors streaming RAW with the pattern intact. Binned identically
+    /// to `hist` so the curves overlay directly.
+    channel_hists: Option<[histogram::Histogram; 3]>,
+    /// Bayer pattern name ("RGGB", …) when the pixel data itself still carries
+    /// an intact mosaic — i.e. a color sensor with no hardware or superpixel
+    /// binning applied. Recorded as the FITS BAYERPAT keyword so calibration
+    /// software can auto-demosaic.
+    cfa: Option<&'static str>,
     mean: f32,
     stddev: f32,
     bit_depth: u8,
@@ -48,7 +71,7 @@ impl FrameData {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         let hist = compute_histogram(&mono, 256, 0.0, range_max);
         let (mean, stddev) = compute_stats(&mono);
-        FrameData { mono, width, height, hist, mean, stddev, bit_depth }
+        FrameData { mono: Arc::new(mono), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
 
@@ -67,14 +90,17 @@ impl ScaleMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistDrag { Min, Max }
 
-#[derive(Clone, PartialEq, Eq)]
-enum CameraSource {
-    None,
-    FitsFile(std::path::PathBuf),
-    #[cfg(feature = "svbony")]
-    SVBony(i32),
-    #[cfg(feature = "gev")]
-    Gev(String),
+/// Everything the zoom window's texture derives from; an unchanged key skips
+/// the per-repaint ROI recolor + upload while the window is open.
+#[derive(Clone, Copy, PartialEq)]
+struct ZoomKey {
+    frame_serial: u64,
+    roi: [u32; 4],
+    scale_min: f32,
+    scale_max: f32,
+    gamma: f32,
+    transfer: imageview::TransferFn,
+    colormap: ColormapKind,
 }
 
 enum CaptureState {
@@ -88,6 +114,25 @@ enum CaptureState {
     Gev {
         handle: gev_camera::GevHandle,
         controls: Vec<gev_camera::GevControl>,
+    },
+    #[cfg(feature = "toupcam")]
+    Toupcam {
+        // Boxed: the handle (device info, full model description) and the
+        // control mirror are much larger than the other variants.
+        handle: Box<toupcam_camera::ToupHandle>,
+        controls: Box<toupcam_camera::ToupControls>,
+    },
+    #[cfg(feature = "indi")]
+    Indi {
+        handle: indi_camera::IndiHandle,
+        /// Latest property snapshot from the reader thread.
+        props: Vec<indi_camera::IndiProperty>,
+        /// Selected INDI device (a server can host several drivers).
+        device: String,
+        /// Exposure used by the Single/Live capture buttons, in seconds.
+        exposure_s: f64,
+        /// Whether the live re-trigger loop is on.
+        live: bool,
     },
     Stopped,
 }
@@ -121,7 +166,24 @@ enum BottomTab {
 // ── Recording ───────────────────────────────────────────────────────────────
 
 enum RecordMsg {
-    Frame { mono: Vec<f32>, width: u32, height: u32, date_obs: String, exptime_s: f64 },
+    Frame {
+        /// Shared with the live frame rather than copied; see [`FrameData::mono`].
+        mono: Arc<Vec<f32>>,
+        width: u32,
+        height: u32,
+        date_obs: String,
+        exptime_s: f64,
+        /// Bayer pattern of the pixel data, when it carries an intact mosaic.
+        cfa: Option<&'static str>,
+        /// Camera gain setting, in the camera's native units.
+        gain: Option<f64>,
+        /// Black level / bias offset setting, ADU.
+        offset: Option<f64>,
+        /// Sensor temperature, °C.
+        ccd_temp: Option<f64>,
+        /// Cooler setpoint, °C (only when the cooler is on).
+        set_temp: Option<f64>,
+    },
     Stop,
 }
 
@@ -164,6 +226,12 @@ struct ViewerApp {
     image_viewer: ImageViewer,
     zoom_texture: Option<egui::TextureHandle>,
     zoom_rgba: Vec<u8>,
+    /// Key the current zoom texture was computed from; an unchanged key skips
+    /// the per-repaint ROI recolor + upload.
+    zoom_key: Option<ZoomKey>,
+    /// Bumped whenever `current_frame` is replaced — the frame-identity half
+    /// of the image/zoom recolor cache keys.
+    frame_serial: u64,
 
     ui_theme: widgets::UiTheme,
 
@@ -171,6 +239,8 @@ struct ViewerApp {
     cursor_value: Option<f32>,
     hist_drag: Option<HistDrag>,
     hist_log_y: bool,
+    /// Overlay per-channel R/G/B histograms when the frame carries them.
+    hist_rgb: bool,
 
     // Overlay system
     overlay_items: Vec<overlays::OverlayItem>,
@@ -203,8 +273,18 @@ struct ViewerApp {
     show_build_prompt: bool,
     #[cfg(feature = "starsolve")]
     fov_estimate_deg: f32,
+    /// Job sender for the long-lived extract+solve worker.
     #[cfg(feature = "starsolve")]
-    solve_rx: Option<Receiver<tetra3::SolveResult>>,
+    solve_tx: Sender<SolveJob>,
+    #[cfg(feature = "starsolve")]
+    solve_rx: Receiver<SolveOutput>,
+    /// Whether the worker is mid-job; new frames are skipped rather than queued.
+    #[cfg(feature = "starsolve")]
+    solve_busy: bool,
+    /// Centroids from the worker's last completed frame — the source for the
+    /// overlay and the index space `matched_centroid_indices` refers to.
+    #[cfg(feature = "starsolve")]
+    last_centroids: Vec<tetra3::Centroid>,
     #[cfg(feature = "starsolve")]
     last_solve: Option<tetra3::SolveResult>,
     #[cfg(feature = "starsolve")]
@@ -220,6 +300,9 @@ struct ViewerApp {
     capture_running: bool,
     recording: bool,
     rec_tx: Option<Sender<RecordMsg>>,
+    /// Recording writer thread; joined on stop/exit so the file is always
+    /// fully flushed before the process can go away.
+    rec_join: Option<thread::JoinHandle<()>>,
     rec_filename: String,
     rec_frame_count: u32,
 
@@ -245,16 +328,22 @@ struct ViewerApp {
     // Async FITS loading result (path, source, optional background)
     pending_fits_load: Option<Receiver<FitsLoadResult>>,
 
-    #[cfg(feature = "svbony")]
-    discovered_cameras: Vec<svbony::CameraInfo>,
-    #[cfg(feature = "gev")]
-    discovered_gev: Vec<gev_camera::GevDeviceInfo>,
-    #[cfg(feature = "gev")]
-    gev_manual_ip: String,
+    /// Every discovered device across all backends, in registry order — the
+    /// unified list behind the Source menu, `source_label`, and `open_source`.
+    discovered: Vec<sources::DiscoveredSource>,
+    /// Whether the Connect-to-Source window is showing.
+    connect_dialog_open: bool,
+    /// Text of each backend's address-entry field in the Connect dialog,
+    /// keyed by descriptor scheme ("gev" → last typed IP).
+    manual_inputs: std::collections::HashMap<&'static str, String>,
     /// Substring filter for the GigE controls panel.
     #[cfg(feature = "gev")]
     gev_filter: String,
-    #[cfg(any(feature = "svbony", feature = "gev"))]
+    /// Substring filter for the INDI properties panel.
+    #[cfg(feature = "indi")]
+    indi_filter: String,
+    /// Error from the last connect attempt (device open, manual-address
+    /// parse), shown in the Connect dialog and the side panel.
     camera_error: Option<String>,
 }
 
@@ -373,62 +462,52 @@ impl ViewerApp {
         // Theme colors are applied each frame by apply_theme()
         cc.egui_ctx.set_global_style(style);
 
-        let (frame_tx, frame_rx) = bounded(2);
+        // Producers send into a pump thread that forwards to the UI channel
+        // and wakes egui, so a frame repaints the moment it lands instead of
+        // waiting on a polled tick.
+        let (frame_tx, pump_rx) = bounded::<FrameData>(2);
+        let (pump_tx, frame_rx) = bounded::<FrameData>(2);
+        let pump_ctx = cc.egui_ctx.clone();
+        thread::spawn(move || {
+            while let Ok(frame) = pump_rx.recv() {
+                // Same drop-when-full semantics producers had sending directly.
+                let _ = pump_tx.try_send(frame);
+                pump_ctx.request_repaint();
+            }
+        });
         let (log_tx, log_rx) = bounded(64);
 
-        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
-        let mut log = vec![LogEntry::info("Viewer started".to_string())];
+        let log = vec![LogEntry::info("Viewer started".to_string())];
 
-        // Try to start with an SVBony camera if available
-        #[cfg(feature = "svbony")]
-        let discovered_cameras = camera::enumerate();
+        let discovered = sources::discover_all();
 
+        // Each addressed backend's connect field starts at its registry
+        // default ("localhost" for INDI, empty for GigE).
+        #[allow(unused_mut)]
+        let mut manual_inputs: std::collections::HashMap<&'static str, String> = sources::backends()
+            .iter()
+            .filter_map(|b| b.manual.as_ref().map(|m| (b.scheme, m.default.to_string())))
+            .collect();
+        // Pre-fill the manual GigE connect field with the last IP we connected
+        // to, so a reachable-by-unicast camera is one click away on relaunch.
         #[cfg(feature = "gev")]
-        let discovered_gev = gev_camera::enumerate();
-
-        #[cfg(any(feature = "svbony", feature = "gev"))]
-        #[cfg_attr(not(feature = "svbony"), allow(unused_mut))]
-        let mut camera_error: Option<String> = None;
-
-        let (camera_source, capture_state, capture_running);
-
-        #[cfg(feature = "svbony")]
-        {
-            if let Some(info) = discovered_cameras.first() {
-                match camera::start_camera(info, frame_tx.clone(), log_tx.clone()) {
-                    Ok(handle) => {
-                        let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
-                            .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
-                            .collect();
-                        log.push(LogEntry::info(format!("Camera opened: {}", info.name)));
-                        camera_source = CameraSource::SVBony(info.camera_id);
-                        capture_state = CaptureState::SVBony { handle, control_values };
-                        capture_running = true;
-                    }
-                    Err(e) => {
-                        let msg = format!("Failed to open camera: {}", e);
-                        log.push(LogEntry::error(msg.clone()));
-                        camera_error = Some(msg);
-                        camera_source = CameraSource::None;
-                        capture_state = CaptureState::Stopped;
-                        capture_running = false;
-                    }
-                }
-            } else {
-                camera_source = CameraSource::None;
-                capture_state = CaptureState::Stopped;
-                capture_running = false;
+        if let Ok(ip) = std::fs::read_to_string(Self::gev_last_ip_path()) {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                manual_inputs.insert("gev", ip);
             }
         }
 
-        #[cfg(not(feature = "svbony"))]
-        {
-            camera_source = CameraSource::None;
-            capture_state = CaptureState::Stopped;
-            capture_running = false;
-        }
+        // The app is built idle; the startup source (CLI argument or the
+        // remembered last source) is opened after construction, below.
+        let camera_source = CameraSource::None;
+        let capture_state = CaptureState::Stopped;
+        let capture_running = false;
 
         let ui_theme = widgets::UiTheme::Dark;
+
+        #[cfg(feature = "starsolve")]
+        let (solve_tx, solve_rx) = spawn_solve_worker();
 
         #[allow(unused_mut)]
         let mut app = Self {
@@ -440,10 +519,13 @@ impl ViewerApp {
             image_viewer: ImageViewer::new(),
             zoom_texture: None,
             zoom_rgba: Vec::new(),
+            zoom_key: None,
+            frame_serial: 0,
             ui_theme,
             cursor_pixel: None, cursor_value: None,
             hist_drag: None,
             hist_log_y: false,
+            hist_rgb: true,
             overlay_items: Vec::new(),
             #[cfg(feature = "starsolve")]
             show_centroids: false,
@@ -472,7 +554,13 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             fov_estimate_deg: 15.0,
             #[cfg(feature = "starsolve")]
-            solve_rx: None,
+            solve_tx,
+            #[cfg(feature = "starsolve")]
+            solve_rx,
+            #[cfg(feature = "starsolve")]
+            solve_busy: false,
+            #[cfg(feature = "starsolve")]
+            last_centroids: Vec::new(),
             #[cfg(feature = "starsolve")]
             last_solve: None,
             #[cfg(feature = "starsolve")]
@@ -483,6 +571,7 @@ impl ViewerApp {
             camera_source, capture_state, capture_running,
             recording: false,
             rec_tx: None,
+            rec_join: None,
             rec_filename: String::new(),
             rec_frame_count: 0,
             fits_fps: Arc::new(AtomicU32::new(10)),
@@ -496,20 +585,39 @@ impl ViewerApp {
             pending_bg: None,
             pending_fits_path: None,
             pending_fits_load: None,
-            #[cfg(feature = "svbony")]
-            discovered_cameras,
-            #[cfg(feature = "gev")]
-            discovered_gev,
-            #[cfg(feature = "gev")]
-            gev_manual_ip: String::new(),
+            discovered,
+            connect_dialog_open: false,
+            manual_inputs,
             #[cfg(feature = "gev")]
             gev_filter: String::new(),
-            #[cfg(any(feature = "svbony", feature = "gev"))]
-            camera_error,
+            #[cfg(feature = "indi")]
+            indi_filter: String::new(),
+            camera_error: None,
         };
 
         #[cfg(feature = "starsolve")]
         app.load_config();
+
+        // Startup source precedence: an explicit CLI descriptor (or bare FITS
+        // path) wins; otherwise reconnect to the last source used; otherwise
+        // stay idle and let the user pick from the Source menu.
+        if let Some(arg) = std::env::args().nth(1) {
+            match CameraSource::parse_descriptor(&arg) {
+                Ok(src) => app.open_source(src),
+                Err(e) => app.add_log(LogEntry::error(format!("Command-line source: {}", e))),
+            }
+        } else if let Ok(desc) = std::fs::read_to_string(Self::last_source_path()) {
+            let desc = desc.trim();
+            if !desc.is_empty() {
+                match CameraSource::parse_descriptor(desc) {
+                    Ok(src) => {
+                        app.add_log(LogEntry::info(format!("Reconnecting to last source: {}", desc)));
+                        app.open_source(src);
+                    }
+                    Err(e) => app.add_log(LogEntry::error(format!("Remembered source: {}", e))),
+                }
+            }
+        }
 
         app
     }
@@ -743,20 +851,17 @@ impl ViewerApp {
             CameraSource::FitsFile(path) => {
                 format!("FITS: {}", path.file_name().unwrap_or_default().to_string_lossy())
             }
-            #[cfg(feature = "svbony")]
-            CameraSource::SVBony(cam_id) => self
-                .discovered_cameras
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => format!("INDI: {}", host),
+            // Discovered-device backends: name from the unified list, falling
+            // back to the descriptor for a device that is no longer visible.
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            other => self
+                .discovered
                 .iter()
-                .find(|c| c.camera_id == *cam_id)
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| format!("Camera {}", cam_id)),
-            #[cfg(feature = "gev")]
-            CameraSource::Gev(id) => self
-                .discovered_gev
-                .iter()
-                .find(|c| c.id == *id)
-                .map(|c| c.display_name())
-                .unwrap_or_else(|| format!("GigE {}", id)),
+                .find(|d| d.source == *other)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| other.descriptor().unwrap_or_default()),
         }
     }
 
@@ -853,17 +958,54 @@ impl ViewerApp {
         let log_tx = self.log_tx.clone();
         let full_path = filepath.display().to_string();
         let fname = full_path.clone();
+        // Camera name for INSTRUME; file playback isn't an instrument.
+        let instrume = match &self.camera_source {
+            CameraSource::None | CameraSource::FitsFile(_) => None,
+            #[allow(unreachable_patterns)]
+            _ => Some(self.source_label()),
+        };
 
-        thread::spawn(move || {
+        let join = thread::spawn(move || {
             use fitskit::{FitsFile, Hdu, ImageData, PixelData, HeaderValue};
+            use std::io::Write;
 
-            let mut fits = FitsFile::with_empty_primary();
-            fits.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
+            // Stream each HDU to disk as its frame arrives (a FITS file is a
+            // plain concatenation of HDUs). This keeps memory flat regardless
+            // of recording length and means the data is on disk continuously —
+            // the old accumulate-then-write design held gigabytes in RAM and
+            // wrote them only at Stop, so quitting during that final write
+            // truncated the file.
+            let file = match std::fs::File::create(&filepath) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = log_tx.send(LogEntry::error(format!("Failed to create {}: {}", fname, e)));
+                    // Drain until Stop so senders don't block on a full channel.
+                    while let Ok(msg) = rx.recv() {
+                        if matches!(msg, RecordMsg::Stop) { break; }
+                    }
+                    return;
+                }
+            };
+            let mut writer = std::io::BufWriter::new(file);
+
+            let mut primary = FitsFile::with_empty_primary();
+            primary.primary_mut().header.set("OBJECT", HeaderValue::String("Recording".into()), None);
+            if let Some(name) = instrume {
+                primary.primary_mut().header.set("INSTRUME", HeaderValue::String(name), Some("camera"));
+            }
+            // After the first error, keep draining frames (so the UI thread's
+            // sends don't back up) but stop writing; the error is reported at
+            // Stop.
+            let mut write_err: Option<String> =
+                primary.primary().write_to(&mut writer).err().map(|e| e.to_string());
             let mut frame_count: u32 = 0;
 
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s } => {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp } => {
+                        if write_err.is_some() {
+                            continue;
+                        }
                         // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
                         let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
                             let clamped = v.clamp(0.0, 65535.0) as u16;
@@ -879,32 +1021,65 @@ impl ViewerApp {
                         hdu.header.set("BSCALE", HeaderValue::Float(1.0), Some("default scaling"));
                         hdu.header.set("DATE-OBS", HeaderValue::String(date_obs), Some("estimated mid-exposure UTC"));
                         hdu.header.set("EXPTIME", HeaderValue::Float(exptime_s), Some("exposure time in seconds"));
-                        fits.push_extension(hdu);
-                        frame_count += 1;
+                        // Only written when the pixels still carry an intact
+                        // mosaic (no hardware or superpixel binning) so
+                        // calibration software never demosaics mono data.
+                        if let Some(pat) = cfa {
+                            hdu.header.set("BAYERPAT", HeaderValue::String(pat.into()), Some("CFA order of pixel (0,0)"));
+                            hdu.header.set("XBAYROFF", HeaderValue::Integer(0), Some("CFA X phase offset"));
+                            hdu.header.set("YBAYROFF", HeaderValue::Integer(0), Some("CFA Y phase offset"));
+                        }
+                        if let Some(g) = gain {
+                            hdu.header.set("GAIN", HeaderValue::Float(g), Some("camera gain setting"));
+                        }
+                        if let Some(o) = offset {
+                            hdu.header.set("OFFSET", HeaderValue::Float(o), Some("black level / bias offset (ADU)"));
+                        }
+                        if let Some(t) = ccd_temp {
+                            hdu.header.set("CCD-TEMP", HeaderValue::Float(t), Some("sensor temperature (C)"));
+                        }
+                        if let Some(t) = set_temp {
+                            hdu.header.set("SET-TEMP", HeaderValue::Float(t), Some("cooler setpoint (C)"));
+                        }
+                        match hdu.write_to(&mut writer) {
+                            Ok(()) => frame_count += 1,
+                            Err(e) => write_err = Some(e.to_string()),
+                        }
                     }
                     RecordMsg::Stop => break,
                 }
             }
 
-            // Write file
-            if frame_count > 0 {
-                match fits.to_file(&filepath) {
-                    Ok(_) => {
-                        let _ = log_tx.send(LogEntry::info(
-                            format!("Recording saved: {} ({} frames)", fname, frame_count)
-                        ));
-                    }
-                    Err(e) => {
-                        let _ = log_tx.send(LogEntry::error(
-                            format!("Failed to write {}: {}", fname, e)
-                        ));
-                    }
+            // Flush the buffered tail and force it to disk before claiming
+            // success — BufWriter's Drop silently ignores flush errors.
+            if write_err.is_none() {
+                let finished = writer
+                    .flush()
+                    .and_then(|()| writer.into_inner().map_err(|e| e.into_error())?.sync_all());
+                if let Err(e) = finished {
+                    write_err = Some(e.to_string());
                 }
-            } else {
-                let _ = log_tx.send(LogEntry::info("Recording cancelled (no frames)".to_string()));
+            }
+
+            match write_err {
+                Some(e) => {
+                    let _ = log_tx.send(LogEntry::error(
+                        format!("Failed to write {}: {} ({} frames written)", fname, e, frame_count)
+                    ));
+                }
+                None if frame_count > 0 => {
+                    let _ = log_tx.send(LogEntry::info(
+                        format!("Recording saved: {} ({} frames)", fname, frame_count)
+                    ));
+                }
+                None => {
+                    let _ = std::fs::remove_file(&filepath);
+                    let _ = log_tx.send(LogEntry::info("Recording cancelled (no frames)".to_string()));
+                }
             }
         });
 
+        self.rec_join = Some(join);
         self.rec_tx = Some(tx);
         self.rec_filename = filename.clone();
         self.rec_frame_count = 0;
@@ -916,6 +1091,12 @@ impl ViewerApp {
         if let Some(tx) = self.rec_tx.take() {
             let _ = tx.send(RecordMsg::Stop);
         }
+        // Wait for the writer to drain the queue, flush, and fsync — the
+        // "Recording saved" log line arrives only once the data is on disk,
+        // and quitting right after Stop can no longer truncate the file.
+        if let Some(jh) = self.rec_join.take() {
+            let _ = jh.join();
+        }
         self.recording = false;
         self.add_log(LogEntry::info(format!(
             "Recording stopped: {} ({} frames)", self.rec_filename, self.rec_frame_count
@@ -924,15 +1105,29 @@ impl ViewerApp {
 
     fn record_frame(&mut self, frame: &FrameData) {
         if let Some(tx) = &self.rec_tx {
-            // Estimate exposure time from camera controls (microseconds)
-            #[cfg_attr(not(any(feature = "svbony", feature = "gev")), allow(unused_mut))]
+            // Exposure, gain, and temperatures from the active camera's controls.
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi")), allow(unused_mut))]
             let mut exposure_us: f64 = 0.0;
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
+            let mut gain: Option<f64> = None;
+            #[cfg_attr(not(any(feature = "svbony", feature = "gev", feature = "toupcam")), allow(unused_mut))]
+            let mut offset: Option<f64> = None;
+            #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
+            let mut ccd_temp: Option<f64> = None;
+            #[cfg_attr(not(feature = "toupcam"), allow(unused_mut))]
+            let mut set_temp: Option<f64> = None;
             #[cfg(feature = "svbony")]
             if let CaptureState::SVBony { ref control_values, .. } = self.capture_state {
                 exposure_us = control_values.iter()
                     .find(|(ct, _, _)| *ct == svbony::ControlType::Exposure)
                     .map(|(_, v, _)| *v as f64)
                     .unwrap_or(0.0);
+                gain = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::Gain)
+                    .map(|(_, v, _)| *v as f64);
+                offset = control_values.iter()
+                    .find(|(ct, _, _)| *ct == svbony::ControlType::BlackLevel)
+                    .map(|(_, v, _)| *v as f64);
             }
             #[cfg(feature = "gev")]
             if let CaptureState::Gev { ref controls, .. } = self.capture_state {
@@ -941,6 +1136,25 @@ impl ViewerApp {
                     .find(|c| c.name == "ExposureTime")
                     .map(|c| c.fvalue)
                     .unwrap_or(0.0);
+                gain = controls.iter().find(|c| c.name == "Gain").map(|c| c.fvalue);
+                offset = controls.iter().find(|c| c.name == "BlackLevel").map(|c| c.fvalue);
+            }
+            #[cfg(feature = "toupcam")]
+            if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
+                exposure_us = controls.exposure_us as f64;
+                gain = Some(controls.gain as f64);
+                // The pedestal lives in the probe-gated Advanced table.
+                offset = controls.advanced.iter()
+                    .find(|c| c.opt.0 == toupcam::sys::TOUPCAM_OPTION_BLACKLEVEL)
+                    .map(|c| c.value as f64);
+                ccd_temp = controls.temperature_c.map(|t| t as f64);
+                set_temp = controls.tec_on.then_some(controls.tec_target_c as f64);
+            }
+            #[cfg(feature = "indi")]
+            if let CaptureState::Indi { exposure_s, .. } = self.capture_state {
+                // Use the requested exposure — the driver's CCD_EXPOSURE value
+                // counts down during the exposure, so it isn't the duration.
+                exposure_us = exposure_s * 1_000_000.0;
             }
             let exptime_s = exposure_us / 1_000_000.0;
             // Estimate mid-exposure: now is ~end of readout, so midpoint ≈ now - exposure/2
@@ -953,6 +1167,11 @@ impl ViewerApp {
                 height: frame.height,
                 date_obs,
                 exptime_s,
+                cfa: frame.cfa,
+                gain,
+                offset,
+                ccd_temp,
+                set_temp,
             };
             if tx.try_send(msg).is_ok() {
                 self.rec_frame_count += 1;
@@ -979,6 +1198,18 @@ impl ViewerApp {
             }
             #[cfg(feature = "gev")]
             CaptureState::Gev { mut handle, .. } => {
+                handle.stop();
+            }
+            #[cfg(feature = "toupcam")]
+            CaptureState::Toupcam { mut handle, .. } => {
+                let _ = handle.cmd_tx.send(toupcam_camera::ToupCmd::Stop);
+                // Wait for the capture thread so the SDK closes cleanly before drop.
+                if let Some(jh) = handle.join_handle.take() {
+                    let _ = jh.join();
+                }
+            }
+            #[cfg(feature = "indi")]
+            CaptureState::Indi { mut handle, .. } => {
                 handle.stop();
             }
             CaptureState::Stopped => {}
@@ -1035,6 +1266,7 @@ impl ViewerApp {
                         start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps.clone());
                         self.capture_state = CaptureState::Fits { _stop_tx: stop_tx };
                         self.capture_running = true;
+                        self.persist_last_source();
                         self.add_log(LogEntry::info(format!(
                             "FITS: {} ({}x{}, {}-bit, {} frames)",
                             path.file_name().unwrap_or_default().to_string_lossy(), w, h, bd, nframes
@@ -1093,6 +1325,29 @@ impl ViewerApp {
                 self.capture_state = CaptureState::SVBony { handle, control_values };
                 self.camera_source = CameraSource::SVBony(camera_id);
                 self.capture_running = true;
+                self.persist_last_source();
+            }
+            Err(e) => {
+                let msg = format!("Failed to open camera: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
+    #[cfg(feature = "toupcam")]
+    fn start_toupcam(&mut self, info: &toupcam::DeviceInfo) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        match toupcam_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok((handle, controls)) => {
+                self.add_log(LogEntry::info(format!("Camera opened: {}", info.display_name)));
+                let id = info.id.clone();
+                self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
+                self.camera_source = CameraSource::Toupcam(id);
+                self.capture_running = true;
+                self.persist_last_source();
             }
             Err(e) => {
                 let msg = format!("Failed to open camera: {}", e);
@@ -1115,6 +1370,11 @@ impl ViewerApp {
                 self.capture_state = CaptureState::Gev { handle, controls };
                 self.camera_source = CameraSource::Gev(id);
                 self.capture_running = true;
+                self.persist_last_source();
+                // Remember this IP so the manual connect field is pre-filled
+                // on the next launch (and reflects the live connection now).
+                self.manual_inputs.insert("gev", info.ip.to_string());
+                let _ = std::fs::write(Self::gev_last_ip_path(), info.ip.to_string());
             }
             Err(e) => {
                 let msg = format!("Failed to open GigE camera: {}", e);
@@ -1122,6 +1382,154 @@ impl ViewerApp {
                 self.add_log(LogEntry::error(msg));
             }
         }
+    }
+
+    /// Open any source by identity — the single entry point used by the CLI
+    /// argument, last-source reconnect, and the Source menu. Cameras absent
+    /// from the discovered list trigger one re-enumeration before failing.
+    fn open_source(&mut self, source: CameraSource) {
+        match source {
+            CameraSource::None => {}
+            CameraSource::FitsFile(path) => self.start_fits(path),
+            #[cfg(feature = "indi")]
+            CameraSource::Indi(host) => self.start_indi(&host),
+            // Discovered-device backends, dispatched via the unified list.
+            #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+            source => {
+                // A raw GigE IP connects directly, without waiting on a
+                // broadcast re-enumeration it may never answer anyway.
+                #[cfg(feature = "gev")]
+                if let CameraSource::Gev(id) = &source {
+                    if let Ok(ip) = id.parse::<std::net::Ipv4Addr>() {
+                        self.start_gev(&gev_camera::GevDeviceInfo {
+                            ip,
+                            model: String::new(),
+                            manufacturer: String::new(),
+                            id: ip.to_string(),
+                        });
+                        return;
+                    }
+                }
+                // A missing device warrants re-enumerating only its own
+                // backend, not sweeping every other backend's bus.
+                if self.discovered.iter().all(|d| d.source != source) {
+                    self.refresh_backend_of(&source);
+                }
+                match self.discovered.iter().find(|d| d.source == source) {
+                    Some(d) => {
+                        let info = d.info.clone();
+                        self.start_discovered(&info);
+                    }
+                    None => self.source_not_found(source.descriptor().unwrap_or_default()),
+                }
+            }
+        }
+    }
+
+    /// Open a discovered device with its backend's start function.
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn start_discovered(&mut self, info: &sources::SourceInfo) {
+        match info {
+            #[cfg(feature = "svbony")]
+            sources::SourceInfo::SVBony(info) => self.start_svbony(info),
+            #[cfg(feature = "toupcam")]
+            sources::SourceInfo::Toupcam(info) => self.start_toupcam(info),
+            #[cfg(feature = "gev")]
+            sources::SourceInfo::Gev(info) => self.start_gev(info),
+        }
+    }
+
+    /// Connect to the INDI server at `addr` ("host" or "host:port"). Frames
+    /// only start once the user connects a device and starts an exposure from
+    /// the Controls tab, so switch there on success.
+    #[cfg(feature = "indi")]
+    fn start_indi(&mut self, addr: &str) {
+        self.stop_capture();
+        self.camera_error = None;
+
+        let addr = addr.trim().to_string();
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+            _ => (addr.clone(), indi_camera::DEFAULT_PORT),
+        };
+        match indi_camera::start_client(&host, port, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok(handle) => {
+                self.add_log(LogEntry::info(format!("INDI: connected to {host}:{port}")));
+                self.capture_state = CaptureState::Indi {
+                    handle,
+                    props: Vec::new(),
+                    device: String::new(),
+                    exposure_s: 1.0,
+                    live: false,
+                };
+                self.camera_source = CameraSource::Indi(addr);
+                self.capture_running = true;
+                self.bottom_tab = BottomTab::Controls;
+                self.persist_last_source();
+            }
+            Err(e) => {
+                let msg = format!("INDI connect failed: {}", e);
+                self.camera_error = Some(msg.clone());
+                self.add_log(LogEntry::error(msg));
+            }
+        }
+    }
+
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn source_not_found(&mut self, descriptor: String) {
+        let msg = format!("Source not found: {}", descriptor);
+        self.camera_error = Some(msg.clone());
+        self.add_log(LogEntry::error(msg));
+    }
+
+    /// Re-enumerate every camera backend (the Source menu's Refresh).
+    fn refresh_sources(&mut self) {
+        self.discovered = sources::discover_all();
+    }
+
+    /// Re-enumerate only `source`'s backend, splicing its fresh rows into
+    /// `discovered` in place of that backend's old ones.
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam"))]
+    fn refresh_backend_of(&mut self, source: &CameraSource) {
+        let Some(b) = sources::backends().iter().find(|b| Some(b.scheme) == source.scheme())
+        else {
+            return;
+        };
+        self.discovered.retain(|d| d.backend != b.name);
+        self.discovered.extend(b.discover_devices());
+    }
+
+    /// Every discovered source across all backends with kind-tagged labels —
+    /// the unified list the Source menu presents.
+    fn discovered_source_list(&self) -> Vec<(CameraSource, String)> {
+        self.discovered.iter().map(|d| (d.source.clone(), d.label())).collect()
+    }
+
+    /// File remembering the last successfully opened source's descriptor.
+    fn last_source_path() -> std::path::PathBuf {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("last_source")
+    }
+
+    /// Called after each successful open so the next launch reconnects.
+    fn persist_last_source(&self) {
+        if let Some(desc) = self.camera_source.descriptor() {
+            let _ = std::fs::write(Self::last_source_path(), desc);
+        }
+    }
+
+    /// Path of the remembered last-connected GigE IP, used to pre-fill the
+    /// manual "Connect to IP" field on the next launch.
+    #[cfg(feature = "gev")]
+    fn gev_last_ip_path() -> std::path::PathBuf {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("gev_last_ip")
     }
 
     fn poll_frame(&mut self) {
@@ -1132,6 +1540,68 @@ impl ViewerApp {
                 *controls = snap;
             }
         }
+        // Latest ToupTek telemetry (temperature, power, wheel/focuser state).
+        #[cfg(feature = "toupcam")]
+        if let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state {
+            while let Ok(t) = handle.telemetry_rx.try_recv() {
+                if let Some(v) = t.temperature_c { controls.temperature_c = Some(v); }
+                if let Some(v) = t.power_mw { controls.power_mw = Some(v); }
+                if let Some(v) = t.tec_voltage { controls.tec_voltage = Some(v); }
+                if let Some(v) = t.chamber_ht { controls.chamber_ht = Some(v); }
+                if let Some(v) = t.env_ht { controls.env_ht = Some(v); }
+                // Track the camera-chosen exposure while auto-exposure runs.
+                if controls.auto_exposure {
+                    if let Some(us) = t.real_exposure_us {
+                        controls.exposure_us = us.clamp(controls.exposure_min, controls.exposure_max);
+                    }
+                }
+                if let Some(roi) = t.roi { controls.roi = roi; }
+                if let (Some(fw), Some(p)) = (controls.filter_wheel.as_mut(), t.filter_position) {
+                    fw.position = (p >= 0).then_some(p as u32);
+                }
+                if let Some(f) = controls.focuser.as_mut() {
+                    if let Some(p) = t.focuser_position { f.position = p; }
+                    if let Some(m) = t.focuser_moving { f.moving = m; }
+                }
+            }
+        }
+        // Refresh INDI property snapshots; default the device picker to the
+        // first device with a CONNECTION property (skipping e.g. INDIGO's
+        // virtual "Server" device).
+        #[cfg(feature = "indi")]
+        if let CaptureState::Indi { ref handle, ref mut props, ref mut device, .. } = self.capture_state {
+            if let Some(snap) = handle.props.lock().unwrap().take() {
+                *props = snap;
+            }
+            if device.is_empty() {
+                if let Some(p) = props
+                    .iter()
+                    .find(|p| p.name == indi_camera::PROP_CONNECTION)
+                    .or(props.first())
+                {
+                    *device = p.device.clone();
+                }
+            }
+        }
+        // Collect the solve worker's last completed frame. Done on every UI
+        // update rather than only when a camera frame arrives, so `solve_busy`
+        // (and the "Solving…" indicator) reflects the worker, not the frame rate.
+        // Centroids and solve arrive together, so matched indices stay aligned.
+        #[cfg(feature = "starsolve")]
+        if let Ok(out) = self.solve_rx.try_recv() {
+            self.solve_busy = false;
+            self.centroid_time_ms = out.extract_ms;
+            self.centroid_count = out.centroids.len();
+            self.last_centroids = out.centroids;
+            if let Some(result) = out.solve {
+                // Update FOV estimate from successful solve
+                if let Ok(ref sol) = result {
+                    self.fov_estimate_deg = sol.fov_rad.to_degrees();
+                }
+                self.last_solve = Some(result);
+            }
+        }
+
         let mut latest = None;
         loop {
             match self.frame_rx.try_recv() {
@@ -1145,7 +1615,9 @@ impl ViewerApp {
             if self.bg_subtract_enabled {
                 if let Some(bg) = &self.bg_image {
                     if bg.len() == frame.mono.len() {
-                        for (px, bg_val) in frame.mono.iter_mut().zip(bg.iter()) {
+                        // Free: the frame is still uniquely owned here, ahead of
+                        // the solve-worker dispatch and the recorder.
+                        for (px, bg_val) in Arc::make_mut(&mut frame.mono).iter_mut().zip(bg.iter()) {
                             *px -= bg_val;
                         }
                         // Recompute histogram and stats on subtracted data
@@ -1196,59 +1668,47 @@ impl ViewerApp {
                 let dt = self.frame_times.last().unwrap().duration_since(self.frame_times[0]);
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
-            // Extract centroids inline (same frame, zero latency) and reuse for solve.
+            // Hand this frame to the worker (skipped while it is still busy).
             #[cfg(feature = "starsolve")]
-            {
-                let t0 = Instant::now();
-                let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
-                    &frame.mono, frame.width, frame.height, &self.centroid_config,
-                )
-                .map(|result| result.centroids)
-                .unwrap_or_default();
-                self.centroid_time_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                self.centroid_count = centroids.len();
-                if self.show_centroids {
-                    self.overlay_items = centroids.iter().map(overlays::centroid_to_overlay).collect();
-                } else {
-                    self.overlay_items.clear();
-                }
+            self.maybe_dispatch_solve(frame.mono.clone(), frame.width, frame.height);
 
-                // Auto plate-solve if database is loaded
-                self.maybe_auto_solve(centroids, frame.width, frame.height);
-            }
-
-            // Poll solve result
+            // Rebuild overlays from the most recent completed extraction. These
+            // may lag the displayed frame by a job; at these frame rates the
+            // difference is not visible, and it keeps the UI thread free.
+            //
+            // Capped: each centroid tessellates to a ~360-index ellipse, and
+            // wgpu aborts the process past a 256 MB buffer (~180k centroids).
+            // A daylight frame on a large sensor can fragment into far more —
+            // draw only the first (brightest; tetra3 sorts by mass) few
+            // thousand. Extraction and solving still see the full list.
             #[cfg(feature = "starsolve")]
-            if let Some(rx) = &self.solve_rx {
-                if let Ok(result) = rx.try_recv() {
-                    // Update FOV estimate from successful solve
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        if let Some(fov) = result.fov_rad {
-                            self.fov_estimate_deg = fov.to_degrees();
-                        }
-                    }
-                    self.last_solve = Some(result);
-                    self.solve_rx = None;
-                }
+            if self.show_centroids {
+                const MAX_CENTROID_OVERLAYS: usize = 4000;
+                self.overlay_items = self
+                    .last_centroids
+                    .iter()
+                    .take(MAX_CENTROID_OVERLAYS)
+                    .map(overlays::centroid_to_overlay)
+                    .collect();
+            } else {
+                self.overlay_items.clear();
             }
 
             // Append matched star markers from last solve (every frame)
             #[cfg(feature = "starsolve")]
             if self.show_matched_stars {
-                if let Some(ref result) = self.last_solve {
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        // Use matched centroid indices to mark which centroids were matched
-                        let n_centroids = self.overlay_items.len();
-                        for &cent_idx in &result.matched_centroid_indices {
-                            if cent_idx < n_centroids {
-                                if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
-                                    self.overlay_items.push(overlays::OverlayItem::Marker {
-                                        x: *x,
-                                        y: *y,
-                                        kind: overlays::MarkerKind::Crosshair,
-                                        label: None,
-                                    });
-                                }
+                if let Some(Ok(ref sol)) = self.last_solve {
+                    // Use matched centroid indices to mark which centroids were matched
+                    let n_centroids = self.overlay_items.len();
+                    for &cent_idx in &sol.matched_centroid_indices {
+                        if cent_idx < n_centroids {
+                            if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
+                                self.overlay_items.push(overlays::OverlayItem::Marker {
+                                    x: *x,
+                                    y: *y,
+                                    kind: overlays::MarkerKind::Crosshair,
+                                    label: None,
+                                });
                             }
                         }
                     }
@@ -1258,22 +1718,20 @@ impl ViewerApp {
             // Append named bright star labels from last solve
             #[cfg(feature = "starsolve")]
             if self.show_star_names && self.show_matched_stars && self.show_centroids {
-                if let Some(ref result) = self.last_solve {
-                    if result.status == tetra3::SolveStatus::MatchFound {
-                        let hw = frame.width as f32 / 2.0;
-                        let hh = frame.height as f32 / 2.0;
-                        for star in bright_stars::NAMED_STARS {
-                            if let Some((px, py)) = result.world_to_pixel(star.ra_deg, star.dec_deg) {
-                                let px = px as f32;
-                                let py = py as f32;
-                                if px.abs() < hw && py.abs() < hh {
-                                    self.overlay_items.push(overlays::OverlayItem::Marker {
-                                        x: px,
-                                        y: py,
-                                        kind: overlays::MarkerKind::Label,
-                                        label: Some(star.name.to_string()),
-                                    });
-                                }
+                if let Some(Ok(ref sol)) = self.last_solve {
+                    let hw = frame.width as f32 / 2.0;
+                    let hh = frame.height as f32 / 2.0;
+                    for star in bright_stars::NAMED_STARS {
+                        if let Some((px, py)) = sol.world_to_pixel(star.ra_deg, star.dec_deg) {
+                            let px = px as f32;
+                            let py = py as f32;
+                            if px.abs() < hw && py.abs() < hh {
+                                self.overlay_items.push(overlays::OverlayItem::Marker {
+                                    x: px,
+                                    y: py,
+                                    kind: overlays::MarkerKind::Label,
+                                    label: Some(star.name.to_string()),
+                                });
                             }
                         }
                     }
@@ -1286,6 +1744,7 @@ impl ViewerApp {
             }
 
             self.current_frame = Some(frame);
+            self.frame_serial += 1;
         }
     }
 
@@ -1308,62 +1767,24 @@ impl ViewerApp {
             // Current source status line
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
-            #[cfg(any(feature = "svbony", feature = "gev"))]
             if let Some(err) = &self.camera_error {
                 ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
             }
 
             // Source-specific settings
-            match &self.camera_source {
-                CameraSource::None => {}
-                CameraSource::FitsFile(_) => {
-                    ui.add_space(4.0);
-                    let mut fps = self.fits_fps.load(Ordering::Relaxed);
-                    if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
-                        self.fits_fps.store(fps, Ordering::Relaxed);
-                    }
-                }
-                #[cfg(feature = "svbony")]
-                CameraSource::SVBony(_) => {}
-                #[cfg(feature = "gev")]
-                CameraSource::Gev(_) => {}
-            }
-
-            // GigE: connect directly by IP (needed when a camera is reachable by
-            // unicast but doesn't answer broadcast discovery).
-            #[cfg(feature = "gev")]
-            {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("GigE IP:");
-                    ui.add(egui::TextEdit::singleline(&mut self.gev_manual_ip)
-                        .hint_text("192.168.0.2").desired_width(120.0));
-                });
-                if widgets::styled_button(ui, "Connect to IP", &pal) {
-                    match self.gev_manual_ip.trim().parse::<std::net::Ipv4Addr>() {
-                        Ok(ip) => {
-                            let info = gev_camera::GevDeviceInfo {
-                                ip,
-                                model: String::new(),
-                                manufacturer: String::new(),
-                                id: ip.to_string(),
-                            };
-                            self.start_gev(&info);
-                        }
-                        Err(_) => {
-                            self.camera_error = Some(format!(
-                                "Invalid IP: '{}'", self.gev_manual_ip.trim()
-                            ));
-                        }
-                    }
+            if let CameraSource::FitsFile(_) = &self.camera_source {
+                ui.add_space(4.0);
+                let mut fps = self.fits_fps.load(Ordering::Relaxed);
+                if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
+                    self.fits_fps.store(fps, Ordering::Relaxed);
                 }
             }
 
-            // Open FITS shortcut
-            ui.add_space(4.0);
-            let dialog_pending = self.pending_fits_path.is_some();
-            if !dialog_pending && widgets::styled_button(ui, "Open FITS...", &pal) {
-                self.open_fits_dialog();
+            // Everything about choosing a source — device lists, manual
+            // addresses, FITS files — lives in the Connect dialog.
+            ui.add_space(6.0);
+            if widgets::styled_button(ui, "Connect\u{2026}", &pal) {
+                self.connect_dialog_open = true;
             }
         });
 
@@ -1578,10 +1999,45 @@ impl ViewerApp {
                 line_vec.push([(cx + bin_width * 0.5) as f64, y]);
             }
 
-            // Log Y toggle
+            // Per-channel R/G/B overlays (raw CFA subsampling from color
+            // sensors), same step-line shape as the main curve. G sits ~2×
+            // higher than R/B: green covers half the mosaic. Hidden while
+            // background subtraction is on — its histogram is re-ranged and
+            // the CFA curves would no longer share the axis.
+            let log_y = self.hist_log_y;
+            let step_line = |h: &histogram::Histogram| -> Vec<[f64; 2]> {
+                let centers = h.centers();
+                let bw = if centers.len() > 1 { centers[1] - centers[0] } else { 1.0 };
+                let mut pts = Vec::with_capacity(centers.len() * 2);
+                for (&cx, &cy) in centers.iter().zip(h.counts.iter()) {
+                    let y = if log_y { (cy as f64 + 1.0).log10() } else { cy as f64 };
+                    pts.push([(cx - bw * 0.5) as f64, y]);
+                    pts.push([(cx + bw * 0.5) as f64, y]);
+                }
+                pts
+            };
+            let has_rgb = frame.channel_hists.is_some() && !self.bg_subtract_enabled;
+            let rgb_lines: Vec<(&'static str, egui::Color32, Vec<[f64; 2]>)> =
+                if has_rgb && self.hist_rgb {
+                    frame.channel_hists.as_ref().map_or(Vec::new(), |chs| {
+                        vec![
+                            ("R", egui::Color32::from_rgb(235, 87, 87), step_line(&chs[0])),
+                            ("G", egui::Color32::from_rgb(76, 187, 106), step_line(&chs[1])),
+                            ("B", egui::Color32::from_rgb(96, 165, 250), step_line(&chs[2])),
+                        ]
+                    })
+                } else {
+                    Vec::new()
+                };
+
+            // Log Y / RGB overlay toggles
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 widgets::styled_checkbox(ui, &mut self.hist_log_y, "Log Y", &pal);
+                if has_rgb {
+                    ui.add_space(8.0);
+                    widgets::styled_checkbox(ui, &mut self.hist_rgb, "RGB", &pal);
+                }
             });
 
             let plot_height = ui.available_height().max(80.0);
@@ -1622,6 +2078,13 @@ impl ViewerApp {
                             .fill(0.0)
                             .fill_alpha(0.35),
                     );
+                    for (name, color, pts) in rgb_lines {
+                        plot_ui.line(
+                            egui_plot::Line::new(name, egui_plot::PlotPoints::from(pts))
+                                .color(color)
+                                .width(1.0),
+                        );
+                    }
                     if self.scale_mode == ScaleMode::Manual {
                         let smin = self.display_params.scale_min as f64;
                         let smax = self.display_params.scale_max as f64;
@@ -1695,11 +2158,21 @@ impl ViewerApp {
         }
     }
 
-    #[cfg(any(feature = "svbony", feature = "gev"))]
+    #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
     fn controls_content(&mut self, ui: &mut egui::Ui) {
         #[cfg(feature = "gev")]
         if matches!(self.capture_state, CaptureState::Gev { .. }) {
             self.gev_controls_content(ui);
+            return;
+        }
+        #[cfg(feature = "toupcam")]
+        if matches!(self.capture_state, CaptureState::Toupcam { .. }) {
+            self.toupcam_controls_content(ui);
+            return;
+        }
+        #[cfg(feature = "indi")]
+        if matches!(self.capture_state, CaptureState::Indi { .. }) {
+            self.indi_controls_content(ui);
             return;
         }
         #[cfg(feature = "svbony")]
@@ -1738,6 +2211,553 @@ impl ViewerApp {
             ui.add_space(20.0);
             ui.label(egui::RichText::new("No camera connected").color(pal.text_secondary));
         });
+    }
+
+    /// Render the curated ToupTek controls: exposure (+auto/target), gain, and
+    /// speed always; Cooling, Corrections, Filter Wheel, and Focuser groups
+    /// only when the model has the hardware; and a collapsed Advanced section
+    /// for the capability-gated option table. The toupcam SDK has no runtime
+    /// control discovery, so anything shown here is hand-picked; options not
+    /// listed stay at their SDK defaults.
+    #[cfg(feature = "toupcam")]
+    fn toupcam_controls_content(&mut self, ui: &mut egui::Ui) {
+        use toupcam_camera::{CorrectionAction, ToupCmd};
+        let pal = self.pal();
+        let log_tx = self.log_tx.clone();
+        let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state else { return };
+
+        let label_w = 120.0_f32;
+        let value_w = 80.0_f32;
+        let slider_w = (ui.available_width() * 0.5 - label_w - value_w - 90.0).max(60.0);
+
+        ui.add_space(6.0);
+        egui::Grid::new("toup_controls")
+            .num_columns(4)
+            .spacing([4.0, 8.0])
+            .show(ui, |ui| {
+                // ── Exposure: log slider + unit-aware entry + Auto ──────────
+                ctrl_label(ui, label_w, "Exposure");
+                let old_exp = controls.exposure_us;
+                // Slider capped at 10 s so the log scale stays usable; the
+                // entry field still accepts the full range.
+                let slider_max = (controls.exposure_max as f32).min(10_000_000.0);
+                let mut v = controls.exposure_us as f32;
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_log_bare(
+                        ui, &mut v,
+                        (controls.exposure_min as f32).max(1.0)..=slider_max,
+                        &pal,
+                    );
+                });
+                let mut v_us = v.round() as f64;
+                let speed = (v_us * 0.005).max(1.0);
+                let dv = egui::DragValue::new(&mut v_us)
+                    .range(controls.exposure_min as f64..=controls.exposure_max as f64)
+                    .speed(speed)
+                    .custom_formatter(|v, _| {
+                        if v >= 1_000_000.0 { format!("{:.2} s", v / 1_000_000.0) }
+                        else if v >= 1_000.0 { format!("{:.1} ms", v / 1_000.0) }
+                        else { format!("{:.0} µs", v) }
+                    })
+                    .custom_parser(|s| {
+                        let s = s.trim();
+                        if let Some(n) = s.strip_suffix("ms").and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n * 1_000.0)
+                        } else if let Some(n) = s.strip_suffix("µs").or_else(|| s.strip_suffix("us")).and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n)
+                        } else if let Some(n) = s.strip_suffix('s').and_then(|n| n.trim().parse::<f64>().ok()) {
+                            Some(n * 1_000_000.0)
+                        } else {
+                            s.parse::<f64>().ok()
+                        }
+                    });
+                ui.add_sized([value_w, 20.0], dv);
+                controls.exposure_us = (v_us.round() as u32)
+                    .clamp(controls.exposure_min, controls.exposure_max);
+                if controls.exposure_us != old_exp {
+                    let _ = handle.cmd_tx.send(ToupCmd::SetExposure(controls.exposure_us));
+                }
+                let mut auto = controls.auto_exposure;
+                if widgets::styled_checkbox(ui, &mut auto, "Auto", &pal) {
+                    controls.auto_exposure = auto;
+                    let _ = handle.cmd_tx.send(ToupCmd::SetAutoExposure(auto));
+                }
+                ui.end_row();
+
+                // ── Auto-exposure target brightness (only meaningful in auto)
+                if controls.auto_exposure {
+                    ctrl_label(ui, label_w, "AE Target");
+                    let old = controls.auto_expo_target;
+                    let mut t = controls.auto_expo_target as f32;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut t, 16.0..=220.0, &pal);
+                    });
+                    controls.auto_expo_target = t.round() as u16;
+                    ui.label(egui::RichText::new(controls.auto_expo_target.to_string()).monospace().size(12.0));
+                    if controls.auto_expo_target != old {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetAutoExpoTarget(controls.auto_expo_target));
+                    }
+                    ui.end_row();
+                }
+
+                // ── Gain (percent, 100 = 1×) ────────────────────────────────
+                ctrl_label(ui, label_w, "Gain");
+                let old_gain = controls.gain;
+                let mut g = controls.gain as f32;
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(
+                        ui, &mut g,
+                        controls.gain_min as f32..=(controls.gain_max.max(controls.gain_min + 1)) as f32,
+                        &pal,
+                    );
+                });
+                controls.gain = g.round() as u16;
+                ui.label(egui::RichText::new(format!("{} %", controls.gain)).monospace().size(12.0));
+                if controls.gain != old_gain {
+                    let _ = handle.cmd_tx.send(ToupCmd::SetGain(controls.gain));
+                }
+                ui.end_row();
+
+                // ── Frame-speed level (USB/link bandwidth tier) ─────────────
+                if controls.max_speed > 0 {
+                    ctrl_label(ui, label_w, "Speed Level");
+                    let old = controls.speed;
+                    let mut s = controls.speed as f32;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut s, 0.0..=controls.max_speed as f32, &pal);
+                    });
+                    controls.speed = s.round() as u16;
+                    ui.label(egui::RichText::new(format!("{} / {}", controls.speed, controls.max_speed)).monospace().size(12.0));
+                    if controls.speed != old {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetSpeed(controls.speed));
+                    }
+                    ui.end_row();
+                }
+
+                // ── Capture mode: free-running video vs software trigger ────
+                if controls.has_soft_trigger {
+                    ctrl_label(ui, label_w, "Capture Mode");
+                    let mut mode = controls.trigger_mode as i32;
+                    if widgets::combo_box(
+                        ui, "toup_trig_mode", "", &mut mode,
+                        &[(0, "Video"), (1, "Triggered")], &pal,
+                    ) {
+                        controls.trigger_mode = mode != 0;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetTriggerMode(controls.trigger_mode));
+                    }
+                    if controls.trigger_mode
+                        && ui.button("Snap")
+                            .on_hover_text("Fire one software-triggered exposure")
+                            .clicked()
+                    {
+                        let _ = handle.cmd_tx.send(ToupCmd::Snap);
+                    }
+                    ui.end_row();
+                }
+
+                // ── Sensor readout resolution (restarts the stream) ─────────
+                if controls.resolutions.len() > 1 {
+                    ctrl_label(ui, label_w, "Resolution");
+                    let labels: Vec<String> = controls
+                        .resolutions
+                        .iter()
+                        .map(|(w, h)| format!("{} × {}", w, h))
+                        .collect();
+                    let opts: Vec<(u32, &str)> = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i as u32, s.as_str()))
+                        .collect();
+                    let mut sel = controls.resolution_index;
+                    if widgets::combo_box(ui, "toup_resolution", "", &mut sel, &opts, &pal) {
+                        controls.resolution_index = sel;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetResolution(sel));
+                        // ROI resets to the new full frame; telemetry corrects.
+                        if let Some(&(w, h)) = controls.resolutions.get(sel as usize) {
+                            controls.roi = (0, 0, w, h);
+                            controls.roi_edit = controls.roi;
+                        }
+                    }
+                    ui.end_row();
+                }
+
+                // ── Software 2×2 superpixel binning (color sensors) ─────────
+                if controls.is_color {
+                    ctrl_label(ui, label_w, "Superpixel");
+                    let mut sp = controls.superpixel;
+                    if widgets::styled_checkbox(ui, &mut sp, "2×2 mono bin", &pal) {
+                        controls.superpixel = sp;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetSuperpixel(sp));
+                    }
+                    ui.label(
+                        egui::RichText::new("exact CFA average, ½ res")
+                            .size(11.0).color(pal.text_secondary),
+                    ).on_hover_text(
+                        "Averages each 2×2 Bayer cell into one mono pixel — removes the \
+                         mosaic checkerboard without interpolation. Applies to display, \
+                         statistics, and recording.",
+                    );
+                    ui.end_row();
+                }
+
+                // ── Cooling (TEC-equipped models only) ──────────────────────
+                if controls.has_tec {
+                    ctrl_label(ui, label_w, "Cooler");
+                    let mut on = controls.tec_on;
+                    if widgets::styled_checkbox(ui, &mut on, "TEC on", &pal) {
+                        controls.tec_on = on;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetOption(toupcam::Opt::TEC, on as i32));
+                    }
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Target Temp");
+                    let old_target = controls.tec_target_c;
+                    let mut t = controls.tec_target_c;
+                    let (tec_lo, tec_hi) = controls.tec_range;
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut t, tec_lo..=tec_hi, &pal);
+                    });
+                    ui.label(egui::RichText::new(format!("{:.1} °C", t)).monospace().size(12.0));
+                    if (t - old_target).abs() >= 0.05 {
+                        controls.tec_target_c = t;
+                        let _ = handle.cmd_tx.send(ToupCmd::SetOption(
+                            toupcam::Opt::TEC_TARGET,
+                            (t * 10.0).round() as i32,
+                        ));
+                    }
+                    ui.end_row();
+                }
+
+                // ── Read-only telemetry ─────────────────────────────────────
+                if let Some(temp) = controls.temperature_c {
+                    ctrl_label(ui, label_w, "Sensor Temp");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} °C", temp))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some(mw) = controls.power_mw {
+                    ctrl_label(ui, label_w, "Power Draw");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} W", mw as f32 / 1000.0))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some(v) = controls.tec_voltage {
+                    ctrl_label(ui, label_w, "TEC Drive");
+                    let text = match controls.tec_voltage_max {
+                        Some(max) => format!("{:.1} V / {:.1} V max", v, max),
+                        None => format!("{:.1} V", v),
+                    };
+                    ui.label(
+                        egui::RichText::new(text)
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some((rh, t)) = controls.chamber_ht {
+                    ctrl_label(ui, label_w, "Chamber");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} %RH  {:.1} °C", rh, t))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+                if let Some((rh, t)) = controls.env_ht {
+                    ctrl_label(ui, label_w, "Ambient");
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} %RH  {:.1} °C", rh, t))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+                }
+            });
+
+        // ── Advanced: curated, capability-gated SDK options ─────────────────
+        if !controls.advanced.is_empty() {
+            use toupcam_camera::AdvKind;
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Advanced").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_advanced")
+                    .num_columns(3)
+                    .spacing([4.0, 8.0])
+                    .show(ui, |ui| {
+                        for c in controls.advanced.iter_mut() {
+                            ctrl_label(ui, label_w, c.label);
+                            let old = c.value;
+                            match c.kind {
+                                AdvKind::Bool => {
+                                    let mut on = c.value != 0;
+                                    if widgets::styled_checkbox(ui, &mut on, "", &pal) {
+                                        c.value = on as i32;
+                                    }
+                                }
+                                AdvKind::Int { min, max } => {
+                                    let mut v = c.value as f32;
+                                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                                        widgets::styled_slider_bare(ui, &mut v, min as f32..=max as f32, &pal);
+                                    });
+                                    c.value = v.round() as i32;
+                                    ui.label(egui::RichText::new(c.value.to_string()).monospace().size(12.0));
+                                }
+                                AdvKind::Enum(variants) => {
+                                    widgets::combo_box(ui, c.label, "", &mut c.value, variants, &pal);
+                                }
+                            }
+                            if c.value != old {
+                                let _ = handle.cmd_tx.send(ToupCmd::SetOption(c.opt, c.value));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+
+        // ── Hardware sensor ROI (reduces readout region on-camera) ──────────
+        {
+            let (full_w, full_h) = controls
+                .resolutions
+                .get(controls.resolution_index as usize)
+                .copied()
+                .unwrap_or((controls.roi.2, controls.roi.3));
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Sensor ROI").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_roi").num_columns(5).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Active");
+                    let (x, y, w, h) = controls.roi;
+                    ui.label(
+                        egui::RichText::new(format!("{} × {} @ ({}, {})", w, h, x, y))
+                            .monospace().size(12.0).color(pal.text_secondary),
+                    );
+                    ui.end_row();
+
+                    let e = &mut controls.roi_edit;
+                    ctrl_label(ui, label_w, "Offset");
+                    ui.add(egui::DragValue::new(&mut e.0).range(0..=full_w.saturating_sub(8)).speed(2).prefix("x "));
+                    ui.add(egui::DragValue::new(&mut e.1).range(0..=full_h.saturating_sub(8)).speed(2).prefix("y "));
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Size");
+                    ui.add(egui::DragValue::new(&mut e.2).range(8..=full_w).speed(2).prefix("w "));
+                    ui.add(egui::DragValue::new(&mut e.3).range(8..=full_h).speed(2).prefix("h "));
+                    if ui.button("Apply").on_hover_text("Set the sensor readout region (values rounded to even)").clicked() {
+                        // SDK constraints: offsets/sizes even, minimum 8×8,
+                        // region inside the frame.
+                        e.0 = (e.0 & !1).min(full_w.saturating_sub(8));
+                        e.1 = (e.1 & !1).min(full_h.saturating_sub(8));
+                        e.2 = (e.2 & !1).clamp(8, full_w - e.0);
+                        e.3 = (e.3 & !1).clamp(8, full_h - e.1);
+                        let _ = handle.cmd_tx.send(ToupCmd::SetRoi(e.0, e.1, e.2, e.3));
+                    }
+                    if ui.button("Full Frame").clicked() {
+                        *e = (0, 0, full_w, full_h);
+                        let _ = handle.cmd_tx.send(ToupCmd::SetRoi(0, 0, 0, 0));
+                    }
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── Corrections: on-camera flat/dark/fixed-pattern pipelines ────────
+        if !controls.corrections.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Corrections").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_corrections")
+                    .num_columns(5)
+                    .spacing([6.0, 8.0])
+                    .show(ui, |ui| {
+                        for c in controls.corrections.iter_mut() {
+                            let kind = c.kind;
+                            ctrl_label(ui, label_w, kind.label());
+                            let mut on = c.enabled;
+                            if widgets::styled_checkbox(ui, &mut on, "Apply", &pal) {
+                                c.enabled = on;
+                                let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                    kind, CorrectionAction::Enable(on),
+                                ));
+                            }
+                            if ui.button("Capture").on_hover_text(kind.capture_hint()).clicked() {
+                                let _ = log_tx.try_send(LogEntry::info(format!(
+                                    "{}: {}", kind.label(), kind.capture_hint(),
+                                )));
+                                let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                    kind, CorrectionAction::Capture,
+                                ));
+                                c.enabled = true; // a successful capture auto-applies
+                            }
+                            if ui.button("Import…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                    let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                        kind,
+                                        CorrectionAction::Import(path.to_string_lossy().into_owned()),
+                                    ));
+                                    c.enabled = true;
+                                }
+                            }
+                            if ui.button("Export…").clicked() {
+                                let default = format!(
+                                    "{}.dat",
+                                    kind.label().to_lowercase().replace(' ', "_")
+                                );
+                                if let Some(path) = rfd::FileDialog::new().set_file_name(default).save_file() {
+                                    let _ = handle.cmd_tx.send(ToupCmd::Correction(
+                                        kind,
+                                        CorrectionAction::Export(path.to_string_lossy().into_owned()),
+                                    ));
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+
+        // ── Filter wheel (models with an integrated/connected wheel) ────────
+        if let Some(fw) = controls.filter_wheel.as_mut() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Filter Wheel").strong().color(pal.accent),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_wheel").num_columns(3).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Position");
+                    match fw.position {
+                        Some(pos) => {
+                            let labels: Vec<String> =
+                                (0..fw.slots).map(|i| format!("Slot {}", i + 1)).collect();
+                            let opts: Vec<(u32, &str)> = labels
+                                .iter()
+                                .enumerate()
+                                .map(|(i, s)| (i as u32, s.as_str()))
+                                .collect();
+                            let mut sel = pos.min(fw.slots.saturating_sub(1));
+                            if widgets::combo_box(ui, "toup_wheel_pos", "", &mut sel, &opts, &pal) {
+                                let _ = handle.cmd_tx.send(ToupCmd::SetFilterPosition(sel));
+                                fw.position = None; // shows "moving" until telemetry updates
+                            }
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("moving…")
+                                    .color(pal.text_secondary).italics(),
+                            );
+                        }
+                    }
+                    if ui.button("Home").on_hover_text("Reset / re-home the wheel").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::ResetFilterWheel);
+                        fw.position = None;
+                    }
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── Astro auto-focuser ───────────────────────────────────────────────
+        if let Some(f) = controls.focuser.as_mut() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Focuser").strong().color(pal.accent),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_focuser").num_columns(4).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Position");
+                    let pos_text = if f.moving {
+                        format!("{} (moving)", f.position)
+                    } else {
+                        f.position.to_string()
+                    };
+                    ui.label(egui::RichText::new(pos_text).monospace().size(12.0));
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Target");
+                    ui.add(egui::DragValue::new(&mut f.target).range(0..=f.max_step).speed(10));
+                    if ui.button("Move").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::SetFocuserPosition(f.target));
+                    }
+                    if ui.button("Halt").clicked() {
+                        let _ = handle.cmd_tx.send(ToupCmd::FocuserHalt);
+                    }
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── ST4 autoguider port: manual pulse for cable/mount testing ───────
+        if controls.has_st4 {
+            use toupcam::GuideDirection;
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Guide (ST4)").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_st4").num_columns(2).spacing([6.0, 8.0]).show(ui, |ui| {
+                    ctrl_label(ui, label_w, "Pulse Length");
+                    ui.add(
+                        egui::DragValue::new(&mut controls.guide_ms)
+                            .range(10..=10_000)
+                            .speed(10)
+                            .suffix(" ms"),
+                    );
+                    ui.end_row();
+
+                    ctrl_label(ui, label_w, "Pulse");
+                    ui.horizontal(|ui| {
+                        for (label, dir) in [
+                            ("N", GuideDirection::North),
+                            ("S", GuideDirection::South),
+                            ("E", GuideDirection::East),
+                            ("W", GuideDirection::West),
+                        ] {
+                            if ui.button(label).clicked() {
+                                let _ = handle.cmd_tx.send(ToupCmd::Guide(dir, controls.guide_ms));
+                            }
+                        }
+                        if ui.button("Stop").on_hover_text("Cancel any pulse in progress").clicked() {
+                            let _ = handle.cmd_tx.send(ToupCmd::Guide(GuideDirection::Stop, 0));
+                        }
+                    });
+                    ui.end_row();
+                });
+            });
+        }
+
+        // ── Static device identity ───────────────────────────────────────────
+        if !controls.info_rows.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Camera Info").strong().color(pal.accent),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("toup_info").num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
+                    for (label, value) in &controls.info_rows {
+                        ctrl_label(ui, label_w, label);
+                        ui.label(
+                            egui::RichText::new(value)
+                                .monospace().size(12.0).color(pal.text_secondary),
+                        );
+                        ui.end_row();
+                    }
+                });
+            });
+        }
     }
 
     /// Render the GigE camera's GenICam-derived controls, grouped by the
@@ -1961,6 +2981,182 @@ impl ViewerApp {
         }
     }
 
+    /// Render the INDI device's properties: a device picker with connection
+    /// state, a capture block (exposure, Single / Live), then the generic
+    /// property vectors grouped by the driver's own groups — the same
+    /// collapsible-grid pattern as the GigE panel.
+    #[cfg(feature = "indi")]
+    fn indi_controls_content(&mut self, ui: &mut egui::Ui) {
+        use indi_camera::{BlobMode, IndiCmd, IndiProperty, IndiValue, PropState};
+        let pal = self.pal();
+        if !matches!(self.capture_state, CaptureState::Indi { .. }) { return }
+
+        // Filter box first — self.indi_filter can't be borrowed once
+        // capture_state is destructured below.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.indi_filter)
+                    .hint_text("Filter properties…")
+                    .desired_width(180.0),
+            );
+            if !self.indi_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.indi_filter.clear();
+            }
+        });
+        let filter = self.indi_filter.trim().to_lowercase();
+        let filtering = !filter.is_empty();
+
+        let CaptureState::Indi {
+            ref handle, ref mut props, ref mut device, ref mut exposure_s, ref mut live,
+        } = self.capture_state else { return };
+
+        if props.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.label(egui::RichText::new("Waiting for INDI properties…").color(pal.text_secondary));
+            });
+            return;
+        }
+
+        // Device row: picker + connection state.
+        let mut devices: Vec<String> = Vec::new();
+        for p in props.iter() {
+            if !devices.contains(&p.device) { devices.push(p.device.clone()); }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Device").color(pal.text_secondary));
+            egui::ComboBox::from_id_salt("indi_device")
+                .selected_text(device.clone())
+                .show_ui(ui, |ui| {
+                    for d in &devices {
+                        if ui.selectable_label(*d == *device, d).clicked() {
+                            *device = d.clone();
+                        }
+                    }
+                });
+            // Item names differ by dialect: INDI uses CONNECT/DISCONNECT,
+            // INDIGO (protocol 2.0) CONNECTED/DISCONNECTED — read them from
+            // the property definition instead of assuming.
+            let conn = props.iter().find(|p| {
+                p.device == *device && p.name == indi_camera::PROP_CONNECTION
+            });
+            let connected = conn.is_some_and(|p| {
+                p.elements.iter().any(|el| {
+                    (el.name == "CONNECT" || el.name == "CONNECTED")
+                        && matches!(el.value, IndiValue::Switch(true))
+                })
+            });
+            let indigo_names = conn
+                .is_some_and(|p| p.elements.iter().any(|el| el.name == "CONNECTED"));
+            let (on_item, off_item) = if indigo_names {
+                ("CONNECTED", "DISCONNECTED")
+            } else {
+                ("CONNECT", "DISCONNECT")
+            };
+            if connected {
+                ui.label(egui::RichText::new("● connected")
+                    .color(egui::Color32::from_rgb(34, 197, 94)).small());
+                if ui.small_button("Disconnect").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::SetSwitch {
+                        device: device.clone(),
+                        property: indi_camera::PROP_CONNECTION.to_string(),
+                        values: vec![(on_item.into(), false), (off_item.into(), true)],
+                    });
+                }
+            } else if ui.small_button("Connect").clicked() {
+                let _ = handle.cmd_tx.send(IndiCmd::Connect { device: device.clone() });
+                let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                    device: device.clone(), mode: BlobMode::Also,
+                });
+            }
+        });
+
+        // Capture block — INDI exposures are one-shot; Live re-triggers on
+        // each received frame.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Exposure (s)").color(pal.text_secondary));
+            ui.add(egui::DragValue::new(exposure_s).speed(0.1).range(0.001..=3600.0));
+            if *live {
+                if ui.button("Stop Live").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::StopLive);
+                    *live = false;
+                }
+            } else {
+                if ui.button("Single").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                        device: device.clone(), mode: BlobMode::Also,
+                    });
+                    let _ = handle.cmd_tx.send(IndiCmd::StartExposure {
+                        device: device.clone(), seconds: *exposure_s, live: false,
+                    });
+                }
+                if ui.button("Live").clicked() {
+                    let _ = handle.cmd_tx.send(IndiCmd::EnableBlob {
+                        device: device.clone(), mode: BlobMode::Also,
+                    });
+                    let _ = handle.cmd_tx.send(IndiCmd::StartExposure {
+                        device: device.clone(), seconds: *exposure_s, live: true,
+                    });
+                    *live = true;
+                }
+            }
+            let exposing = props.iter().any(|p| {
+                p.device == *device
+                    && p.name == indi_camera::PROP_EXPOSURE
+                    && p.state == PropState::Busy
+            });
+            if exposing {
+                ui.label(egui::RichText::new("exposing…").color(pal.accent).small());
+            }
+        });
+
+        // Property groups (CONNECTION is handled by the device row above).
+        let matches = |p: &IndiProperty| {
+            !filtering
+                || p.label.to_lowercase().contains(&filter)
+                || p.name.to_lowercase().contains(&filter)
+                || p.elements.iter().any(|el| el.label.to_lowercase().contains(&filter))
+        };
+        let mut groups: Vec<String> = Vec::new();
+        for p in props.iter().filter(|p| p.device == *device) {
+            if !groups.contains(&p.group) { groups.push(p.group.clone()); }
+        }
+
+        for group in &groups {
+            if !props.iter().any(|p| {
+                p.device == *device && &p.group == group
+                    && p.name != indi_camera::PROP_CONNECTION && matches(p)
+            }) {
+                continue;
+            }
+            ui.add_space(2.0);
+            let title = if group.is_empty() { "Other" } else { group.as_str() };
+            let mut header = egui::CollapsingHeader::new(
+                egui::RichText::new(title).strong().color(pal.accent),
+            )
+            .default_open(group.contains("Main"));
+            if filtering {
+                header = header.open(Some(true)); // reveal matches; reverts when cleared
+            }
+            header.show(ui, |ui| {
+                egui::Grid::new(format!("indi_prop_{group}"))
+                    .num_columns(3)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        for prop in props.iter_mut().filter(|p| {
+                            p.device == *device && &p.group == group
+                                && p.name != indi_camera::PROP_CONNECTION
+                        }) {
+                            if !matches(prop) { continue }
+                            indi_property_rows(ui, prop, &handle.cmd_tx, &pal);
+                        }
+                    });
+            });
+        }
+    }
+
     #[cfg(feature = "svbony")]
     fn draw_control(
         ui: &mut egui::Ui,
@@ -2152,9 +3348,9 @@ impl ViewerApp {
             // Solve status
             if self.solver_db.is_some() {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(75.0, 18.0), egui::Sense::hover());
-                let (text, color) = if self.solve_rx.is_some() {
+                let (text, color) = if self.solve_busy {
                     ("Solving...", egui::Color32::from_rgb(217, 119, 6))
-                } else if self.last_solve.as_ref().map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound) {
+                } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                     ("Locked", egui::Color32::from_rgb(34, 197, 94))
                 } else {
                     ("Searching...", pal.text_secondary)
@@ -2319,57 +3515,52 @@ impl ViewerApp {
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(2.0);
-            if result.status == tetra3::SolveStatus::MatchFound {
-                ui.horizontal_wrapped(|ui| {
-                    let mono = egui::FontId::monospace(12.0);
-                    let dim = pal.text_secondary;
-                    let sp = 10.0;
-                    if let Some(crval) = result.crval_rad {
+            match result {
+                Ok(sol) => {
+                    ui.horizontal_wrapped(|ui| {
+                        let mono = egui::FontId::monospace(12.0);
+                        let dim = pal.text_secondary;
+                        let sp = 10.0;
+                        let crval = sol.crval_rad;
                         ui.label(egui::RichText::new("RA").color(dim));
                         ui.label(egui::RichText::new(format!("{:.4}°", crval[0].to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
                         ui.label(egui::RichText::new("Dec").color(dim));
                         ui.label(egui::RichText::new(format!("{:.4}°", crval[1].to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(fov) = result.fov_rad {
                         ui.label(egui::RichText::new("FOV").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.2}°", fov.to_degrees())).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.2}°", sol.fov_rad.to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                        let ifov = fov.to_degrees() as f64 / result.image_width.max(1) as f64 * 3600.0;
+                        let ifov = sol.fov_rad.to_degrees() as f64
+                            / sol.camera_model.image_width.max(1) as f64
+                            * 3600.0;
                         ui.label(egui::RichText::new("IFOV").color(dim));
                         ui.label(egui::RichText::new(format!("{:.2}\"/px", ifov)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(theta) = result.theta_rad {
                         ui.label(egui::RichText::new("Rot").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.2}°", theta.to_degrees())).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.2}°", sol.theta_rad.to_degrees())).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(n) = result.num_matches {
                         ui.label(egui::RichText::new("Stars").color(dim));
-                        ui.label(egui::RichText::new(format!("{}", n)).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{}", sol.num_matches)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    if let Some(rmse) = result.rmse_rad {
                         ui.label(egui::RichText::new("RMSE").color(dim));
-                        ui.label(egui::RichText::new(format!("{:.1}\"", rmse.to_degrees() * 3600.0)).font(mono.clone()));
+                        ui.label(egui::RichText::new(format!("{:.1}\"", sol.rmse_rad.to_degrees() * 3600.0)).font(mono.clone()));
                         ui.add_space(sp);
-                    }
-                    ui.label(egui::RichText::new("Extract").color(dim));
-                    ui.label(egui::RichText::new(format!("{:.0}ms", self.centroid_time_ms)).font(mono.clone()));
-                    ui.add_space(sp);
-                    ui.label(egui::RichText::new("Solve").color(dim));
-                    ui.label(egui::RichText::new(format!("{:.0}ms", result.solve_time_ms)).font(mono));
-                });
-            } else {
-                let msg = match result.status {
-                    tetra3::SolveStatus::NoMatch => "No match",
-                    tetra3::SolveStatus::Timeout => "Timed out",
-                    tetra3::SolveStatus::TooFew => "Too few stars",
-                    _ => "",
-                };
-                ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+                        ui.label(egui::RichText::new("Extract").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.0}ms", self.centroid_time_ms)).font(mono.clone()));
+                        ui.add_space(sp);
+                        ui.label(egui::RichText::new("Solve").color(dim));
+                        ui.label(egui::RichText::new(format!("{:.0}ms", sol.solve_time_ms)).font(mono));
+                    });
+                }
+                Err(fail) => {
+                    let msg = match fail.status {
+                        tetra3::SolveStatus::NoMatch => "No match",
+                        tetra3::SolveStatus::Timeout => "Timed out",
+                        tetra3::SolveStatus::TooFew => "Too few stars",
+                    };
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+                }
             }
         }
     }
@@ -2411,7 +3602,7 @@ fn gev_category_default_open(cat: &str) -> bool {
 
 /// Format a GenICam float for telemetry display: integers plain, otherwise
 /// precision scaled to magnitude.
-#[cfg(feature = "gev")]
+#[cfg(any(feature = "gev", feature = "indi"))]
 fn fmt_gev_float(v: f64) -> String {
     let a = v.abs();
     if v == v.trunc() && a < 1e7 {
@@ -2423,6 +3614,200 @@ fn fmt_gev_float(v: f64) -> String {
     } else {
         format!("{v:.5}")
     }
+}
+
+/// Render the grid rows for one INDI property vector (label | widget | state).
+/// Numbers and text commit the *whole* vector at end-of-edit — INDI expects
+/// full-vector writes, and per-tick sends would spam the wire. Switches send
+/// immediately; a OneOfMany switch vector renders as a single combo row.
+#[cfg(feature = "indi")]
+fn indi_property_rows(
+    ui: &mut egui::Ui,
+    prop: &mut indi_camera::IndiProperty,
+    cmd_tx: &Sender<indi_camera::IndiCmd>,
+    pal: &widgets::Palette,
+) {
+    use indi_camera::{IndiCmd, IndiValue, PropPerm, PropState, SwitchRule};
+
+    let writable = prop.perm != PropPerm::Ro;
+    let state_dot = |ui: &mut egui::Ui, state: PropState| {
+        let (color, name) = match state {
+            PropState::Idle => (pal.text_secondary, "idle"),
+            PropState::Ok => (egui::Color32::from_rgb(34, 197, 94), "ok"),
+            PropState::Busy => (egui::Color32::from_rgb(245, 158, 11), "busy"),
+            PropState::Alert => (egui::Color32::from_rgb(239, 68, 68), "alert"),
+        };
+        ui.label(egui::RichText::new("●").color(color).small()).on_hover_text(name);
+    };
+    let ro_text = |ui: &mut egui::Ui, text: String| {
+        ui.label(egui::RichText::new(text).monospace().color(pal.text_primary));
+    };
+
+    // Vectors are homogeneous by protocol; the first element sets the type.
+    let Some(first) = prop.elements.first() else { return };
+
+    // OneOfMany switch vectors are radio groups → single combo row.
+    if matches!(first.value, IndiValue::Switch(_)) && prop.rule == Some(SwitchRule::OneOfMany) {
+        ui.label(egui::RichText::new(&prop.label).color(pal.text_secondary))
+            .on_hover_text(&prop.name);
+        let on_idx = prop.elements.iter()
+            .position(|el| matches!(el.value, IndiValue::Switch(true)));
+        let cur = on_idx.map(|i| prop.elements[i].label.clone()).unwrap_or_default();
+        if writable {
+            let mut pick: Option<usize> = None;
+            egui::ComboBox::from_id_salt(("indi_sw", &prop.device, &prop.name))
+                .selected_text(cur)
+                .show_ui(ui, |ui| {
+                    for (i, el) in prop.elements.iter().enumerate() {
+                        if ui.selectable_label(Some(i) == on_idx, &el.label).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            if let Some(i) = pick {
+                for (j, el) in prop.elements.iter_mut().enumerate() {
+                    el.value = IndiValue::Switch(i == j);
+                }
+                let _ = cmd_tx.send(IndiCmd::SetSwitch {
+                    device: prop.device.clone(),
+                    property: prop.name.clone(),
+                    values: indi_switch_payload(prop),
+                });
+            }
+        } else {
+            ro_text(ui, cur);
+        }
+        state_dot(ui, prop.state);
+        ui.end_row();
+        return;
+    }
+
+    let n = prop.elements.len();
+    let (pdev, pname, plabel, pstate) =
+        (prop.device.clone(), prop.name.clone(), prop.label.clone(), prop.state);
+    let mut commit_numbers = false;
+    let mut commit_texts = false;
+    let mut commit_switches = false;
+
+    for idx in 0..n {
+        let el_label = {
+            let el = &prop.elements[idx];
+            if n == 1 || el.label == plabel {
+                plabel.clone()
+            } else {
+                format!("{} · {}", plabel, el.label)
+            }
+        };
+        let hover = format!("{}.{}", pname, prop.elements[idx].name);
+        ui.label(egui::RichText::new(el_label).color(pal.text_secondary)).on_hover_text(hover);
+
+        let el = &mut prop.elements[idx];
+        match &mut el.value {
+            IndiValue::Number { value, min, max, step, .. } => {
+                if writable {
+                    let id = egui::Id::new(("indi_num", &pdev, &pname, &el.name));
+                    let speed = if *step > 0.0 {
+                        *step
+                    } else if *max > *min {
+                        (*max - *min) / 1000.0
+                    } else {
+                        0.1
+                    };
+                    let mut dv = egui::DragValue::new(value).speed(speed);
+                    if *max > *min { dv = dv.range(*min..=*max); }
+                    let r = ui.add(dv);
+                    let mut dirty: bool = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+                    dirty |= r.changed();
+                    let active = r.dragged() || r.has_focus();
+                    if dirty && !active {
+                        commit_numbers = true;
+                        dirty = false;
+                    }
+                    ui.data_mut(|d| d.insert_temp(id, dirty));
+                } else {
+                    ro_text(ui, fmt_gev_float(*value));
+                }
+            }
+            IndiValue::Switch(on) => {
+                if writable {
+                    let mut v = *on;
+                    if ui.add(egui::Checkbox::new(&mut v, "")).changed() {
+                        *on = v;
+                        commit_switches = true;
+                    }
+                } else {
+                    ro_text(ui, if *on { "On".into() } else { "Off".into() });
+                }
+            }
+            IndiValue::Text(t) => {
+                if writable {
+                    // Edit a temp buffer while focused; commit on Enter so
+                    // half-typed values never hit the wire.
+                    let id = egui::Id::new(("indi_text", &pdev, &pname, &el.name));
+                    let mut buf: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| t.clone());
+                    let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(160.0));
+                    if r.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && buf != *t {
+                            *t = buf;
+                            commit_texts = true;
+                        }
+                        ui.data_mut(|d| d.remove::<String>(id));
+                    } else if r.has_focus() {
+                        ui.data_mut(|d| d.insert_temp(id, buf));
+                    }
+                } else {
+                    ro_text(ui, t.clone());
+                }
+            }
+            IndiValue::Light(s) => state_dot(ui, *s),
+            IndiValue::Blob { format, size } => {
+                let text = if *size > 0 {
+                    format!("{} ({} bytes)", format, size)
+                } else if format.is_empty() {
+                    "—".to_string()
+                } else {
+                    format.clone()
+                };
+                ro_text(ui, text);
+            }
+        }
+        if idx == 0 { state_dot(ui, pstate); } else { ui.label(""); }
+        ui.end_row();
+    }
+
+    if commit_numbers {
+        let values = prop.elements.iter().filter_map(|el| match el.value {
+            IndiValue::Number { value, .. } => Some((el.name.clone(), value)),
+            _ => None,
+        }).collect();
+        let _ = cmd_tx.send(IndiCmd::SetNumber {
+            device: pdev.clone(), property: pname.clone(), values,
+        });
+    }
+    if commit_texts {
+        let values = prop.elements.iter().filter_map(|el| match &el.value {
+            IndiValue::Text(t) => Some((el.name.clone(), t.clone())),
+            _ => None,
+        }).collect();
+        let _ = cmd_tx.send(IndiCmd::SetText {
+            device: pdev.clone(), property: pname.clone(), values,
+        });
+    }
+    if commit_switches {
+        let _ = cmd_tx.send(IndiCmd::SetSwitch {
+            device: pdev, property: pname, values: indi_switch_payload(prop),
+        });
+    }
+}
+
+/// All switch elements of a property as (name, on) pairs — INDI switch writes
+/// send the full vector so the driver can apply its rule atomically.
+#[cfg(feature = "indi")]
+fn indi_switch_payload(prop: &indi_camera::IndiProperty) -> Vec<(String, bool)> {
+    prop.elements.iter().filter_map(|el| match el.value {
+        indi_camera::IndiValue::Switch(on) => Some((el.name.clone(), on)),
+        _ => None,
+    }).collect()
 }
 
 #[cfg(feature = "svbony")]
@@ -2438,6 +3823,29 @@ fn format_control_value(ctrl: svbony::ControlType, value: i64) -> String {
         }
         _ => format!("{}", value),
     }
+}
+
+/// Semibold, letter-spaced uppercase eyebrow text — the section headers'
+/// voice. Tracking gives the small caps room to breathe instead of reading
+/// as a cramped run.
+fn eyebrow_job(title: &str, pal: &widgets::Palette) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &title.to_uppercase(),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::new(11.0, strong_family()),
+            color: pal.section_header_text,
+            extra_letter_spacing: 1.2,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// Eyebrow labeling one backend's group in the Connect dialog.
+fn connect_group_header(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette) {
+    ui.label(eyebrow_job(title, pal));
 }
 
 fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl FnOnce(&mut egui::Ui)) {
@@ -2456,20 +3864,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
                 ui.painter().hline(rect.x_range(), rect.max.y, egui::Stroke::new(1.0, pal.section_border));
                 rect
             };
-            // Semibold, letter-spaced uppercase eyebrow — tracking gives the
-            // small caps room to breathe instead of reading as a cramped run.
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                &title.to_uppercase(),
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::new(11.0, strong_family()),
-                    color: pal.section_header_text,
-                    extra_letter_spacing: 1.2,
-                    ..Default::default()
-                },
-            );
-            let galley = ui.painter().layout_job(job);
+            let galley = ui.painter().layout_job(eyebrow_job(title, pal));
             let gy = header_rect.center().y - galley.size().y / 2.0;
             ui.painter().galley(egui::pos2(header_rect.min.x + 10.0, gy), galley, pal.section_header_text);
             ui.allocate_space(egui::vec2(0.0, header_h));
@@ -2479,7 +3874,7 @@ fn section(ui: &mut egui::Ui, title: &str, pal: &widgets::Palette, content: impl
         });
 }
 
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 fn ctrl_label(ui: &mut egui::Ui, width: f32, text: &str) {
     ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
         ui.set_max_width(width);
@@ -2504,6 +3899,11 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str, pal: 
 
 impl eframe::App for ViewerApp {
     fn on_exit(&mut self) {
+        // Finish any in-flight recording first: the writer thread is joined
+        // so the FITS file is flushed and closed before the process exits.
+        if self.rec_tx.is_some() || self.rec_join.is_some() {
+            self.stop_recording();
+        }
         self.stop_capture();
         #[cfg(feature = "starsolve")]
         self.save_config();
@@ -2519,7 +3919,11 @@ impl eframe::App for ViewerApp {
         self.poll_solver_generation();
         self.apply_theme(&ctx);
 
-        if self.capture_running || self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        if self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
+        // While capturing, frames wake the UI instantly via the pump thread;
+        // this slow tick only keeps telemetry, logs, and INDI property updates
+        // flowing between frames.
+        if self.capture_running { ctx.request_repaint_after(std::time::Duration::from_millis(200)); }
         // Keep repainting while the database builds so the elapsed timer ticks
         // and completion is detected promptly.
         #[cfg(feature = "starsolve")]
@@ -2648,8 +4052,11 @@ impl eframe::App for ViewerApp {
                         }
                     });
 
-                    // ── Camera ──────────────────────────────────────────
-                    ui.menu_button("Camera", |ui| {
+                    // ── Source ──────────────────────────────────────────
+                    // One flat, kind-tagged list across all camera backends;
+                    // non-enumerable sources (FITS, GigE-by-IP) have their own
+                    // entries. Everything opens through open_source().
+                    ui.menu_button("Source", |ui| {
                         if self.capture_running {
                             if ui.button("Stop").clicked() {
                                 self.stop_capture();
@@ -2657,62 +4064,36 @@ impl eframe::App for ViewerApp {
                             }
                         } else {
                             if ui.button("Play").clicked() {
-                                match &self.camera_source.clone() {
-                                    CameraSource::None => {}
-                                    CameraSource::FitsFile(path) => {
-                                        let path = path.clone();
-                                        self.start_fits(path);
-                                    }
-                                    #[cfg(feature = "svbony")]
-                                    CameraSource::SVBony(cam_id) => {
-                                        let cam_id = *cam_id;
-                                        if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
-                                            self.start_svbony(&info);
-                                        }
-                                    }
-                                    #[cfg(feature = "gev")]
-                                    CameraSource::Gev(id) => {
-                                        let id = id.clone();
-                                        if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
-                                            self.start_gev(&info);
-                                        }
-                                    }
-                                }
+                                let source = self.camera_source.clone();
+                                self.open_source(source);
                                 ui.close();
                             }
                         }
-                        #[cfg(feature = "svbony")]
-                        {
-                            ui.separator();
-                            if ui.button("Refresh Cameras").clicked() {
-                                self.discovered_cameras = camera::enumerate();
-                            }
-                            for cam_info in &self.discovered_cameras.clone() {
-                                let is_this = matches!(&self.camera_source, CameraSource::SVBony(id) if *id == cam_info.camera_id);
-                                let label = format!("{} ({})", cam_info.name, cam_info.serial);
-                                if menu_radio(ui, is_this, &label) && !is_this {
-                                    self.start_svbony(cam_info);
-                                    ui.close();
-                                }
+                        ui.separator();
+                        if ui.button("Connect\u{2026}").clicked() {
+                            self.connect_dialog_open = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Refresh Sources").clicked() {
+                            self.refresh_sources();
+                        }
+                        let sources = self.discovered_source_list();
+                        if sources.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No cameras found"));
+                        }
+                        for (source, label) in sources {
+                            let is_this = self.camera_source == source;
+                            if menu_radio(ui, is_this, &label) && !is_this {
+                                self.open_source(source);
+                                ui.close();
                             }
                         }
-                        #[cfg(feature = "gev")]
-                        {
-                            ui.separator();
-                            // To connect by IP, use the "GigE IP" field in the
-                            // side-panel Camera section (text entry inside a menu
-                            // is unreliable in egui).
-                            if ui.button("Refresh GigE Cameras").clicked() {
-                                self.discovered_gev = gev_camera::enumerate();
-                            }
-                            for gev_info in &self.discovered_gev.clone() {
-                                let is_this = matches!(&self.camera_source, CameraSource::Gev(id) if *id == gev_info.id);
-                                let label = format!("{} ({})", gev_info.display_name(), gev_info.ip);
-                                if menu_radio(ui, is_this, &label) && !is_this {
-                                    self.start_gev(gev_info);
-                                    ui.close();
-                                }
-                            }
+                        ui.separator();
+                        let dialog_pending = self.pending_fits_path.is_some();
+                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
+                            self.open_fits_dialog();
+                            ui.close();
                         }
                     });
 
@@ -2754,27 +4135,8 @@ impl eframe::App for ViewerApp {
                             self.stop_capture();
                         }
                     } else if widgets::primary_button(ui, "\u{25B6}  Play", &pal) {
-                        match &self.camera_source.clone() {
-                            CameraSource::None => {}
-                            CameraSource::FitsFile(path) => {
-                                let path = path.clone();
-                                self.start_fits(path);
-                            }
-                            #[cfg(feature = "svbony")]
-                            CameraSource::SVBony(cam_id) => {
-                                let cam_id = *cam_id;
-                                if let Some(info) = self.discovered_cameras.iter().find(|c| c.camera_id == cam_id).cloned() {
-                                    self.start_svbony(&info);
-                                }
-                            }
-                            #[cfg(feature = "gev")]
-                            CameraSource::Gev(id) => {
-                                let id = id.clone();
-                                if let Some(info) = self.discovered_gev.iter().find(|c| c.id == id).cloned() {
-                                    self.start_gev(&info);
-                                }
-                            }
-                        }
+                        let source = self.camera_source.clone();
+                        self.open_source(source);
                     }
                     ui.separator();
                     // The record/stop control. Red record semantics (filled
@@ -2855,12 +4217,10 @@ impl eframe::App for ViewerApp {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         #[cfg(feature = "starsolve")]
                         {
-                            if self.solve_rx.is_some() {
+                            if self.solve_busy {
                                 ui.label(egui::RichText::new("Solving…").size(small).monospace()
                                     .color(egui::Color32::from_rgb(217, 119, 6)));
-                            } else if self.last_solve.as_ref()
-                                .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound)
-                            {
+                            } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                                 ui.label(egui::RichText::new("Solved").size(small).monospace()
                                     .color(egui::Color32::from_rgb(34, 197, 94)));
                             }
@@ -2906,13 +4266,13 @@ impl eframe::App for ViewerApp {
                         match self.bottom_tab {
                             BottomTab::Histogram => self.histogram_content(ui),
                             BottomTab::Controls => {
-                                #[cfg(any(feature = "svbony", feature = "gev"))]
+                                #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
                                 {
                                     egui::ScrollArea::vertical().show(ui, |ui| {
                                         self.controls_content(ui);
                                     });
                                 }
-                                #[cfg(not(any(feature = "svbony", feature = "gev")))]
+                                #[cfg(not(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi")))]
                                 ui.label("Camera support not compiled in");
                             }
                             #[cfg(feature = "starsolve")]
@@ -2934,7 +4294,7 @@ impl eframe::App for ViewerApp {
             )
             .show_inside(ui, |ui| {
             if let Some(frame) = &self.current_frame {
-                let resp = self.image_viewer.show(ui, &frame.mono, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
+                let resp = self.image_viewer.show(ui, &frame.mono, self.frame_serial, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;
                 self.cursor_value = resp.hovered_value;
             } else {
@@ -2972,61 +4332,240 @@ impl eframe::App for ViewerApp {
 
         // Zoom popup window
         self.show_zoom_window(&ctx);
+
+        // Connect-to-source window
+        self.connect_dialog(&ctx);
     }
 }
 
+/// Wall-clock budget for a single live plate-solve attempt.
+///
+/// Measured against real captures: a solve that is going to succeed lands well
+/// under this (0.5–6 ms), while one with no possible match runs until stopped —
+/// pattern combinations grow as C(n,4), so a few thousand read-noise centroids
+/// never terminate on their own. tetra3 honors this to the millisecond.
+#[cfg(feature = "starsolve")]
+const SOLVE_TIMEOUT_MS: u64 = 10;
+
+/// One frame's work for the plate-solve worker: extract centroids, then solve
+/// them if a database is loaded.
+#[cfg(feature = "starsolve")]
+struct SolveJob {
+    mono: Arc<Vec<f32>>,
+    width: u32,
+    height: u32,
+    centroid_config: tetra3::CentroidExtractionConfig,
+    /// `None` when no database is loaded — the worker still extracts, so the
+    /// centroid overlay and star count keep working without a solver.
+    solve: Option<SolveParams>,
+}
+
+/// Solver inputs, snapshotted on the UI thread at dispatch time.
+#[cfg(feature = "starsolve")]
+struct SolveParams {
+    db: Arc<tetra3::SolverDatabase>,
+    fov_rad: f32,
+    fov_max_error: Option<f32>,
+    attitude_hint: Option<tetra3::Quaternion>,
+    camera_model: Option<tetra3::CameraModel>,
+}
+
+/// One frame's results. Centroids travel with their solve so
+/// `matched_centroid_indices` always indexes the centroids it was solved from.
+#[cfg(feature = "starsolve")]
+struct SolveOutput {
+    centroids: Vec<tetra3::Centroid>,
+    extract_ms: f32,
+    solve: Option<tetra3::SolveResult>,
+}
+
+/// Long-lived worker running extraction and solving off the UI thread. One
+/// thread for the life of the app rather than one per frame: at full sensor
+/// resolution a single job is ~100 ms of work, and the UI must stay responsive
+/// throughout.
+#[cfg(feature = "starsolve")]
+fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
+    let (job_tx, job_rx) = bounded::<SolveJob>(1);
+    let (out_tx, out_rx) = bounded::<SolveOutput>(1);
+    thread::spawn(move || {
+        // Ends when the app drops the job sender.
+        while let Ok(job) = job_rx.recv() {
+            let t0 = Instant::now();
+            let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
+                &job.mono, job.width, job.height, &job.centroid_config,
+            )
+            .map(|r| r.centroids)
+            .unwrap_or_default();
+            let extract_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+            let solve = job.solve.map(|p| {
+                let mut cfg = tetra3::SolveConfig::new(p.fov_rad, job.width, job.height);
+                cfg.fov_max_error_rad = p.fov_max_error;
+                // Live tracking: a solve that cannot finish in a few ms is not
+                // worth finishing — the next frame is along shortly. Bounds the
+                // pathological case (thousands of read-noise centroids never
+                // matching, which otherwise burns a full core on every frame)
+                // without capping the centroid count real solves depend on.
+                cfg.solve_timeout_ms = Some(SOLVE_TIMEOUT_MS);
+                if let Some(cam) = p.camera_model {
+                    cfg.camera_model = cam;
+                }
+                if let Some(q) = p.attitude_hint {
+                    cfg.attitude_hint = Some(q);
+                    cfg.hint_uncertainty_rad = 2.0_f32.to_radians();
+                }
+                p.db.solve_from_centroids(&centroids, &cfg)
+            });
+
+            if out_tx.send(SolveOutput { centroids, extract_ms, solve }).is_err() {
+                break;
+            }
+        }
+    });
+    (job_tx, out_rx)
+}
+
 impl ViewerApp {
-    /// Auto-solve: dispatch to background thread if DB loaded and not already solving.
-    /// Called from poll_frame on each new frame. Takes ownership of the centroids
-    /// already extracted for overlay display, so we don't re-extract or clone pixels.
+    /// Hand this frame to the solve worker, unless it is still busy with the
+    /// previous one — in which case this frame is skipped rather than queued, so
+    /// the pipeline always works on recent data instead of falling behind.
     #[cfg(feature = "starsolve")]
-    fn maybe_auto_solve(&mut self, centroids: Vec<tetra3::Centroid>, w: u32, h: u32) {
-        // Only if DB loaded and not already solving
-        if self.solver_db.is_none() || self.solve_rx.is_some() {
+    fn maybe_dispatch_solve(&mut self, mono: Arc<Vec<f32>>, w: u32, h: u32) {
+        if self.solve_busy {
             return;
         }
 
-        let db = self.solver_db.as_ref().unwrap().clone();
-
-        // Use previous solve's FOV if available, otherwise user estimate
-        let prev_locked = self.last_solve.as_ref()
-            .map_or(false, |s| s.status == tetra3::SolveStatus::MatchFound);
-        let fov_rad = self.last_solve.as_ref()
-            .and_then(|s| s.fov_rad)
-            .unwrap_or_else(|| (self.fov_estimate_deg as f32).to_radians());
-
-        // Wide FOV tolerance for initial solve, tight once we have a lock
-        let fov_max_error = if prev_locked {
-            Some((2.0_f32).to_radians())
-        } else {
-            Some((10.0_f32).to_radians())
-        };
-
-        // Seed tracking-mode solve with previous attitude when locked.
-        let attitude_hint = self.last_solve.as_ref().and_then(|s| s.qicrs2cam);
-
-        let camera_model = self.camera_model.clone();
-
-        let (tx, rx) = bounded(1);
-        self.solve_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            let mut solve_config = tetra3::SolveConfig::new(fov_rad, w, h);
-            solve_config.fov_max_error_rad = fov_max_error;
-            solve_config.solve_timeout_ms = Some(2000); // fast timeout for live use
-            if let Some(cam) = camera_model {
-                solve_config.camera_model = cam;
+        // Solver inputs, if a database is loaded. Without one the worker still
+        // extracts, so centroid overlays keep working.
+        let solve = self.solver_db.as_ref().map(|db| {
+            // Use previous solve's FOV if available, otherwise user estimate
+            let prev_solution = self.last_solve.as_ref().and_then(|s| s.as_ref().ok());
+            let prev_locked = prev_solution.is_some();
+            SolveParams {
+                db: db.clone(),
+                fov_rad: prev_solution
+                    .map(|s| s.fov_rad)
+                    .unwrap_or_else(|| self.fov_estimate_deg.to_radians()),
+                // Wide FOV tolerance for initial solve, tight once we have a lock
+                fov_max_error: Some(if prev_locked { 2.0_f32 } else { 10.0_f32 }.to_radians()),
+                // Seed tracking-mode solve with previous attitude when locked.
+                attitude_hint: prev_solution.map(|s| s.qicrs2cam),
+                camera_model: self.camera_model.clone(),
             }
-            if let Some(q) = attitude_hint {
-                solve_config.attitude_hint = Some(q);
-                solve_config.hint_uncertainty_rad = 2.0_f32.to_radians();
-            }
-            let result = db.solve_from_centroids(&centroids, &solve_config);
-            let _ = tx.send(result);
         });
+
+        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), solve };
+        if self.solve_tx.try_send(job).is_ok() {
+            self.solve_busy = true;
+        }
     }
 
 
+
+    /// The Connect window: every backend's discovered devices plus inline
+    /// address entry for addressed backends (GigE by IP, INDI server), all
+    /// grouped under one roof so the Source menu and side panel stay small.
+    fn connect_dialog(&mut self, ctx: &egui::Context) {
+        if !self.connect_dialog_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.connect_dialog_open = false;
+            return;
+        }
+        let pal = self.pal();
+        let mut keep_open = true;
+        // Actions are collected during the UI pass and applied after it, so
+        // the closure never re-enters &mut self.
+        let mut connect: Option<CameraSource> = None;
+        let mut manual_err: Option<String> = None;
+        let mut refresh = false;
+        let mut open_fits = false;
+
+        egui::Window::new("Connect to Source")
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+
+                if let Some(err) = &self.camera_error {
+                    ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
+                }
+
+                for b in sources::backends() {
+                    ui.add_space(2.0);
+                    connect_group_header(ui, b.name, &pal);
+
+                    let mut any = false;
+                    for d in self.discovered.iter().filter(|d| d.backend == b.name) {
+                        any = true;
+                        let text = d.title();
+                        let is_current = self.camera_source == d.source;
+                        if ui.selectable_label(is_current, egui::RichText::new(text).size(13.0)).clicked() {
+                            connect = Some(d.source.clone());
+                        }
+                    }
+                    if !any && b.discover.is_some() {
+                        ui.label(egui::RichText::new("none found").italics().size(12.0).color(pal.text_secondary));
+                    }
+
+                    if let Some(spec) = &b.manual {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(spec.label).size(13.0));
+                            let input = self.manual_inputs.entry(b.scheme).or_default();
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(input)
+                                    .hint_text(spec.hint)
+                                    .desired_width(150.0),
+                            );
+                            let submitted =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if widgets::styled_button(ui, "Connect", &pal) || submitted {
+                                match (spec.make_source)(input) {
+                                    Ok(src) => connect = Some(src),
+                                    Err(e) => manual_err = Some(e),
+                                }
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(2.0);
+                connect_group_header(ui, "Files", &pal);
+                let dialog_pending = self.pending_fits_path.is_some();
+                if !dialog_pending && widgets::styled_button(ui, "Open FITS\u{2026}", &pal) {
+                    open_fits = true;
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                if widgets::styled_button(ui, "\u{27F3} Refresh", &pal) {
+                    refresh = true;
+                }
+            });
+
+        self.connect_dialog_open = keep_open;
+        if let Some(e) = manual_err {
+            self.camera_error = Some(e);
+        }
+        if refresh {
+            self.refresh_sources();
+        }
+        if open_fits {
+            self.open_fits_dialog();
+            self.connect_dialog_open = false;
+        }
+        if let Some(src) = connect {
+            self.camera_error = None;
+            self.open_source(src);
+            if self.camera_error.is_none() {
+                self.connect_dialog_open = false;
+            }
+        }
+    }
 
     fn show_zoom_window(&mut self, ctx: &egui::Context) {
         let roi = match self.image_viewer.roi_rect {
@@ -3043,50 +4582,65 @@ impl ViewerApp {
         let roi_h = (y1 - y0 + 1) as usize;
         if roi_w < 2 || roi_h < 2 { return; }
 
-        // Build zoomed RGBA from the ROI sub-region
-        let npix = roi_w * roi_h;
-        self.zoom_rgba.resize(npix * 4, 255);
+        // Recolor and re-upload only when the frame, ROI, or display params
+        // changed — repaints happen far more often than any of those.
+        let key = ZoomKey {
+            frame_serial: self.frame_serial,
+            roi,
+            scale_min: self.display_params.scale_min,
+            scale_max: self.display_params.scale_max,
+            gamma: self.display_params.gamma,
+            transfer: self.display_params.transfer,
+            colormap: self.colormap.kind,
+        };
+        if self.zoom_key != Some(key) || self.zoom_texture.is_none() {
+            self.zoom_key = Some(key);
 
-        let range = self.display_params.scale_max - self.display_params.scale_min;
-        let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
-        let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
-        let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
-        let asinh_alpha = self.display_params.gamma;
-        let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
-            let v = asinh_alpha.asinh();
-            if v > 0.0 { 1.0 / v } else { 1.0 }
-        } else { 1.0 };
+            // Build zoomed RGBA from the ROI sub-region
+            let npix = roi_w * roi_h;
+            self.zoom_rgba.resize(npix * 4, 255);
 
-        for ry in 0..roi_h {
-            for rx in 0..roi_w {
-                let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
-                let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
-                let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
-                match self.display_params.transfer {
-                    imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
-                    imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
+            let range = self.display_params.scale_max - self.display_params.scale_min;
+            let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
+            let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
+            let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
+            let asinh_alpha = self.display_params.gamma;
+            let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+                let v = asinh_alpha.asinh();
+                if v > 0.0 { 1.0 / v } else { 1.0 }
+            } else { 1.0 };
+
+            for ry in 0..roi_h {
+                for rx in 0..roi_w {
+                    let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
+                    let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
+                    let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
+                    match self.display_params.transfer {
+                        imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
+                        imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
+                    }
+                    let rgb = self.colormap.lookup(t);
+                    let off = (ry * roi_w + rx) * 4;
+                    self.zoom_rgba[off] = rgb[0];
+                    self.zoom_rgba[off + 1] = rgb[1];
+                    self.zoom_rgba[off + 2] = rgb[2];
+                    self.zoom_rgba[off + 3] = 255;
                 }
-                let rgb = self.colormap.lookup(t);
-                let off = (ry * roi_w + rx) * 4;
-                self.zoom_rgba[off] = rgb[0];
-                self.zoom_rgba[off + 1] = rgb[1];
-                self.zoom_rgba[off + 2] = rgb[2];
-                self.zoom_rgba[off + 3] = 255;
             }
-        }
 
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [roi_w, roi_h],
-            &self.zoom_rgba,
-        );
-        match &mut self.zoom_texture {
-            Some(tex) => tex.set(color_image, egui::TextureOptions::NEAREST),
-            None => {
-                self.zoom_texture = Some(ctx.load_texture(
-                    "zoom_image",
-                    color_image,
-                    egui::TextureOptions::NEAREST,
-                ));
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [roi_w, roi_h],
+                &self.zoom_rgba,
+            );
+            match &mut self.zoom_texture {
+                Some(tex) => tex.set(color_image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.zoom_texture = Some(ctx.load_texture(
+                        "zoom_image",
+                        color_image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
             }
         }
 
@@ -3193,7 +4747,7 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
     });
 }
 
-#[cfg(feature = "svbony")]
+#[cfg(any(feature = "svbony", feature = "toupcam"))]
 fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
     let width = img.width();
     let height = img.height();
@@ -3282,6 +4836,34 @@ fn zscale(data: &[f64]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
+    // Capture panics to a file so a GUI crash is diagnosable even when the
+    // app wasn't launched from a terminal (Finder, `open`, crash-after-close).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let report = format!("{}\n\n{}", info, std::backtrace::Backtrace::force_capture());
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("last_panic.txt"), &report);
+        default_hook(info);
+    }));
+
+    if std::env::args().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "usage: astroviewer [SOURCE]\n\n\
+             SOURCE selects the input at startup: a FITS file path, or a descriptor\n\
+             \x20 file:<path>      FITS file\n\
+             \x20 toupcam:<id>     ToupTek camera (requires the `toupcam` feature)\n\
+             \x20 svb:<id>         SVBony camera (requires the `svbony` feature)\n\
+             \x20 gev:<ip-or-id>   GigE Vision camera (requires the `gev` feature)\n\
+             \x20 indi:<host[:port]>  INDI/INDIGO server (requires the `indi` feature)\n\n\
+             With no SOURCE, the viewer reconnects to the last source used\n\
+             (remembered across runs); if there is none, it starts idle —\n\
+             pick a source from the Source menu."
+        );
+        return Ok(());
+    }
     // cameleon_genapi logs an ERROR every time it constructs an error, even for
     // ones we handle (e.g. probing chunk-backed features we then skip) — keep
     // its internal logging out; failures we care about are reported by our code.

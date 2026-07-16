@@ -1,0 +1,114 @@
+# AstroViewer
+
+A live camera image viewer for astronomy, built with Rust and egui. It displays
+frames from USB and network cameras (or FITS files) with false-color mapping,
+interactive scaling, histograms, zoom, star-centroid overlays, live plate
+solving, and FITS recording.
+
+## Camera backends
+
+Backends are selected at build time with Cargo features:
+
+| Feature | Source | Connects by |
+|---|---|---|
+| `svbony` | SVBony USB cameras | discovery |
+| `toupcam` | ToupTek USB/GigE cameras (and rebrands: Altair, Omegon, RisingCam, …) | discovery |
+| `gev` | Any GigE Vision camera (pure-Rust transport + GenICam) | discovery or IP address |
+| `indi` | INDI / INDIGO server | host\[:port\] address |
+| `starsolve` | Centroid extraction + lost-in-space plate solving (tetra3) | — |
+| `all` | Everything above | — |
+
+FITS file playback is always built in.
+
+```bash
+# Build with every backend
+cargo build --release --features all
+
+# Or just what you need
+cargo build --release --features svbony,indi
+```
+
+## Running
+
+```bash
+# Start idle (or reconnect to the last source used)
+cargo run --release --features all
+
+# Or name a source on the command line
+viewer path/to/capture.fits          # bare FITS path
+viewer file:/data/capture.fits       # explicit scheme
+viewer svb:0                         # SVBony camera id
+viewer toupcam:<id>                  # ToupTek enumeration id
+viewer gev:192.168.0.2               # GigE camera by IP (or by discovered id)
+viewer indi:astro.local:7624         # INDI server
+```
+
+With no argument the viewer reconnects to the last source it used; the same
+descriptor strings are what it remembers between runs. `viewer --help` prints
+the full list.
+
+## Choosing a source: the Connect dialog
+
+**Source ▸ Connect…** (or the **Connect…** button in the side panel) opens a
+connection manager listing every backend compiled into the binary:
+
+- Discovered devices appear grouped under their backend, one click to connect.
+- **GigE Vision** has an IP field for cameras that are reachable by unicast
+  but don't answer broadcast discovery (the last-used IP is remembered).
+- **INDI** has a server field (`host` or `host:port`). After connecting, pick
+  a device and control it from the Controls tab.
+- **Files ▸ Open FITS…** opens the native file picker.
+- **⟳ Refresh** re-enumerates all backends.
+
+The Source menu also lists discovered cameras directly for quick switching,
+plus Play/Stop for the current source.
+
+## Display controls
+
+- **Colormaps:** Grayscale, Hot, Viridis, Inferno, Plasma, Magma, Cubehelix,
+  Turbo.
+- **Scale modes:** Full Range (bit-depth), Auto (per-frame min/max), ZScale,
+  Manual.
+- **Transfer functions:** Linear (with gamma) or Asinh (alpha up to 1000) for
+  pulling faint detail out of high-dynamic-range frames.
+- **Histogram:** live, with draggable min/max scale lines, optional log-y, and
+  per-channel R/G/B curves for color sensors streaming RAW.
+- **Background subtraction:** percentile-based temporal background for
+  multi-frame FITS.
+- **Zoom:** right-click-drag a rectangle on the image to open a zoom window
+  (close with Esc or X; left-click the image to clear the ROI).
+- **Overlays:** colorbar, pixel axes, hover pixel readout.
+
+Camera controls (exposure, gain, cooling, filter wheel, resolution, trigger
+mode, and backend-specific advanced options) appear in the Controls tab and
+side panel once a camera is connected.
+
+## Plate solving (`starsolve`)
+
+With the `starsolve` feature, the viewer extracts star centroids from live
+frames and solves them against a star database (built once from the bundled
+catalog on first run — the app offers to generate it). Overlays show detected
+centroids, matched stars, and named bright stars. Solver parameters (pixel
+sigma, min/max blob size, FOV estimate) are adjustable in the Plate Solve tab
+and persist across runs.
+
+For very busy frames, only the brightest few thousand centroids are drawn;
+extraction and solving always use the full set.
+
+## Recording
+
+**File ▸ Start Recording** (or the ● button in the toolbar) streams incoming
+frames to `~/Documents/AstroViewer/astroviewer-YYYYMMDD-HHMMSS.fits`. RAW
+color frames record the `BAYERPAT` keyword so calibration software can
+demosaic them later.
+
+## Odds and ends
+
+- **Themes:** Dark, Light, and Night (deep-red night vision) via the Theme menu.
+- **Keyboard:** `S` toggles the side panel; `Esc` closes the zoom window or
+  Connect dialog.
+- The UI repaints when a frame actually arrives rather than on a fixed timer,
+  so idle and low-frame-rate CPU usage stays low.
+- If the app ever crashes, the panic message and backtrace are written to
+  `~/Library/Application Support/astroviewer/last_panic.txt` (config dir on
+  other platforms) — please include it when reporting a bug.

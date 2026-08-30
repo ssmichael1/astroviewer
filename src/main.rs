@@ -99,6 +99,7 @@ struct ZoomKey {
     scale_min: f32,
     scale_max: f32,
     gamma: f32,
+    asinh_offset: f32,
     transfer: imageview::TransferFn,
     colormap: ColormapKind,
 }
@@ -237,6 +238,8 @@ struct ViewerApp {
 
     cursor_pixel: Option<(u32, u32)>,
     cursor_value: Option<f32>,
+    /// Track the asinh pivot automatically (per-frame median ≈ sky background).
+    asinh_auto_offset: bool,
     hist_drag: Option<HistDrag>,
     hist_log_y: bool,
     /// Overlay per-channel R/G/B histograms when the frame carries them.
@@ -523,6 +526,7 @@ impl ViewerApp {
             frame_serial: 0,
             ui_theme,
             cursor_pixel: None, cursor_value: None,
+            asinh_auto_offset: true,
             hist_drag: None,
             hist_log_y: false,
             hist_rgb: true,
@@ -1661,6 +1665,12 @@ impl ViewerApp {
                 }
                 ScaleMode::Manual => {}
             }
+            // Auto asinh pivot: the frame median is a robust sky-background
+            // estimate (stars occupy a negligible pixel fraction), and
+            // frame.hist already reflects background subtraction when enabled.
+            if self.asinh_auto_offset && matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+                self.display_params.asinh_offset = frame.hist.percentile(0.5);
+            }
             let now = Instant::now();
             self.frame_times.push(now);
             while self.frame_times.len() > 30 { self.frame_times.remove(0); }
@@ -1702,11 +1712,13 @@ impl ViewerApp {
                     let n_centroids = self.overlay_items.len();
                     for &cent_idx in &sol.matched_centroid_indices {
                         if cent_idx < n_centroids {
-                            if let overlays::OverlayItem::Centroid { x, y, .. } = &self.overlay_items[cent_idx] {
+                            if let overlays::OverlayItem::Centroid { x, y, semi_major, .. } = &self.overlay_items[cent_idx] {
+                                // Gap sized to clear the centroid ellipse so the
+                                // star core stays unobscured.
                                 self.overlay_items.push(overlays::OverlayItem::Marker {
                                     x: *x,
                                     y: *y,
-                                    kind: overlays::MarkerKind::Crosshair,
+                                    kind: overlays::MarkerKind::GappedCrosshair((semi_major * 1.5).max(3.0)),
                                     label: None,
                                 });
                             }
@@ -1828,6 +1840,30 @@ impl ViewerApp {
                     ui.label(egui::RichText::new(format!("{:.2}", self.display_params.gamma)).monospace().size(12.0));
                 });
                 ui.end_row();
+
+                if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Offset"); });
+                    ui.horizontal(|ui| {
+                        let was_auto = self.asinh_auto_offset;
+                        widgets::styled_checkbox(ui, &mut self.asinh_auto_offset, "Auto", &pal);
+                        if self.asinh_auto_offset {
+                            // Refresh immediately on toggle rather than waiting
+                            // for the next frame (matters for paused sources).
+                            if !was_auto {
+                                if let Some(f) = &self.current_frame {
+                                    self.display_params.asinh_offset = f.hist.percentile(0.5);
+                                }
+                            }
+                        } else {
+                            let (off_lo, off_hi) = (self.display_params.scale_min, self.display_params.scale_max);
+                            ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                                widgets::styled_slider_bare(ui, &mut self.display_params.asinh_offset, off_lo..=off_hi, &pal);
+                            });
+                        }
+                        ui.label(egui::RichText::new(format!("{:.1}", self.display_params.asinh_offset)).monospace().size(12.0));
+                    });
+                    ui.end_row();
+                }
             });
             ui.horizontal(|ui| {
                 ui.add_space(label_w + 8.0);
@@ -2293,7 +2329,7 @@ impl ViewerApp {
                         widgets::styled_slider_bare(ui, &mut t, 16.0..=220.0, &pal);
                     });
                     controls.auto_expo_target = t.round() as u16;
-                    ui.label(egui::RichText::new(controls.auto_expo_target.to_string()).monospace().size(12.0));
+                    ui.add_sized([value_w, 20.0], egui::DragValue::new(&mut controls.auto_expo_target).range(16..=220));
                     if controls.auto_expo_target != old {
                         let _ = handle.cmd_tx.send(ToupCmd::SetAutoExpoTarget(controls.auto_expo_target));
                     }
@@ -2312,7 +2348,12 @@ impl ViewerApp {
                     );
                 });
                 controls.gain = g.round() as u16;
-                ui.label(egui::RichText::new(format!("{} %", controls.gain)).monospace().size(12.0));
+                ui.add_sized(
+                    [value_w, 20.0],
+                    egui::DragValue::new(&mut controls.gain)
+                        .range(controls.gain_min..=controls.gain_max.max(controls.gain_min + 1))
+                        .suffix(" %"),
+                );
                 if controls.gain != old_gain {
                     let _ = handle.cmd_tx.send(ToupCmd::SetGain(controls.gain));
                 }
@@ -2327,7 +2368,12 @@ impl ViewerApp {
                         widgets::styled_slider_bare(ui, &mut s, 0.0..=controls.max_speed as f32, &pal);
                     });
                     controls.speed = s.round() as u16;
-                    ui.label(egui::RichText::new(format!("{} / {}", controls.speed, controls.max_speed)).monospace().size(12.0));
+                    ui.add_sized(
+                        [value_w, 20.0],
+                        egui::DragValue::new(&mut controls.speed)
+                            .range(0..=controls.max_speed)
+                            .suffix(format!(" / {}", controls.max_speed)),
+                    );
                     if controls.speed != old {
                         let _ = handle.cmd_tx.send(ToupCmd::SetSpeed(controls.speed));
                     }
@@ -2417,7 +2463,14 @@ impl ViewerApp {
                     ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
                         widgets::styled_slider_bare(ui, &mut t, tec_lo..=tec_hi, &pal);
                     });
-                    ui.label(egui::RichText::new(format!("{:.1} °C", t)).monospace().size(12.0));
+                    ui.add_sized(
+                        [value_w, 20.0],
+                        egui::DragValue::new(&mut t)
+                            .range(tec_lo..=tec_hi)
+                            .speed(0.1)
+                            .fixed_decimals(1)
+                            .suffix(" °C"),
+                    );
                     if (t - old_target).abs() >= 0.05 {
                         controls.tec_target_c = t;
                         let _ = handle.cmd_tx.send(ToupCmd::SetOption(
@@ -2504,7 +2557,7 @@ impl ViewerApp {
                                         widgets::styled_slider_bare(ui, &mut v, min as f32..=max as f32, &pal);
                                     });
                                     c.value = v.round() as i32;
-                                    ui.label(egui::RichText::new(c.value.to_string()).monospace().size(12.0));
+                                    ui.add_sized([value_w, 20.0], egui::DragValue::new(&mut c.value).range(min..=max));
                                 }
                                 AdvKind::Enum(variants) => {
                                     widgets::combo_box(ui, c.label, "", &mut c.value, variants, &pal);
@@ -3235,13 +3288,20 @@ impl ViewerApp {
                         });
                     ui.add_sized([value_w, 20.0], dv);
                     cv.1 = v_us.round() as i64;
+                } else if caps.control_type == svbony::ControlType::TargetTemperature {
+                    // SDK stores temperature in tenths of a °C.
+                    let mut v_c = cv.1 as f64 / 10.0;
+                    let dv = egui::DragValue::new(&mut v_c)
+                        .range(caps.min_value as f64 / 10.0..=caps.max_value as f64 / 10.0)
+                        .speed(0.1)
+                        .fixed_decimals(1)
+                        .suffix(" °C");
+                    ui.add_sized([value_w, 20.0], dv);
+                    cv.1 = (v_c * 10.0).round() as i64;
                 } else {
-                    ui.allocate_ui(egui::vec2(value_w, 20.0), |ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(format_control_value(caps.control_type, cv.1))
-                                .monospace().size(12.0));
-                        });
-                    });
+                    let dv = egui::DragValue::new(&mut cv.1)
+                        .range(caps.min_value..=caps.max_value);
+                    ui.add_sized([value_w, 20.0], dv);
                 }
                 // Auto checkbox
                 if caps.is_auto_supported {
@@ -4590,6 +4650,7 @@ impl ViewerApp {
             scale_min: self.display_params.scale_min,
             scale_max: self.display_params.scale_max,
             gamma: self.display_params.gamma,
+            asinh_offset: self.display_params.asinh_offset,
             transfer: self.display_params.transfer,
             colormap: self.colormap.kind,
         };
@@ -4605,10 +4666,14 @@ impl ViewerApp {
             let inv_gamma = if self.display_params.gamma != 0.0 { 1.0 / self.display_params.gamma } else { 1.0 };
             let apply_gamma = (self.display_params.gamma - 1.0).abs() > 1e-4;
             let asinh_alpha = self.display_params.gamma;
-            let asinh_norm: f32 = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
-                let v = asinh_alpha.asinh();
-                if v > 0.0 { 1.0 / v } else { 1.0 }
-            } else { 1.0 };
+            // Mirrors the pivoted asinh in ImageViewer::update_rgba.
+            let (asinh_o, asinh_lo, asinh_norm): (f32, f32, f32) = if matches!(self.display_params.transfer, imageview::TransferFn::Asinh) {
+                let o = ((self.display_params.asinh_offset - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
+                let lo = (-asinh_alpha * o).asinh();
+                let hi = (asinh_alpha * (1.0 - o)).asinh();
+                let norm = if hi > lo { 1.0 / (hi - lo) } else { 1.0 };
+                (o, lo, norm)
+            } else { (0.0, 0.0, 1.0) };
 
             for ry in 0..roi_h {
                 for rx in 0..roi_w {
@@ -4617,7 +4682,7 @@ impl ViewerApp {
                     let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
                     match self.display_params.transfer {
                         imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
-                        imageview::TransferFn::Asinh => { t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0); }
+                        imageview::TransferFn::Asinh => { t = (((asinh_alpha * (t - asinh_o)).asinh() - asinh_lo) * asinh_norm).clamp(0.0, 1.0); }
                     }
                     let rgb = self.colormap.lookup(t);
                     let off = (ry * roi_w + rx) * 4;

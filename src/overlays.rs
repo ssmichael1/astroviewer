@@ -39,6 +39,9 @@ pub enum OverlayItem {
 #[allow(dead_code)]
 pub enum MarkerKind {
     Crosshair,
+    /// Crosshair whose arms stop short of the center, leaving the star's
+    /// core pixels unobscured; the value is the inner gap radius in image pixels.
+    GappedCrosshair(f32),
     Circle(f32), // radius in pixels
     Diamond(f32),
     Label, // text-only, no symbol
@@ -148,6 +151,27 @@ pub fn draw_overlays(
                         let stroke = Stroke::new(1.0 * stroke_scale, Color32::from_rgb(50, 255, 50));
                         painter.line_segment([Pos2::new(center.x - s, center.y), Pos2::new(center.x + s, center.y)], stroke);
                         painter.line_segment([Pos2::new(center.x, center.y - s), Pos2::new(center.x, center.y + s)], stroke);
+                    }
+                    MarkerKind::GappedCrosshair(gap) => {
+                        // Inner radius tracks image zoom but never shrinks below a
+                        // legible gap; arms extend a fixed screen length beyond it.
+                        // Kept faint on purpose — the centroid dot already marks the
+                        // star; this only needs to whisper "matched".
+                        let r0 = (gap * pixels_to_screen_scale).max(2.5 * stroke_scale);
+                        let r1 = r0 + 4.0 * stroke_scale;
+                        let stroke = Stroke::new(
+                            1.0 * stroke_scale,
+                            Color32::from_rgba_unmultiplied(50, 255, 50, 140),
+                        );
+                        for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                            painter.line_segment(
+                                [
+                                    Pos2::new(center.x + dx * r0, center.y + dy * r0),
+                                    Pos2::new(center.x + dx * r1, center.y + dy * r1),
+                                ],
+                                stroke,
+                            );
+                        }
                     }
                     MarkerKind::Circle(r) => {
                         painter.circle_stroke(center, *r, Stroke::new(1.0, Color32::from_rgb(255, 255, 0)));

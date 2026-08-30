@@ -18,6 +18,25 @@ impl Histogram {
             .map(|w| (w[0] + w[1]) * 0.5)
             .collect()
     }
+
+    /// Value at cumulative fraction `frac` in [0,1] (0.5 = median),
+    /// linearly interpolated within the containing bin.
+    pub fn percentile(&self, frac: f32) -> f32 {
+        let total: u64 = self.counts.iter().sum();
+        if total == 0 {
+            return self.data_min;
+        }
+        let target = frac.clamp(0.0, 1.0) as f64 * total as f64;
+        let mut cum = 0u64;
+        for (i, &c) in self.counts.iter().enumerate() {
+            if c > 0 && (cum + c) as f64 >= target {
+                let within = ((target - cum as f64) / c as f64) as f32;
+                return self.edges[i] + within * (self.edges[i + 1] - self.edges[i]);
+            }
+            cum += c;
+        }
+        self.data_max
+    }
 }
 
 /// Compute histogram over the given fixed range `[range_min, range_max]`.

@@ -21,6 +21,9 @@ pub struct DisplayParams {
     pub scale_min: f32,
     pub scale_max: f32,
     pub gamma: f32,
+    /// Asinh pivot in data units: the stretch is linear around this level
+    /// (typically the sky background) and logarithmic above it.
+    pub asinh_offset: f32,
     pub transfer: TransferFn,
     pub show_axes: bool,
     pub show_colorbar: bool,
@@ -34,6 +37,7 @@ impl Default for DisplayParams {
             scale_min: 0.0,
             scale_max: 65535.0,
             gamma: 1.0,
+            asinh_offset: 0.0,
             transfer: TransferFn::Linear,
             show_axes: true,
             show_colorbar: true,
@@ -317,12 +321,19 @@ impl ImageViewer {
         let inv_gamma = if params.gamma != 0.0 { 1.0 / params.gamma } else { 1.0 };
         let apply_gamma = (params.gamma - 1.0).abs() > 1e-4;
 
+        // Asinh with a pivot: s(t) = (asinh(α(t−o)) − asinh(−αo)) / (asinh(α(1−o)) − asinh(−αo))
+        // where o is the offset normalized into the display range. asinh is odd,
+        // so pixels below the pivot stay visible (compressed toward black) rather
+        // than clipping; o = 0 reduces to the plain asinh(αt)/asinh(α) stretch.
         let asinh_alpha = params.gamma;
-        let asinh_norm = if matches!(params.transfer, TransferFn::Asinh) {
-            let v = asinh_alpha.asinh();
-            if v > 0.0 { 1.0 / v } else { 1.0 }
+        let (asinh_o, asinh_lo, asinh_norm) = if matches!(params.transfer, TransferFn::Asinh) {
+            let o = ((params.asinh_offset - params.scale_min) * inv_range).clamp(0.0, 1.0);
+            let lo = (-asinh_alpha * o).asinh();
+            let hi = (asinh_alpha * (1.0 - o)).asinh();
+            let norm = if hi > lo { 1.0 / (hi - lo) } else { 1.0 };
+            (o, lo, norm)
         } else {
-            1.0
+            (0.0, 0.0, 1.0)
         };
 
         for (i, &val) in mono_data.iter().take(npix).enumerate() {
@@ -332,7 +343,7 @@ impl ImageViewer {
                     if apply_gamma { t = t.powf(inv_gamma); }
                 }
                 TransferFn::Asinh => {
-                    t = ((asinh_alpha * t).asinh() * asinh_norm).clamp(0.0, 1.0);
+                    t = (((asinh_alpha * (t - asinh_o)).asinh() - asinh_lo) * asinh_norm).clamp(0.0, 1.0);
                 }
             }
             let rgb = colormap.lookup(t);

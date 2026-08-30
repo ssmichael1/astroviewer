@@ -420,7 +420,7 @@ fn reader_loop(
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let tag = e.name().as_ref().to_owned();
                 let attrs = attr_map(&e);
                 let children = match read_children(&mut reader, &tag) {
                     Ok(c) => c,
@@ -435,7 +435,7 @@ fn reader_loop(
                 );
             }
             Ok(Event::Empty(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let tag = e.name().as_ref().to_owned();
                 let attrs = attr_map(&e);
                 handle_element(
                     &tag, attrs, Vec::new(), &mut store, &server_addr, &frame_tx, &props_slot,
@@ -467,7 +467,7 @@ fn read_children(
         buf.clear();
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let tag = e.name().as_ref().to_owned();
                 let attrs = attr_map(&e);
                 // Collect text (may be huge for oneBLOB) until the child's end tag.
                 let mut text = String::new();
@@ -476,7 +476,21 @@ fn read_children(
                     tbuf.clear();
                     match reader.read_event_into(&mut tbuf)? {
                         Event::Text(t) => {
-                            text.push_str(&t.unescape().unwrap_or_default());
+                            text.push_str(&t.xml10_content());
+                        }
+                        Event::GeneralRef(r) => {
+                            if let Ok(Some(ch)) = r.resolve_char_ref() {
+                                text.push(ch);
+                            } else {
+                                match r.as_ref() {
+                                    "amp" => text.push('&'),
+                                    "lt" => text.push('<'),
+                                    "gt" => text.push('>'),
+                                    "quot" => text.push('"'),
+                                    "apos" => text.push('\''),
+                                    _ => {}
+                                }
+                            }
                         }
                         Event::End(_) => break,
                         Event::Eof => bail!("EOF inside <{tag}>"),
@@ -486,7 +500,7 @@ fn read_children(
                 children.push(RawChild { tag, attrs, text });
             }
             Event::Empty(e) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let tag = e.name().as_ref().to_owned();
                 let attrs = attr_map(&e);
                 children.push(RawChild { tag, attrs, text: String::new() });
             }
@@ -502,8 +516,8 @@ fn attr_map(e: &BytesStart) -> HashMap<String, String> {
         .flatten()
         .map(|a| {
             (
-                String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                a.unescape_value().unwrap_or_default().into_owned(),
+                a.key.as_ref().to_owned(),
+                a.normalized_value(quick_xml::XmlVersion::Implicit1_0).unwrap_or_default().into_owned(),
             )
         })
         .collect()

@@ -1957,8 +1957,7 @@ impl ViewerApp {
         let bar_rect = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), 28.0));
         ui.painter().rect_filled(bar_rect, egui::CornerRadius::ZERO, pal.tab_bar);
 
-        #[allow(deprecated)]
-        ui.allocate_ui_at_rect(bar_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar_rect), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -3618,6 +3617,7 @@ impl ViewerApp {
                         tetra3::SolveStatus::NoMatch => "No match",
                         tetra3::SolveStatus::Timeout => "Timed out",
                         tetra3::SolveStatus::TooFew => "Too few stars",
+                        tetra3::SolveStatus::InvalidConfig => "Invalid solver config",
                     };
                     ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
                 }
@@ -4033,7 +4033,7 @@ impl eframe::App for ViewerApp {
                 .inner_margin(egui::Margin { left: 4, right: 4, top: 2, bottom: 2 })
                 .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     // ── File ────────────────────────────────────────────
                     ui.menu_button("File", |ui| {
@@ -4177,7 +4177,7 @@ impl eframe::App for ViewerApp {
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 4, bottom: 6 })
                 .stroke(egui::Stroke::new(1.0, pal.toolbar_border))
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     // Toggle side panel
@@ -4244,7 +4244,7 @@ impl eframe::App for ViewerApp {
                 .inner_margin(egui::Margin { left: 10, right: 10, top: 2, bottom: 2 })
                 .stroke(egui::Stroke::new(1.0, pal.statusbar_border))
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let dim = pal.text_secondary;
                 let small = 11.0;
                 let sep = |ui: &mut egui::Ui| {
@@ -4301,7 +4301,7 @@ impl eframe::App for ViewerApp {
                     .fill(pal.panel_fill)
                     .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
                 )
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
                 });
         }
@@ -4315,7 +4315,7 @@ impl eframe::App for ViewerApp {
                 .fill(pal.panel_fill)
                 .inner_margin(egui::Margin::ZERO)
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.set_min_height(260.0);
                 self.bottom_panel_tabs(ui);
 
@@ -4352,7 +4352,7 @@ impl eframe::App for ViewerApp {
                 .fill(pal.image_bg)
                 .inner_margin(egui::Margin { left: 4, right: 4, top: 12, bottom: 4 })
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
             if let Some(frame) = &self.current_frame {
                 let resp = self.image_viewer.show(ui, &frame.mono, self.frame_serial, frame.width, frame.height, &self.display_params, &self.colormap, &self.overlay_items);
                 self.cursor_pixel = resp.hovered_pixel;

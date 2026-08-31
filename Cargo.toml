@@ -21,7 +21,7 @@ rfd = "0.17.2"
 svbony = { version = "0.1", features = ["image"], optional = true }
 # ToupTek (toupcam) USB/GigE cameras and rebrands (Altair, Omegon, RisingCam, …).
 toupcam = { version = "0.1.0", features = ["image"], optional = true }
-tetra3 = { version = "0.11.0", features = [
+tetra3 = { version = "0.12.0", features = [
     "image",
     "parallel",
 ], optional = true }
@@ -46,6 +46,10 @@ starsolve = ["dep:tetra3"]
 gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
 indi = ["dep:quick-xml", "dep:base64"]
 all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
+
+[[example]]
+name = "extract_bench"
+required-features = ["starsolve"]
 
 [[example]]
 name = "gev_spike"

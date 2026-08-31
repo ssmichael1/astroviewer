@@ -153,6 +153,9 @@ struct SavedConfig {
     camera_model_path: String,
     #[serde(default)]
     matched_filter_sigma: Option<f32>,
+    /// Use the single-pass fast extraction path (tracking mode).
+    #[serde(default)]
+    tracking_mode: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +258,11 @@ struct ViewerApp {
     show_star_names: bool,
     #[cfg(feature = "starsolve")]
     centroid_config: tetra3::CentroidExtractionConfig,
+    /// Extraction path: false = CCL (calibration-quality, matched filter),
+    /// true = single-pass fast path — reads each pixel once, no convolution.
+    /// Trades faint-star sensitivity for speed; right for live tracking.
+    #[cfg(feature = "starsolve")]
+    tracking_mode: bool,
     #[cfg(feature = "starsolve")]
     centroid_count: usize,
     #[cfg(feature = "starsolve")]
@@ -540,6 +548,8 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             centroid_config: tetra3::CentroidExtractionConfig::default(),
             #[cfg(feature = "starsolve")]
+            tracking_mode: false,
+            #[cfg(feature = "starsolve")]
             centroid_count: 0,
             #[cfg(feature = "starsolve")]
             centroid_time_ms: 0.0,
@@ -646,6 +656,7 @@ impl ViewerApp {
             max_elongation: self.centroid_config.max_elongation,
             camera_model_path: self.camera_model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             matched_filter_sigma: self.centroid_config.matched_filter_sigma,
+            tracking_mode: self.tracking_mode,
         };
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(Self::config_path(), json);
@@ -691,6 +702,7 @@ impl ViewerApp {
                 self.centroid_config.local_bg_block_size = cfg.local_bg_block_size;
                 self.centroid_config.max_elongation = cfg.max_elongation;
                 self.centroid_config.matched_filter_sigma = cfg.matched_filter_sigma;
+                self.tracking_mode = cfg.tracking_mode;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
                     self.load_solver_db(std::path::Path::new(&cfg.solver_db_path));
@@ -3563,10 +3575,24 @@ impl ViewerApp {
             let mut v = self.centroid_config.matched_filter_sigma.unwrap_or(0.0);
             let val = if self.centroid_config.matched_filter_sigma.is_none() { "off".into() } else { format!("{:.1}", v) };
             param_label(ui, "Blur σ", &val);
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
+            // The fast path has no matched filter — disable rather than hide,
+            // so the setting visibly survives round-trips through tracking mode.
+            ui.add_enabled_ui(!self.tracking_mode, |ui| {
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
+                });
             });
-            self.centroid_config.matched_filter_sigma = if v < 0.1 { None } else { Some(v) };
+            if !self.tracking_mode {
+                self.centroid_config.matched_filter_sigma = if v < 0.1 { None } else { Some(v) };
+            }
+
+            ui.add_space(12.0);
+            widgets::styled_checkbox(ui, &mut self.tracking_mode, "Tracking mode", &pal);
+            ui.label(
+                egui::RichText::new("single-pass fast extraction")
+                    .size(11.0)
+                    .color(pal.text_secondary),
+            );
         });
 
         // ── Solve results ───────────────────────────────────────────────────
@@ -4415,6 +4441,8 @@ struct SolveJob {
     width: u32,
     height: u32,
     centroid_config: tetra3::CentroidExtractionConfig,
+    /// Extract with the single-pass fast path instead of the CCL path.
+    tracking: bool,
     /// `None` when no database is loaded — the worker still extracts, so the
     /// centroid overlay and star count keep working without a solver.
     solve: Option<SolveParams>,
@@ -4451,9 +4479,28 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
         // Ends when the app drops the job sender.
         while let Ok(job) = job_rx.recv() {
             let t0 = Instant::now();
-            let centroids: Vec<tetra3::Centroid> = tetra3::extract_centroids_from_raw(
-                &job.mono, job.width, job.height, &job.centroid_config,
-            )
+            // Tracking mode swaps in the single-pass fast extractor. The shared
+            // sliders map across directly; knobs the fast path doesn't have
+            // (Blur σ) are simply ignored, and its own extras (sharpness gate,
+            // saturation level) stay at their defaults.
+            let centroids: Vec<tetra3::Centroid> = if job.tracking {
+                let cfg = tetra3::FastCentroidConfig {
+                    sigma_threshold: job.centroid_config.sigma_threshold,
+                    // The fast path has no global-background option; fall back
+                    // to its default grid when the CCL slider says "global".
+                    bg_grid: job.centroid_config.local_bg_block_size.unwrap_or(64),
+                    min_pixels: job.centroid_config.min_pixels,
+                    max_pixels: job.centroid_config.max_pixels,
+                    max_centroids: job.centroid_config.max_centroids,
+                    max_elongation: job.centroid_config.max_elongation,
+                    ..Default::default()
+                };
+                tetra3::extract_centroids_fast(&job.mono, job.width, job.height, &cfg)
+            } else {
+                tetra3::extract_centroids_from_raw(
+                    &job.mono, job.width, job.height, &job.centroid_config,
+                )
+            }
             .map(|r| r.centroids)
             .unwrap_or_default();
             let extract_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -4514,7 +4561,7 @@ impl ViewerApp {
             }
         });
 
-        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), solve };
+        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), tracking: self.tracking_mode, solve };
         if self.solve_tx.try_send(job).is_ok() {
             self.solve_busy = true;
         }

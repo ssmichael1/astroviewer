@@ -127,6 +127,16 @@ fn main() -> anyhow::Result<()> {
         "stream negotiated: host={} port={} mtu={} packet_size={} requested / {} effective (payload stride={})",
         params.host, local_port, params.mtu, params.packet_size, effective, packet_payload
     );
+    // GEV_SCPD=<ticks> overrides the inter-packet delay (GevSCPD, 0x0D08). A
+    // camera that bursts faster than the host NIC can absorb loses payload
+    // packets before the socket, so no frame completes; spacing packets out
+    // trades frame rate for completeness.
+    if let Ok(scpd) = std::env::var("GEV_SCPD") {
+        if let Ok(v) = scpd.trim().parse::<u32>() {
+            let r = rt.block_on(dev.write_register(0x0D08, v));
+            println!("set SCPD = {v} ticks -> {:?}", r.map(|_| "ok"));
+        }
+    }
     // Read back the stream-channel registers to confirm the camera accepted them.
     for (name, addr) in [("SCPHostPort", 0x0D00u32), ("SCPSPacketSize", 0x0D04), ("SCPD", 0x0D08), ("SCDA", 0x0D18)] {
         match rt.block_on(dev.read_register(addr)) {

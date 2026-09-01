@@ -114,11 +114,18 @@ fn main() -> anyhow::Result<()> {
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let socket = rt.block_on(nic::bind_udp(bind_ip, 0, Some(iface.clone()), Some(32 * 1024 * 1024)))?;
     let local_port = socket.local_addr()?.port();
-    let params = rt.block_on(dev.negotiate_stream(0, &iface, local_port, None))?;
-    let packet_payload = params.packet_size.saturating_sub(8).max(1) as usize;
+    // GEV_PKTSIZE=<bytes> caps the negotiated GVSP packet size (full IP datagram).
+    let cap: Option<u32> = std::env::var("GEV_PKTSIZE").ok().and_then(|s| s.parse().ok());
+    let params = rt.block_on(dev.negotiate_stream(0, &iface, local_port, cap))?;
+    // Cameras may clamp the requested size; the wire follows the register.
+    let effective = rt.block_on(dev.get_stream_packet_size(0)).unwrap_or(params.packet_size);
+    // GevSCPSPacketSize is the full IP datagram: image bytes per packet exclude
+    // IPv4 (20) + UDP (8) + GVSP (8) headers. (viva-gige <= 0.2 reported the UDP
+    // payload here, so this used to be `- 8`.)
+    let mut packet_payload = effective.saturating_sub(36).max(1) as usize;
     println!(
-        "stream negotiated: host={} port={} mtu={} packet_size={} (payload={})",
-        params.host, local_port, params.mtu, params.packet_size, packet_payload
+        "stream negotiated: host={} port={} mtu={} packet_size={} requested / {} effective (payload stride={})",
+        params.host, local_port, params.mtu, params.packet_size, effective, packet_payload
     );
     // Read back the stream-channel registers to confirm the camera accepted them.
     for (name, addr) in [("SCPHostPort", 0x0D00u32), ("SCPSPacketSize", 0x0D04), ("SCPD", 0x0D08), ("SCDA", 0x0D18)] {
@@ -185,17 +192,26 @@ fn main() -> anyhow::Result<()> {
     let mut first_pkt_ids: Vec<u32> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(listen_secs);
 
-    // Hole-punch: the host's network-extension filter allows inbound that
-    // corresponds to an outbound flow (that's why GVCP replies get through). The
-    // camera streams from a varying low source port (observed 1051, 1054…), so we
-    // spray a punch across the whole likely range from our receive socket; one of
-    // them matches the camera's actual source port and opens the allowed flow.
-    let mut known_port: Option<u16> = None;
+    // Hole-punch: stateful host firewalls (Windows Defender, macOS network
+    // extensions) admit inbound UDP only for a flow this socket already sent on
+    // (that's why GVCP replies get through). GevSCSP (0x0D1C) names the port
+    // the camera streams from; punch it directly, or spray the likely range
+    // when the camera reports 0 (the Hawk streams from varying low ports).
+    let mut known_port: Option<u16> = match rt.block_on(dev.read_register(0x0D1C)) {
+        Ok(v) if v & 0xFFFF != 0 => Some((v & 0xFFFF) as u16),
+        _ => None,
+    };
+    println!("GevSCSP (camera stream source port) = {known_port:?}");
     rt.block_on(async {
-        for p in 1024u16..=2048 {
-            let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await;
+        match known_port {
+            Some(p) => { let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await; }
+            None => {
+                for p in 1024u16..=2048 {
+                    let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(ip), p)).await;
+                }
+                println!("(sprayed hole-punch to camera ports 1024-2048)");
+            }
         }
-        println!("(sprayed hole-punch to camera ports 1024-2048)");
 
         let deadline_t = tokio::time::Instant::now() + Duration::from_secs(listen_secs);
         let sleep = tokio::time::sleep_until(deadline_t);
@@ -233,6 +249,20 @@ fn main() -> anyhow::Result<()> {
                         Ok(GvspPacket::Payload { block_id, packet_id, data }) => {
                             payloads += 1;
                             if first_pkt_ids.len() < 6 { first_pkt_ids.push(packet_id); }
+                            // The wire is the authority on the stride: re-seat the
+                            // block if the first payload packet disagrees.
+                            if let (Some(a), Some((w, h, pf))) = (assembly.as_ref(), geom) {
+                                let total = w as usize * h as usize * bytes_per_pixel(pf).max(1);
+                                if a.block_id() == block_id && data.len() != packet_payload && data.len() < total
+                                    && (packet_id == 1 || data.len() > packet_payload)
+                                {
+                                    println!("  !! stride corrected {packet_payload} -> {} B/packet", data.len());
+                                    packet_payload = data.len();
+                                    let expected = total.div_ceil(packet_payload).max(1);
+                                    let pool = BytesMut::zeroed(expected * packet_payload);
+                                    assembly = Some(FrameAssembly::new(block_id, expected, packet_payload, pool, Instant::now() + Duration::from_secs(2)));
+                                }
+                            }
                             if let Some(a) = assembly.as_mut() {
                                 if a.block_id() == block_id {
                                     a.ingest(packet_id.saturating_sub(1) as usize, &data);

@@ -15,13 +15,13 @@
 //! and drives each async operation with a discrete `block_on` — never nested,
 //! so the sync `Device` bridge can itself `block_on` when applying controls.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tokio::net::UdpSocket;
 use tokio::runtime::Runtime;
 
 use cameleon_genapi::elem_type::{IntegerRepresentation, Visibility};
@@ -50,6 +50,18 @@ const STREAM_CHANNEL: u32 = 0;
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// How long an in-flight frame may take to reassemble before being abandoned.
 const FRAME_DEADLINE: Duration = Duration::from_millis(1000);
+/// Stream channel 0 source-port register (`GevSCSP`): the UDP port the camera
+/// transmits GVSP from once the channel is open (0 = unspecified).
+const SCSP_REGISTER: u32 = 0x0d1c;
+/// Bytes of a GVSP data packet that are not image payload: IPv4 (20) + UDP (8)
+/// + GVSP header (8). `GevSCPSPacketSize` is the *full IP datagram* size, so
+/// the image bytes per packet — the stride reassembly places packets at — is
+/// `packet_size - 36`. (viva-gige ≤ 0.2 reported the UDP payload instead, so
+/// this used to be `- 8`; that silent semantic change truncated every frame.)
+const GVSP_PACKET_OVERHEAD: u32 = 20 + 8 + 8;
+/// How long after AcquisitionStart to wait before warning that no packets (or
+/// no complete frame) have arrived, with the likely causes.
+const SILENCE_GRACE: Duration = Duration::from_secs(3);
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -311,22 +323,50 @@ pub fn start_camera(
     let socket = rt.block_on(nic::bind_udp(bind_ip, 0, iface.clone(), None))?;
     let local_port = socket.local_addr()?.port();
 
+    // Optional cap on the GVSP packet size (bytes, full IP datagram), e.g. to
+    // force 1500 on a jumbo-capable NIC whose path can't actually carry jumbo
+    // frames. Cameras that can't carry the negotiated size stream nothing.
+    let packet_cap: Option<u32> = std::env::var("GEV_PACKET_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
     let stream_params = rt.block_on(dev.negotiate_stream(
         STREAM_CHANNEL,
         iface.as_ref().ok_or_else(|| anyhow::anyhow!("no usable network interface for GigE streaming"))?,
         local_port,
-        None,
+        packet_cap,
     ))?;
+    // A camera may silently clamp the requested size; the wire follows what the
+    // register actually holds, so read it back over raw GVCP (not GenApi, whose
+    // cache the raw write bypassed).
+    let effective_packet_size = rt
+        .block_on(dev.get_stream_packet_size(STREAM_CHANNEL))
+        .ok()
+        .filter(|&v| v > GVSP_PACKET_OVERHEAD)
+        .unwrap_or(stream_params.packet_size);
+    let packet_payload = gvsp_stride(effective_packet_size);
     let _ = log_tx.try_send(LogEntry::info(format!(
-        "GigE: stream channel negotiated (mtu={}, packet_size={})",
-        stream_params.mtu, stream_params.packet_size
+        "GigE: stream to {}:{} (mtu={}, packet_size={} requested / {} effective, {} image bytes per packet)",
+        stream_params.host, local_port, stream_params.mtu, stream_params.packet_size,
+        effective_packet_size, packet_payload
     )));
+    if effective_packet_size != stream_params.packet_size {
+        let _ = log_tx.try_send(LogEntry::warn(format!(
+            "GigE: camera clamped GevSCPSPacketSize {} -> {}; following the camera",
+            stream_params.packet_size, effective_packet_size
+        )));
+    }
+
+    // GVSP is received on a plain blocking socket owned by the capture thread:
+    // no tokio in the packet path. (viva-genicam's own Windows fix, #72: the
+    // async receive path delivered no frames there; a blocking thread did.)
+    let socket = socket.into_std()?;
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(POLL_TIMEOUT))?;
 
     // Acquisition is started inside the capture thread once everything is wired.
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
-    let packet_payload = stream_params.packet_size.saturating_sub(8).max(1) as usize;
     let cam_name = info.display_name();
 
     let snapshot = controls.clone();
@@ -720,6 +760,26 @@ fn refresh_telemetry(
 
 // ── Capture loop ─────────────────────────────────────────────────────────--
 
+/// Receive-side state that persists across poll windows and frames.
+struct RxState {
+    assembly: Option<FrameAssembly>,
+    geom: Option<FrameGeometry>,
+    /// Image bytes per GVSP payload packet — the stride reassembly places
+    /// packets at. Seeded from the effective `GevSCPSPacketSize`, then
+    /// corrected from the first payload packet actually seen on the wire, so a
+    /// camera that interprets the register differently still reassembles.
+    stride: usize,
+    packets: u64,
+    frames: u64,
+    short_frames: u64,
+}
+
+impl RxState {
+    fn new(stride: usize) -> Self {
+        Self { assembly: None, geom: None, stride: stride.max(1), packets: 0, frames: 0, short_frames: 0 }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     rt: Runtime,
@@ -734,21 +794,28 @@ fn capture_loop(
     mut snapshot: Vec<GevControl>,
     log_tx: Sender<LogEntry>,
 ) {
+    let cam_ip = match dev.remote_addr().ip() {
+        IpAddr::V4(ip) => ip,
+        _ => Ipv4Addr::UNSPECIFIED,
+    };
+
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
     // the stream transport — required by FLIR/Point Grey before frames flow.
     if let Some(g) = genapi.as_mut() {
         set_int_feature(g, &mut dev, &rt, "TLParamsLocked", 1, &log_tx);
         execute_command(g, &mut dev, &rt, "AcquisitionStart", &log_tx);
     }
+    // Open the reverse path through stateful host firewalls (Windows Defender
+    // Firewall, macOS network-extension filters): they admit inbound UDP only
+    // for a flow the socket has already sent on — which is why GVCP replies get
+    // through — and the GVSP socket otherwise never transmits.
+    let mut scsp = punch_stream_port(&rt, &mut dev, &socket, cam_ip, None);
 
-    let cam_ip = match dev.remote_addr().ip() {
-        IpAddr::V4(ip) => ip,
-        _ => Ipv4Addr::UNSPECIFIED,
-    };
+    let started = Instant::now();
+    let mut warned_silence = false;
     let mut last_heartbeat = Instant::now();
     let mut last_telemetry = Instant::now();
-    let mut assembly: Option<FrameAssembly> = None;
-    let mut geom: Option<FrameGeometry> = None;
+    let mut rx = RxState::new(packet_payload);
     let mut buf = vec![0u8; 65536];
 
     loop {
@@ -783,13 +850,15 @@ fn capture_loop(
             return;
         }
 
-        // 2. Heartbeat.
+        // 2. Heartbeat; re-punch the stream flow while we're at it (a camera
+        //    that reported GevSCSP=0 at start may know it now).
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
             if rt.block_on(dev.read_register(CCP_REGISTER)).is_err() {
                 let _ = log_tx.try_send(LogEntry::error(format!("{cam_name}: camera disconnected")));
                 return;
             }
             last_heartbeat = Instant::now();
+            scsp = punch_stream_port(&rt, &mut dev, &socket, cam_ip, scsp);
         }
 
         // 2b. Telemetry: re-read non-writable feature values periodically so
@@ -803,22 +872,73 @@ fn capture_loop(
             }
         }
 
+        // 2c. Silence diagnostic: a stream that produces nothing looks the same
+        // for a firewall block, a packet-size mismatch, a lost privilege and an
+        // untriggered camera. Say which half we're in and name the candidates.
+        if !warned_silence && rx.frames == 0 && started.elapsed() >= SILENCE_GRACE {
+            warned_silence = true;
+            let msg = if rx.packets == 0 {
+                format!(
+                    "{cam_name}: no GVSP packets received {}s after AcquisitionStart. Likely causes: a host \
+                     firewall/EDR drops inbound UDP to this app (allow it; the camera streams from UDP port {}), \
+                     the negotiated packet size exceeds what the link carries (try GEV_PACKET_SIZE=1500), \
+                     the camera is waiting for a trigger, or another application holds control.",
+                    SILENCE_GRACE.as_secs(),
+                    scsp.map_or("unknown".to_string(), |p| p.to_string()),
+                )
+            } else {
+                format!(
+                    "{cam_name}: {} GVSP packets received but no frame completed ({} short frames; reassembly \
+                     stride {} B/packet). Likely packet loss (socket buffer / link) or a packet-size mismatch.",
+                    rx.packets, rx.short_frames, rx.stride
+                )
+            };
+            let _ = log_tx.try_send(LogEntry::warn(msg));
+        }
+
         // 3. Receive GVSP packets until a frame completes or the poll window expires.
-        let completed = rt.block_on(receive_until_frame(
-            &socket, &mut buf, &mut assembly, &mut geom, packet_payload,
-        ));
+        let completed = receive_until_frame(&socket, &mut buf, &mut rx, &log_tx);
 
         if let Some((payload, g)) = completed {
-            if let Some((mono, w, h, bit_depth)) = decode_payload(&payload, &g) {
-                let frame = FrameData::new(mono, w, h, bit_depth);
-                if frame_tx.try_send(frame).is_err() && frame_tx.is_empty() {
-                    // Receiver gone.
-                    if let Some(g) = genapi.as_mut() {
-                        execute_command(g, &mut dev, &rt, "AcquisitionStop", &log_tx);
-                        set_int_feature(g, &mut dev, &rt, "TLParamsLocked", 0, &log_tx);
+            let npix = g.width as usize * g.height as usize;
+            match decode_payload(&payload, &g) {
+                Some((mono, w, h, bit_depth)) => {
+                    if rx.frames == 0 {
+                        let _ = log_tx.try_send(LogEntry::info(format!(
+                            "{cam_name}: streaming {w}x{h} pf={:#010x} ({} B/frame, {} B/packet)",
+                            g.pixel_format, payload.len(), rx.stride
+                        )));
                     }
-                    let _ = rt.block_on(dev.release_control());
-                    return;
+                    rx.frames += 1;
+                    let frame = FrameData::new(mono, w, h, bit_depth);
+                    if frame_tx.try_send(frame).is_err() && frame_tx.is_empty() {
+                        // Receiver gone.
+                        if let Some(g) = genapi.as_mut() {
+                            execute_command(g, &mut dev, &rt, "AcquisitionStop", &log_tx);
+                            set_int_feature(g, &mut dev, &rt, "TLParamsLocked", 0, &log_tx);
+                        }
+                        let _ = rt.block_on(dev.release_control());
+                        return;
+                    }
+                }
+                None => {
+                    rx.short_frames += 1;
+                    if rx.short_frames == 1 {
+                        let needed = frame_payload_bytes(g.pixel_format, npix);
+                        let msg = if payload.len() < needed {
+                            format!(
+                                "{cam_name}: frame {}x{} pf={:#010x} reassembled to {} B, need {} B \
+                                 (stride {} B/packet) — packet-size mismatch; dropping frames",
+                                g.width, g.height, g.pixel_format, payload.len(), needed, rx.stride
+                            )
+                        } else {
+                            format!(
+                                "{cam_name}: unsupported pixel format {:#010x} ({}x{}); dropping frames",
+                                g.pixel_format, g.width, g.height
+                            )
+                        };
+                        let _ = log_tx.try_send(LogEntry::warn(msg));
+                    }
                 }
             }
         }
@@ -833,55 +953,114 @@ struct FrameGeometry {
     pixel_format: u32,
 }
 
-/// Drain GVSP packets, assembling the current frame. Returns the finished
-/// payload + geometry when a Trailer completes a frame, or `None` if the poll
-/// window elapses first.
-async fn receive_until_frame(
+/// Image bytes per GVSP data packet for a `GevSCPSPacketSize` value.
+fn gvsp_stride(packet_size: u32) -> usize {
+    packet_size.saturating_sub(GVSP_PACKET_OVERHEAD).max(1) as usize
+}
+
+/// Start reassembling a block whose Leader announced geometry `g`.
+fn new_assembly(g: &FrameGeometry, block_id: u64, stride: usize) -> FrameAssembly {
+    let total = frame_payload_bytes(g.pixel_format, g.width as usize * g.height as usize);
+    let expected = total.div_ceil(stride).max(1);
+    let pool = BytesMut::zeroed(expected * stride);
+    FrameAssembly::new(block_id, expected, stride, pool, Instant::now() + FRAME_DEADLINE)
+}
+
+/// Read `GevSCSP` (the camera's GVSP source port) and, when known, send one
+/// datagram from the receive socket to it so stateful host firewalls admit the
+/// camera's packets as replies. Returns the port for reuse. Best-effort: every
+/// failure is ignored, and hosts without such a firewall are unaffected.
+fn punch_stream_port(
+    rt: &Runtime,
+    dev: &mut GigeDevice,
+    socket: &UdpSocket,
+    cam_ip: Ipv4Addr,
+    known: Option<u16>,
+) -> Option<u16> {
+    let port = match rt.block_on(dev.read_register(SCSP_REGISTER)) {
+        Ok(v) if (v & 0xFFFF) != 0 => Some((v & 0xFFFF) as u16),
+        _ => known,
+    };
+    if let Some(p) = port {
+        let _ = socket.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
+    }
+    port
+}
+
+/// Drain GVSP packets from the blocking socket, assembling the current frame.
+/// Returns the finished payload + geometry when a Trailer completes a frame, or
+/// `None` once the poll window elapses (the socket's read timeout) so the caller
+/// can service commands. A partially received frame persists in `rx` across
+/// calls, so a frame slower than one window still completes.
+fn receive_until_frame(
     socket: &UdpSocket,
     buf: &mut [u8],
-    assembly: &mut Option<FrameAssembly>,
-    geom: &mut Option<FrameGeometry>,
-    packet_payload: usize,
-) -> Option<(bytes::Bytes, FrameGeometry)> {
-    let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
+    rx: &mut RxState,
+    log_tx: &Sender<LogEntry>,
+) -> Option<(Bytes, FrameGeometry)> {
+    let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
-        let recv = tokio::time::timeout_at(deadline, socket.recv_from(buf)).await;
-        let n = match recv {
-            Ok(Ok((n, _src))) => n,
-            Ok(Err(_)) => return None,
-            Err(_) => return None, // poll window elapsed
+        let n = match socket.recv_from(buf) {
+            Ok((n, _src)) => n,
+            Err(e) => match e.kind() {
+                // Read timeout: the poll window is over.
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => return None,
+                // Windows reports an ICMP port-unreachable for an earlier send
+                // (our hole punch) as ConnectionReset on the next recv. Harmless.
+                ErrorKind::Interrupted | ErrorKind::ConnectionReset => {
+                    if Instant::now() >= deadline { return None; }
+                    continue;
+                }
+                _ => return None,
+            },
         };
+        rx.packets += 1;
         let packet = match gvsp::parse_packet(&buf[..n]) {
             Ok(p) => p,
             Err(_) => continue,
         };
         match packet {
             GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
-                *geom = Some(FrameGeometry { width, height, pixel_format });
-                let total_bytes = frame_payload_bytes(pixel_format, width as usize * height as usize);
-                let expected_packets = total_bytes.div_ceil(packet_payload).max(1);
-                let pool = BytesMut::zeroed(expected_packets * packet_payload);
-                let dl = Instant::now() + FRAME_DEADLINE;
-                *assembly = Some(FrameAssembly::new(block_id, expected_packets, packet_payload, pool, dl));
+                let g = FrameGeometry { width, height, pixel_format };
+                rx.geom = Some(g);
+                rx.assembly = Some(new_assembly(&g, block_id, rx.stride));
             }
             GvspPacket::Payload { block_id, packet_id, data } => {
-                if let Some(a) = assembly.as_mut() {
-                    if a.block_id() == block_id {
-                        // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
-                        a.ingest(packet_id.saturating_sub(1) as usize, &data);
-                    }
+                let Some(g) = rx.geom else { continue };
+                if rx.assembly.as_ref().map(FrameAssembly::block_id) != Some(block_id) {
+                    continue;
+                }
+                // The wire is the authority on the stride: the first payload
+                // packet of a block is full-sized unless the whole frame fits in
+                // one packet, and any packet larger than the assumed stride
+                // proves the assumption wrong. Re-seat the block on the real one.
+                let total = frame_payload_bytes(g.pixel_format, g.width as usize * g.height as usize);
+                let wire = data.len();
+                if wire != rx.stride && wire < total && (packet_id == 1 || wire > rx.stride) {
+                    let _ = log_tx.try_send(LogEntry::warn(format!(
+                        "GigE: GVSP payload stride corrected {} -> {} B/packet (camera's packet size \
+                         differs from the negotiated value)",
+                        rx.stride, wire
+                    )));
+                    rx.stride = wire;
+                    rx.assembly = Some(new_assembly(&g, block_id, wire));
+                }
+                if let Some(a) = rx.assembly.as_mut() {
+                    // Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
+                    a.ingest(packet_id.saturating_sub(1) as usize, &data);
                 }
             }
             GvspPacket::Trailer { block_id, .. } => {
-                if let Some(a) = assembly.as_ref() {
-                    if a.block_id() == block_id {
-                        let a = assembly.take().unwrap();
-                        if let (Some(payload), Some(g)) = (a.finish(), *geom) {
-                            return Some((payload, g));
-                        }
+                if rx.assembly.as_ref().map(FrameAssembly::block_id) == Some(block_id) {
+                    let a = rx.assembly.take().unwrap();
+                    if let (Some(payload), Some(g)) = (a.finish(), rx.geom) {
+                        return Some((payload, g));
                     }
                 }
             }
+        }
+        if Instant::now() >= deadline {
+            return None;
         }
     }
 }
@@ -1071,6 +1250,99 @@ fn local_ipv4_towards(target: Ipv4Addr) -> Ipv4Addr {
         }
     }
     Ipv4Addr::UNSPECIFIED
+}
+
+#[cfg(test)]
+mod tests {
+    //! Drive the real receive path over loopback with synthetic GVSP packets.
+    use super::*;
+
+    const MONO8: u32 = 0x0108_0001;
+
+    fn header(format: u8, block: u16, packet_id: u32) -> Vec<u8> {
+        let mut v = vec![0u8, 0]; // status
+        v.extend_from_slice(&block.to_be_bytes());
+        v.push(format);
+        v.extend_from_slice(&packet_id.to_be_bytes()[1..]);
+        v
+    }
+
+    fn leader(block: u16, w: u32, h: u32) -> Vec<u8> {
+        let mut v = header(0x01, block, 0);
+        v.extend_from_slice(&[0, 0]); // reserved
+        v.extend_from_slice(&1u16.to_be_bytes()); // payload type: image
+        v.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+        v.extend_from_slice(&MONO8.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    fn trailer(block: u16, packet_id: u32, h: u32) -> Vec<u8> {
+        let mut v = header(0x02, block, packet_id);
+        v.extend_from_slice(&[0, 0]);
+        v.extend_from_slice(&1u16.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    /// Send one Mono8 frame split at `wire_stride` bytes per packet, and
+    /// reassemble it with a receiver seeded with `seed_stride`.
+    fn round_trip(wire_stride: usize, seed_stride: usize) -> (Vec<u8>, Option<Bytes>, usize) {
+        let (w, h) = (100u32, 40u32);
+        let image: Vec<u8> = (0..(w * h) as usize).map(|i| (i * 7 % 251) as u8).collect();
+
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx_sock.set_read_timeout(Some(POLL_TIMEOUT)).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = rx_sock.local_addr().unwrap();
+
+        tx.send_to(&leader(7, w, h), dst).unwrap();
+        let mut id = 1u32;
+        for chunk in image.chunks(wire_stride) {
+            let mut v = header(0x03, 7, id);
+            v.extend_from_slice(chunk);
+            tx.send_to(&v, dst).unwrap();
+            id += 1;
+        }
+        tx.send_to(&trailer(7, id, h), dst).unwrap();
+
+        let (log_tx, _log_rx) = bounded::<LogEntry>(16);
+        let mut rx = RxState::new(seed_stride);
+        let mut buf = vec![0u8; 65536];
+        let got = receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).map(|(p, _)| p);
+        (image, got, rx.stride)
+    }
+
+    #[test]
+    fn gvsp_stride_excludes_ip_udp_and_gvsp_headers() {
+        assert_eq!(gvsp_stride(1500), 1464);
+        assert_eq!(gvsp_stride(1458), 1422);
+        assert_eq!(gvsp_stride(9000), 8964);
+    }
+
+    #[test]
+    fn matching_stride_reassembles_the_frame() {
+        let (image, got, stride) = round_trip(1464, 1464);
+        assert_eq!(got.as_deref(), Some(&image[..]));
+        assert_eq!(stride, 1464);
+    }
+
+    #[test]
+    fn too_large_seed_stride_is_corrected_from_the_wire() {
+        // The viva-gige 0.2 -> 0.5 regression: seeded with packet_size - 8
+        // while the camera sends packet_size - 36 per packet.
+        let (image, got, stride) = round_trip(1464, 1492);
+        assert_eq!(got.as_deref(), Some(&image[..]));
+        assert_eq!(stride, 1464);
+    }
+
+    #[test]
+    fn too_small_seed_stride_is_corrected_from_the_wire() {
+        let (image, got, stride) = round_trip(1464, 1000);
+        assert_eq!(got.as_deref(), Some(&image[..]));
+        assert_eq!(stride, 1464);
+    }
 }
 
 // Trait imports needed for the `*Kind` method calls above.

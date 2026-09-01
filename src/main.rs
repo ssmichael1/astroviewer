@@ -19,6 +19,9 @@ mod camera;
 #[cfg(feature = "gev")]
 mod gev_camera;
 
+#[cfg(feature = "gev")]
+mod gige;
+
 #[cfg(feature = "indi")]
 mod indi_camera;
 

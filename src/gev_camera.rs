@@ -80,12 +80,19 @@ const RESEND_MAX_ATTEMPTS: u32 = 2;
 const RESEND_MAX_RANGES: usize = 32;
 /// Packet resend: gaps this close are merged into one range.
 const RESEND_COALESCE_GAP: u32 = 4;
+/// Packet resend: a block missing more than this fraction of its packets is
+/// dropped, not requested. Resend is for the occasional gap; asking a camera
+/// to retransmit most of a frame into a link that is already dropping 60% of
+/// it only deepens the congestion.
+const RESEND_MAX_MISSING: f64 = 0.25;
 /// Packet resend: requests after which, with no frame ever recovered, the log
 /// says the camera is not honoring them.
 const RESEND_SILENT_AFTER: u64 = 20;
 /// GVCP PACKETRESEND command code. Sent without the ack-required flag: GigE
 /// Vision 1.x devices never acknowledge it, and waiting for one would hold the
-/// request stream past the camera's frame buffer.
+/// request stream past the camera's frame buffer. Payload (12 bytes, as
+/// aravis encodes it): `stream_channel(2) | block_id(2) | first_packet_id(4)
+/// | last_packet_id(4)`. viva-gige's 8-byte form is not the specified layout.
 const PACKET_RESEND_CMD: u16 = 0x0040;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -909,6 +916,11 @@ impl Block {
         self.assembly.finish().map(|p| (p, g))
     }
 
+    /// Packets not yet received.
+    fn missing_count(&self) -> usize {
+        self.bitmap.missing_ranges().iter().map(|r| (*r.end() - *r.start() + 1) as usize).sum()
+    }
+
     /// Whether a PACKETRESEND can name this block's packets (16-bit ids).
     fn resendable(&self) -> bool {
         self.id <= u16::MAX as u64 && self.expected <= u16::MAX as usize
@@ -983,7 +995,10 @@ impl RxState {
     fn request_or_drop(&mut self, mut block: Block) {
         let enabled = self.shared.resend_enabled.load(Ordering::Relaxed);
         if let Some(tx) = self.resend_tx.as_ref().filter(|_| enabled) {
-            if block.resendable() && block.attempts < RESEND_MAX_ATTEMPTS {
+            if block.resendable()
+                && block.attempts < RESEND_MAX_ATTEMPTS
+                && (block.missing_count() as f64) <= RESEND_MAX_MISSING * block.expected as f64
+            {
                 let ranges = coalesce_ranges(block.bitmap.missing_ranges());
                 if !ranges.is_empty() && ranges.len() <= RESEND_MAX_RANGES {
                     let req = ResendReq { block_id: block.id as u16, ranges };
@@ -1056,16 +1071,16 @@ fn issue_resends(socket: &UdpSocket, req: ResendReq, ctl: &mut ResendCtl, shared
     for (first, last) in req.ranges {
         let id = ctl.next_id;
         ctl.next_id = if ctl.next_id == u16::MAX { 1 } else { ctl.next_id + 1 };
-        let mut pkt = [0u8; 16];
+        let mut pkt = [0u8; 20];
         pkt[0] = 0x42;
         pkt[1] = 0x00; // no ack required
         pkt[2..4].copy_from_slice(&PACKET_RESEND_CMD.to_be_bytes());
-        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[4..6].copy_from_slice(&12u16.to_be_bytes());
         pkt[6..8].copy_from_slice(&id.to_be_bytes());
-        pkt[8..10].copy_from_slice(&req.block_id.to_be_bytes());
-        pkt[10..12].copy_from_slice(&0u16.to_be_bytes());
-        pkt[12..14].copy_from_slice(&first.to_be_bytes());
-        pkt[14..16].copy_from_slice(&last.to_be_bytes());
+        // pkt[8..10]: stream channel index 0
+        pkt[10..12].copy_from_slice(&req.block_id.to_be_bytes());
+        pkt[12..16].copy_from_slice(&(first as u32).to_be_bytes());
+        pkt[16..20].copy_from_slice(&(last as u32).to_be_bytes());
         if socket.send(&pkt).is_err() {
             return;
         }
@@ -1805,7 +1820,7 @@ mod tests {
     /// Send one Mono8 block: leader, payloads at `stride` skipping the 1-based
     /// packet ids in `skip`, and the trailer unless `trailer` is false.
     fn send_block(tx: &UdpSocket, dst: SocketAddr, block: u16, image: &[u8], stride: usize, skip: &[u32], trailer: bool) {
-        let (w, h) = (100u32, 40u32);
+        let (w, h) = (100u32, 120u32);
         tx.send_to(&leader(block, w, h), dst).unwrap();
         let mut id = 1u32;
         for chunk in image.chunks(stride) {
@@ -1829,8 +1844,10 @@ mod tests {
         tx.send_to(&v, dst).unwrap();
     }
 
+    /// 100x120 Mono8: 12,000 bytes, nine 1464-byte packets, so one lost packet
+    /// is 11% of the frame — under the resend guard.
     fn test_image() -> Vec<u8> {
-        (0..4000usize).map(|i| (i * 7 % 251) as u8).collect()
+        (0..12_000usize).map(|i| (i * 7 % 251) as u8).collect()
     }
 
     #[test]
@@ -1872,7 +1889,7 @@ mod tests {
 
         // Block 7 loses packet 3 and its trailer; block 8's leader follows.
         send_block(&tx, dst, 7, &image, 1464, &[3], false);
-        tx.send_to(&leader(8, 100, 40), dst).unwrap();
+        tx.send_to(&leader(8, 100, 120), dst).unwrap();
         assert!(receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).is_none());
         let req = resend_rx.try_recv().expect("resend requested when the next leader arrived");
         assert_eq!((req.block_id, req.ranges.clone()), (7, vec![(3, 3)]));

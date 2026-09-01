@@ -13,6 +13,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut dev = rt.block_on(GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)))?;
     let regs: &[(&str, u32)] = &[
+        ("GevCapability", 0x0934),
         ("CCP (control privilege)", 0x0A00),
         ("HeartbeatTimeout ms", 0x0938),
         ("CurrentIPAddress", 0x0024),
@@ -30,6 +31,10 @@ fn main() -> anyhow::Result<()> {
         match rt.block_on(dev.read_register(*addr)) {
             Ok(v) => {
                 let extra = match *addr {
+                    0x0934 => format!(
+                        "  PR(packet resend)={} W(writemem)={} C(concat)={} PA(pending ack)={} E(event)={}",
+                        (v >> 2) & 1, (v >> 1) & 1, v & 1, (v >> 5) & 1, (v >> 3) & 1
+                    ),
                     0x0024 | 0x0034 | 0x0D18 => format!("  = {}", Ipv4Addr::from(v)),
                     0x0D00 | 0x0D1C => format!("  = port {}", v & 0xFFFF),
                     0x0D04 => format!("  = size {} (flags {:#x})", v & 0xFFFF, v >> 16),

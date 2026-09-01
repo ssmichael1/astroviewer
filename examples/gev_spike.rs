@@ -1,23 +1,29 @@
 //! GigE Vision transport spike — proves discovery, control, GenICam XML fetch,
 //! and GVSP streaming against a real camera, with no changes to the viewer app.
+//! Uses the app-owned synchronous GigE transport.
 //!
-//! Run with a camera on the network:
-//!     cargo run --example gev_spike --features gev
+//!   cargo run --example gev_spike --features gev
+//!   cargo run --example gev_spike --features gev -- 192.168.0.2
+//!   cargo run --example gev_spike --features gev -- 127.0.0.1 3957
 //!
 //! With no camera present it prints "no cameras found" and exits cleanly.
 
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+#[path = "../src/gige/mod.rs"]
+#[allow(dead_code)]
+mod gige;
 
-use viva_gige::gvcp::{self, GigeDevice};
-use viva_gige::gvsp::{self, GvspPacket};
-use viva_gige::nic::{self, Iface};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    // Optional first arg: a target IP to open directly (skips broadcast discovery,
-    // useful when the camera is reachable by unicast but doesn't answer broadcasts).
-    let target_ip: Option<std::net::Ipv4Addr> = std::env::args().nth(1).and_then(|s| s.parse().ok());
+use gige::gvcp::{self, Device};
+use gige::gvsp::{self, GvspPacket};
+use gige::nic::{self, Iface};
+
+fn main() -> anyhow::Result<()> {
+    // Optional first arg: a target IP to open directly (skips broadcast
+    // discovery). Optional second arg: the GVCP port (default 3956).
+    let target_ip: Option<Ipv4Addr> = std::env::args().nth(1).and_then(|s| s.parse().ok());
+    let port: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(gvcp::GVCP_PORT);
 
     let ip = match target_ip {
         Some(ip) => {
@@ -26,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             println!("Discovering GigE Vision cameras (500 ms)…");
-            let devices = gvcp::discover_all(Duration::from_millis(500)).await?;
+            let devices = gvcp::discover_all(Duration::from_millis(500));
             if devices.is_empty() {
                 println!("no cameras found (pass an IP to open directly, e.g. `… -- 192.168.0.2`)");
                 return Ok(());
@@ -44,64 +50,56 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    println!("\nOpening {ip}…");
-    let mut dev = GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)).await?;
-    dev.claim_control().await?;
+    println!("\nOpening {ip}:{port}…");
+    let mut dev = Device::open(SocketAddr::new(IpAddr::V4(ip), port)).map_err(|e| anyhow::anyhow!("open: {e}"))?;
+    dev.claim_control().map_err(|e| anyhow::anyhow!("claim control: {e}"))?;
     println!("control claimed");
 
     // First-URL bootstrap register → GenICam XML location.
-    let raw = dev.read_mem(0x0200, 512).await?;
-    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len()); // cut at NUL; tail may be garbage
+    let raw = dev.read_mem(0x0200, 512).map_err(|e| anyhow::anyhow!("READMEM: {e}"))?;
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let url = String::from_utf8_lossy(&raw[..end]);
-    let url = url.trim();
-    println!("GenICam URL: {url}");
+    println!("GenICam URL: {}", url.trim());
 
     // Negotiate a stream channel toward our interface and bind a receive socket.
-    let iface = Iface::from_ipv4(local_ipv4_towards(ip)?)?;
-    let bind_ip = iface.ipv4().map(IpAddr::V4).unwrap_or(nic::default_bind_addr());
-    let socket = nic::bind_udp(bind_ip, 0, Some(iface.clone()), None).await?;
-    let port = socket.local_addr()?.port();
-    let params = dev.negotiate_stream(0, &iface, port, None).await?;
+    let iface = Iface::from_ipv4(nic::local_ipv4_towards(ip, port))?;
+    let bind_ip = iface.ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let (socket, _rcvbuf) = nic::bind_gvsp_socket(bind_ip, 32 << 20, Duration::from_millis(500))?;
+    let local_port = socket.local_addr()?.port();
+    let params = dev.negotiate_stream(0, &iface, local_port, None).map_err(|e| anyhow::anyhow!("negotiate: {e}"))?;
     println!(
         "stream negotiated: mtu={} packet_size={} -> receiving on {}:{}",
-        params.mtu, params.packet_size, bind_ip, port
+        params.mtu, params.packet_size, bind_ip, local_port
     );
 
     // Receive a handful of packets and report the first Leader's geometry.
     let mut buf = vec![0u8; 65536];
     let mut leaders = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline && leaders < 3 {
-        match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => {
-                if let Ok(GvspPacket::Leader { width, height, pixel_format, block_id, .. }) =
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && leaders < 3 {
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                if let Ok(GvspPacket::Leader { width, height, pixel_format, block_id }) =
                     gvsp::parse_packet(&buf[..n])
                 {
-                    println!(
-                        "frame {block_id}: {width}x{height} pixel_format=0x{pixel_format:08x}"
-                    );
+                    println!("frame {block_id}: {width}x{height} pixel_format=0x{pixel_format:08x}");
                     leaders += 1;
                 }
             }
-            Ok(Err(e)) => {
-                println!("recv error: {e}");
-                break;
-            }
-            Err(_) => println!("(no packets — is acquisition running? try AcquisitionStart)"),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                    println!("(no packets — is acquisition running? try AcquisitionStart)");
+                }
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::Interrupted => continue,
+                _ => {
+                    println!("recv error: {e}");
+                    break;
+                }
+            },
         }
     }
 
-    dev.release_control().await?;
+    let _ = dev.release_control();
     println!("done");
     Ok(())
-}
-
-fn local_ipv4_towards(target: std::net::Ipv4Addr) -> anyhow::Result<std::net::Ipv4Addr> {
-    use std::net::UdpSocket;
-    let sock = UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-    sock.connect((target, gvcp::GVCP_PORT))?;
-    match sock.local_addr()? {
-        SocketAddr::V4(a) => Ok(*a.ip()),
-        _ => Ok(std::net::Ipv4Addr::UNSPECIFIED),
-    }
 }

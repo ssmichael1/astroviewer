@@ -663,44 +663,23 @@ enum RecvOutcome {
 
 // ── Discovery ─────────────────────────────────────────────────────────────--
 
-/// Broadcast a GVCP discovery command on every IPv4 interface plus the limited
-/// broadcast, collect for `timeout`, and dedupe by MAC.
+/// Find every camera this host can see: a broadcast DISCOVERY on every IPv4
+/// interface, plus a unicast DISCOVERY to each address of the /24 around
+/// every private, non-default-route interface (see [`sweep_send`]). Collects
+/// for `timeout` and dedupes by MAC.
 pub fn discover_all(timeout: Duration) -> Vec<DeviceInfo> {
     let request_id: u16 = 0x0100;
-    let socket = match make_broadcast_socket() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let packet = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, DISCOVERY_CMD, request_id, &[]);
-    for dest in broadcast_targets() {
-        let _ = socket.send_to(&packet, (dest, GVCP_PORT));
-    }
-
+    let broadcast = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, DISCOVERY_CMD, request_id, &[]);
+    let unicast = encode_command(FLAG_ACK_REQUIRED, DISCOVERY_CMD, request_id, &[]);
+    let mut sockets = broadcast_send(&broadcast);
+    sockets.extend(sweep_send(&unicast));
     let mut seen: std::collections::HashMap<[u8; 6], DeviceInfo> = std::collections::HashMap::new();
-    let deadline = Instant::now() + timeout;
-    let mut buf = vec![0u8; 2048];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    collect_replies(&sockets, Instant::now() + timeout, |buf| {
+        if let Some(info) = parse_discovery_ack(buf, request_id) {
+            seen.entry(info.mac).or_insert(info);
         }
-        if socket.set_read_timeout(Some(remaining)).is_err() {
-            break;
-        }
-        match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
-                if let Some(info) = parse_discovery_ack(&buf[..len], request_id) {
-                    seen.entry(info.mac).or_insert(info);
-                }
-            }
-            Err(e) => match e.kind() {
-                ErrorKind::WouldBlock | ErrorKind::TimedOut => break,
-                // Windows: an ICMP unreachable from the broadcast surfaces here.
-                ErrorKind::ConnectionReset | ErrorKind::Interrupted => continue,
-                _ => break,
-            },
-        }
-    }
+        false
+    });
     let mut devices: Vec<_> = seen.into_values().collect();
     devices.sort_by_key(|d| d.ip);
     devices
@@ -731,21 +710,6 @@ pub fn discover_unicast(ip: Ipv4Addr, port: u16, timeout: Duration) -> Option<De
     None
 }
 
-/// Where a broadcast GVCP command must be sent to reach every device this
-/// host can see: the limited broadcast, each interface's directed broadcast,
-/// and loopback interfaces themselves (loopback only accepts unicast).
-fn broadcast_targets() -> Vec<Ipv4Addr> {
-    let mut out = vec![Ipv4Addr::BROADCAST];
-    for iface in nic::ipv4_interfaces() {
-        out.push(if iface.is_loopback {
-            iface.ip
-        } else {
-            nic::directed_broadcast(iface.ip, iface.netmask)
-        });
-    }
-    out
-}
-
 /// The 56-byte FORCEIP payload: reserved(2) | MAC(6) | reserved(12) |
 /// IP(4) | reserved(12) | subnet mask(4) | reserved(12) | gateway(4).
 pub fn encode_forceip_payload(mac: [u8; 6], ip: Ipv4Addr, subnet: Ipv4Addr, gateway: Ipv4Addr) -> [u8; 56] {
@@ -772,50 +736,129 @@ pub fn force_ip(
     timeout: Duration,
 ) -> Result<bool, GvcpError> {
     let request_id: u16 = 0x0200;
-    let socket = make_broadcast_socket()?;
     let payload = encode_forceip_payload(mac, ip, subnet, gateway);
     let packet = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, FORCEIP_CMD, request_id, &payload);
-    let mut sent = false;
-    for dest in broadcast_targets() {
-        sent |= socket.send_to(&packet, (dest, GVCP_PORT)).is_ok();
-    }
-    if !sent {
+    let sockets = broadcast_send(&packet);
+    if sockets.is_empty() {
         return Err(GvcpError::Protocol("FORCEIP could not be sent on any interface".into()));
     }
+    let mut result: Result<bool, GvcpError> = Ok(false);
+    collect_replies(&sockets, Instant::now() + timeout, |buf| {
+        let Ok(ack) = decode_ack(buf) else { return false };
+        if ack.command != FORCEIP_ACK || ack.request_id != request_id {
+            return false; // discovery replies and other chatter share the port
+        }
+        result = match ack.status {
+            Status::Success => Ok(true),
+            other => Err(GvcpError::Status(other)),
+        };
+        true
+    });
+    result
+}
 
-    let deadline = Instant::now() + timeout;
-    let mut buf = vec![0u8; 2048];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
+/// Send a broadcast GVCP command on every IPv4 interface and return the
+/// sockets it went out on, so their replies can be collected.
+///
+/// One socket per interface, bound to that interface's own address: on
+/// macOS and the BSDs a limited broadcast from a socket bound to 0.0.0.0
+/// leaves only through the default-route interface, so a camera on a
+/// secondary NIC never hears it. Each interface gets the limited broadcast
+/// and its directed broadcast (a camera whose subnet mask differs from the
+/// host's still accepts the former); loopback gets unicast to itself.
+fn broadcast_send(packet: &[u8]) -> Vec<UdpSocket> {
+    let mut sockets = Vec::new();
+    for iface in nic::ipv4_interfaces() {
+        let Ok(socket) = bind_broadcast_socket(&iface) else { continue };
+        let dests: &[Ipv4Addr] = if iface.is_loopback {
+            &[iface.ip]
+        } else {
+            &[Ipv4Addr::BROADCAST, nic::directed_broadcast(iface.ip, iface.netmask)]
+        };
+        let sent = dests.iter().any(|d| socket.send_to(packet, (*d, GVCP_PORT)).is_ok());
+        if sent && socket.set_nonblocking(true).is_ok() {
+            sockets.push(socket);
         }
-        socket.set_read_timeout(Some(remaining))?;
-        match socket.recv_from(&mut buf) {
-            Ok((len, _src)) => {
-                let Ok(ack) = decode_ack(&buf[..len]) else { continue };
-                if ack.command != FORCEIP_ACK || ack.request_id != request_id {
-                    continue; // discovery replies and other chatter share the port
-                }
-                return match ack.status {
-                    Status::Success => Ok(true),
-                    other => Err(GvcpError::Status(other)),
-                };
+    }
+    sockets
+}
+
+/// Send a unicast GVCP command to every address in the /24 containing each
+/// private, non-loopback interface that is not the default route, and return
+/// the sockets it went out on.
+///
+/// Why: endpoint-security filters (the corporate VPN/EDR on the bench Mac)
+/// admit an inbound datagram only when it matches an outbound flow, and a
+/// camera's reply to a broadcast never matches a flow addressed to
+/// 255.255.255.255 — while a reply to a unicast request does. A camera link
+/// is a private subnet off the default route, so sweeping its /24 (254 tiny
+/// datagrams) finds the camera without touching the corporate network.
+fn sweep_send(packet: &[u8]) -> Vec<UdpSocket> {
+    let default_src = nic::local_ipv4_towards(Ipv4Addr::new(1, 1, 1, 1), 53);
+    let mut sockets = Vec::new();
+    for iface in nic::ipv4_interfaces() {
+        if iface.is_loopback || iface.ip == default_src || !iface.ip.is_private() && !iface.ip.is_link_local() {
+            continue;
+        }
+        let Ok(socket) = bind_broadcast_socket(&iface) else { continue };
+        let base = u32::from(iface.ip) & 0xFFFF_FF00;
+        let mut sent = false;
+        for host in 1..=254u32 {
+            let ip = Ipv4Addr::from(base | host);
+            if ip != iface.ip {
+                sent |= socket.send_to(packet, (ip, GVCP_PORT)).is_ok();
             }
-            Err(e) => match e.kind() {
-                ErrorKind::WouldBlock | ErrorKind::TimedOut => return Ok(false),
-                ErrorKind::ConnectionReset | ErrorKind::Interrupted => continue,
-                _ => return Err(e.into()),
-            },
         }
+        if sent && socket.set_nonblocking(true).is_ok() {
+            sockets.push(socket);
+        }
+    }
+    sockets
+}
+
+/// Poll `sockets` round-robin until `deadline`, handing every datagram to
+/// `on_reply`; stop early when it returns true.
+fn collect_replies(sockets: &[UdpSocket], deadline: Instant, mut on_reply: impl FnMut(&[u8]) -> bool) {
+    let mut buf = vec![0u8; 2048];
+    while Instant::now() < deadline {
+        for socket in sockets {
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, _src)) => {
+                        if on_reply(&buf[..len]) {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    // Windows: an ICMP unreachable from the broadcast surfaces here.
+                    Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::Interrupted) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn make_broadcast_socket() -> io::Result<UdpSocket> {
+/// A broadcast-capable socket pinned to one interface. Binding the source
+/// address is not enough on macOS/BSD: the route for 255.255.255.255 still
+/// resolves to the default interface, so the datagram would leave on the
+/// wrong NIC with a foreign source address. IP_BOUND_IF (Apple, illumos) /
+/// SO_BINDTODEVICE (Linux) pins it; Windows picks the interface from the
+/// bound address on its own. Best-effort: a failure leaves the plain bind.
+fn bind_broadcast_socket(iface: &nic::Ipv4Iface) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_broadcast(true)?;
-    socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).into())?;
+    #[cfg(any(target_vendor = "apple", target_os = "illumos", target_os = "solaris"))]
+    if let Some(index) = iface.index.and_then(std::num::NonZeroU32::new) {
+        let _ = socket.bind_device_by_index_v4(Some(index));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = socket.bind_device(Some(iface.name.as_bytes()));
+    }
+    socket.bind(&SocketAddr::new(IpAddr::V4(iface.ip), 0).into())?;
     let socket: UdpSocket = socket.into();
     socket.set_nonblocking(false)?;
     Ok(socket)

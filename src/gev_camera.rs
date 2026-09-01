@@ -208,7 +208,7 @@ impl Drop for GevHandle {
 
 /// Discover GigE Vision cameras on all interfaces. Returns an empty vec on error.
 pub fn enumerate() -> Vec<GevDeviceInfo> {
-    gvcp::discover_all(Duration::from_millis(500))
+    gvcp::discover_all(Duration::from_millis(1200))
         .into_iter()
         .map(device_info_to_gev)
         .collect()

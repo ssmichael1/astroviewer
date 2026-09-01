@@ -68,6 +68,10 @@ pub struct Ipv4Iface {
     pub ip: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub is_loopback: bool,
+    /// OS interface name (`en21`, `eth0`, a GUID on Windows).
+    pub name: String,
+    /// Kernel interface index, when the OS reports one.
+    pub index: Option<u32>,
 }
 
 /// Enumerate every IPv4 interface the host reports.
@@ -80,6 +84,8 @@ pub fn ipv4_interfaces() -> Vec<Ipv4Iface> {
                     ip: v4.ip,
                     netmask: v4.netmask,
                     is_loopback: v4.ip.is_loopback(),
+                    name: iface.name.clone(),
+                    index: iface.index,
                 });
             }
         }

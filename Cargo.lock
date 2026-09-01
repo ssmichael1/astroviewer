@@ -4385,6 +4385,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "socket2",
  "svbony",
  "tetra3",
  "tokio",

@@ -37,13 +37,14 @@ cameleon-genapi = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"], optional = true }
 bytes = { version = "1", optional = true }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
+socket2 = { version = "0.6", optional = true }
 
 [features]
 default = []
 svbony = ["dep:svbony"]
 toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
-gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip"]
+gev = ["dep:viva-gige", "dep:cameleon-genapi", "dep:tokio", "dep:bytes", "dep:zip", "dep:socket2"]
 indi = ["dep:quick-xml", "dep:base64"]
 all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
 

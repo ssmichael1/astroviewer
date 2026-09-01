@@ -63,6 +63,33 @@ connection manager listing every backend compiled into the binary:
 The Source menu also lists discovered cameras directly for quick switching,
 plus Play/Stop for the current source.
 
+### GigE Vision troubleshooting
+
+Controls appear but no image is a transport problem, and the **Log** tab
+says which kind. Three seconds after acquisition starts the viewer reports
+either *no GVSP packets received* (a host firewall or endpoint agent is
+dropping inbound UDP to this program, the packet size is larger than the link
+carries, the camera is waiting for a trigger, or another application holds
+control) or *packets received but no frame completed* (packet loss or a
+packet-size mismatch). The stream line logged at connect shows the negotiated
+and effective packet size and the socket buffer the OS granted.
+
+Environment variables for diagnosis:
+
+- `GEV_PACKET_SIZE=1500` caps the GVSP packet size. Try this first on a NIC
+  with jumbo frames enabled: a camera that accepts a size the path cannot
+  carry streams nothing.
+- `GEV_TRACE=1` logs packets per second, frames completed and decoded, and
+  time spent on control traffic and decoding once a second.
+- `GEV_PIXEL_FORMAT=Mono8` (or any symbolic entry) selects the pixel format
+  to try first.
+
+On Windows, allow the program through Windows Defender Firewall when
+prompted; the viewer also sends a small datagram to the camera's stream port
+so stateful firewalls treat the stream as reply traffic. The
+`gev_stream` example (`cargo run --features gev --example gev_stream -- <ip>`)
+is a headless version of the same pipeline with per-packet counters.
+
 ## Display controls
 
 - **Colormaps:** Grayscale, Hot, Viridis, Inferno, Plasma, Magma, Cubehelix,

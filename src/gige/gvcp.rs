@@ -29,6 +29,11 @@ const HEADER_SIZE: usize = 8;
 // ── Opcodes ─────────────────────────────────────────────────────────────────
 const DISCOVERY_CMD: u16 = 0x0002;
 const DISCOVERY_ACK: u16 = 0x0003;
+/// FORCEIP: give the device with a given MAC a temporary IP configuration.
+/// Broadcast, since the device may currently hold an address this host
+/// cannot route to. 56-byte payload — see [`encode_forceip_payload`].
+const FORCEIP_CMD: u16 = 0x0004;
+const FORCEIP_ACK: u16 = 0x0005;
 const READREG_CMD: u16 = 0x0080;
 #[allow(dead_code)]
 const READREG_ACK: u16 = 0x0081;
@@ -53,6 +58,19 @@ const PACKET_RESEND_CMD: u16 = 0x0040;
 // ── Bootstrap registers ───────────────────────────────────────────────────--
 /// Control Channel Privilege.
 pub const CCP_REGISTER: u32 = 0x0a00;
+/// `GevCurrentIPConfiguration`: bit 0 LLA, bit 1 persistent IP, bit 2 DHCP.
+pub const IP_CONFIG_REGISTER: u32 = 0x0014;
+/// `GevCurrentIPConfiguration` bit: link-local addressing enabled.
+pub const IP_CONFIG_LLA: u32 = 0x1;
+/// `GevCurrentIPConfiguration` bit: boot with the persistent IP.
+pub const IP_CONFIG_PERSISTENT: u32 = 0x2;
+/// `GevCurrentIPConfiguration` bit: DHCP enabled.
+pub const IP_CONFIG_DHCP: u32 = 0x4;
+/// Persistent IP address / subnet mask / default gateway registers (the
+/// address sits in the last word of each 16-byte block).
+const PERSISTENT_IP_REGISTER: u32 = 0x064c;
+const PERSISTENT_SUBNET_REGISTER: u32 = 0x065c;
+const PERSISTENT_GATEWAY_REGISTER: u32 = 0x066c;
 /// CCP value claiming control access.
 const CCP_CONTROL: u32 = 1 << 1;
 /// Bits of CCP that mean "this application is the controller".
@@ -537,6 +555,41 @@ impl Device {
         Ok(())
     }
 
+    /// Read the persistent (boot-time) IP, subnet mask and gateway.
+    pub fn read_persistent_ip(&mut self) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Addr), GvcpError> {
+        Ok((
+            Ipv4Addr::from(self.read_register(PERSISTENT_IP_REGISTER)?),
+            Ipv4Addr::from(self.read_register(PERSISTENT_SUBNET_REGISTER)?),
+            Ipv4Addr::from(self.read_register(PERSISTENT_GATEWAY_REGISTER)?),
+        ))
+    }
+
+    /// Write the persistent IP, subnet mask and gateway. Takes effect at the
+    /// next boot, and only if [`Self::enable_persistent_ip`] has set the
+    /// configuration bit. Requires control privilege.
+    pub fn write_persistent_ip(&mut self, ip: Ipv4Addr, subnet: Ipv4Addr, gateway: Ipv4Addr) -> Result<(), GvcpError> {
+        self.write_register(PERSISTENT_IP_REGISTER, u32::from(ip))?;
+        self.write_register(PERSISTENT_SUBNET_REGISTER, u32::from(subnet))?;
+        self.write_register(PERSISTENT_GATEWAY_REGISTER, u32::from(gateway))
+    }
+
+    /// Read `GevCurrentIPConfiguration` (see the `IP_CONFIG_*` bits).
+    pub fn ip_config(&mut self) -> Result<u32, GvcpError> {
+        self.read_register(IP_CONFIG_REGISTER)
+    }
+
+    /// Write `GevCurrentIPConfiguration`. Requires control privilege.
+    pub fn set_ip_config(&mut self, bits: u32) -> Result<(), GvcpError> {
+        self.write_register(IP_CONFIG_REGISTER, bits)
+    }
+
+    /// Set the persistent-IP bit in `GevCurrentIPConfiguration`, leaving the
+    /// others as they are.
+    pub fn enable_persistent_ip(&mut self) -> Result<(), GvcpError> {
+        let cfg = self.ip_config()?;
+        self.set_ip_config(cfg | IP_CONFIG_PERSISTENT)
+    }
+
     /// Claim control-channel privilege (required before configuring streaming).
     pub fn claim_control(&mut self) -> Result<(), GvcpError> {
         self.write_register(CCP_REGISTER, CCP_CONTROL)
@@ -619,16 +672,7 @@ pub fn discover_all(timeout: Duration) -> Vec<DeviceInfo> {
         Err(_) => return Vec::new(),
     };
     let packet = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, DISCOVERY_CMD, request_id, &[]);
-
-    // Send to the limited broadcast and each interface's directed broadcast (a
-    // loopback interface only accepts unicast to itself).
-    let _ = socket.send_to(&packet, (Ipv4Addr::BROADCAST, GVCP_PORT));
-    for iface in nic::ipv4_interfaces() {
-        let dest = if iface.is_loopback {
-            iface.ip
-        } else {
-            nic::directed_broadcast(iface.ip, iface.netmask)
-        };
+    for dest in broadcast_targets() {
         let _ = socket.send_to(&packet, (dest, GVCP_PORT));
     }
 
@@ -660,6 +704,111 @@ pub fn discover_all(timeout: Duration) -> Vec<DeviceInfo> {
     let mut devices: Vec<_> = seen.into_values().collect();
     devices.sort_by_key(|d| d.ip);
     devices
+}
+
+/// Discover one device by unicast: send DISCOVERY to `ip` directly and wait
+/// up to `timeout` for its acknowledgement. Hosts whose endpoint security
+/// drops broadcast replies can still identify a camera they can route to.
+pub fn discover_unicast(ip: Ipv4Addr, port: u16, timeout: Duration) -> Option<DeviceInfo> {
+    let request_id: u16 = 0x0101;
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    let packet = encode_command(FLAG_ACK_REQUIRED, DISCOVERY_CMD, request_id, &[]);
+    socket.send_to(&packet, (ip, port)).ok()?;
+    socket.set_read_timeout(Some(timeout)).ok()?;
+    let mut buf = vec![0u8; 2048];
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((len, _)) => {
+                if let Some(info) = parse_discovery_ack(&buf[..len], request_id) {
+                    return Some(info);
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::Interrupted) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Where a broadcast GVCP command must be sent to reach every device this
+/// host can see: the limited broadcast, each interface's directed broadcast,
+/// and loopback interfaces themselves (loopback only accepts unicast).
+fn broadcast_targets() -> Vec<Ipv4Addr> {
+    let mut out = vec![Ipv4Addr::BROADCAST];
+    for iface in nic::ipv4_interfaces() {
+        out.push(if iface.is_loopback {
+            iface.ip
+        } else {
+            nic::directed_broadcast(iface.ip, iface.netmask)
+        });
+    }
+    out
+}
+
+/// The 56-byte FORCEIP payload: reserved(2) | MAC(6) | reserved(12) |
+/// IP(4) | reserved(12) | subnet mask(4) | reserved(12) | gateway(4).
+pub fn encode_forceip_payload(mac: [u8; 6], ip: Ipv4Addr, subnet: Ipv4Addr, gateway: Ipv4Addr) -> [u8; 56] {
+    let mut p = [0u8; 56];
+    p[2..8].copy_from_slice(&mac);
+    p[20..24].copy_from_slice(&ip.octets());
+    p[36..40].copy_from_slice(&subnet.octets());
+    p[52..56].copy_from_slice(&gateway.octets());
+    p
+}
+
+/// Broadcast FORCEIP: tell the device with `mac` to adopt `ip`/`subnet`/
+/// `gateway` until its next power cycle. Waits up to `timeout` for the
+/// acknowledgement: `Ok(true)` acknowledged, `Ok(false)` no reply (many
+/// cameras apply it silently, or answer from an address this host can't
+/// hear), `Err` on a send failure or a rejecting status. To make the address
+/// stick, open the device at its new address and use
+/// [`Device::write_persistent_ip`] + [`Device::enable_persistent_ip`].
+pub fn force_ip(
+    mac: [u8; 6],
+    ip: Ipv4Addr,
+    subnet: Ipv4Addr,
+    gateway: Ipv4Addr,
+    timeout: Duration,
+) -> Result<bool, GvcpError> {
+    let request_id: u16 = 0x0200;
+    let socket = make_broadcast_socket()?;
+    let payload = encode_forceip_payload(mac, ip, subnet, gateway);
+    let packet = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, FORCEIP_CMD, request_id, &payload);
+    let mut sent = false;
+    for dest in broadcast_targets() {
+        sent |= socket.send_to(&packet, (dest, GVCP_PORT)).is_ok();
+    }
+    if !sent {
+        return Err(GvcpError::Protocol("FORCEIP could not be sent on any interface".into()));
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, _src)) => {
+                let Ok(ack) = decode_ack(&buf[..len]) else { continue };
+                if ack.command != FORCEIP_ACK || ack.request_id != request_id {
+                    continue; // discovery replies and other chatter share the port
+                }
+                return match ack.status {
+                    Status::Success => Ok(true),
+                    other => Err(GvcpError::Status(other)),
+                };
+            }
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => return Ok(false),
+                ErrorKind::ConnectionReset | ErrorKind::Interrupted => continue,
+                _ => return Err(e.into()),
+            },
+        }
+    }
 }
 
 fn make_broadcast_socket() -> io::Result<UdpSocket> {
@@ -720,6 +869,28 @@ fn fixed_string(payload: &[u8], at: usize, len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forceip_payload_sits_at_the_specified_offsets() {
+        let p = encode_forceip_payload(
+            [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe],
+            Ipv4Addr::new(192, 168, 0, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+            Ipv4Addr::new(192, 168, 0, 1),
+        );
+        assert_eq!(p.len(), 56);
+        assert_eq!(&p[0..2], &[0, 0]);
+        assert_eq!(&p[2..8], &[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe]);
+        assert!(p[8..20].iter().all(|&b| b == 0));
+        assert_eq!(&p[20..24], &[192, 168, 0, 10]);
+        assert!(p[24..36].iter().all(|&b| b == 0));
+        assert_eq!(&p[36..40], &[255, 255, 255, 0]);
+        assert!(p[40..52].iter().all(|&b| b == 0));
+        assert_eq!(&p[52..56], &[192, 168, 0, 1]);
+        // And the command header around it.
+        let pkt = encode_command(FLAG_ACK_REQUIRED | FLAG_BROADCAST, FORCEIP_CMD, 0x0200, &p);
+        assert_eq!(&pkt[..8], &[0x42, 0x11, 0x00, 0x04, 0x00, 56, 0x02, 0x00]);
+    }
 
     #[test]
     fn status_table_matches_the_specification() {

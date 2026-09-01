@@ -293,9 +293,19 @@ pub fn start_camera(
     frame_tx: Sender<FrameData>,
     log_tx: Sender<LogEntry>,
 ) -> anyhow::Result<GevHandle> {
+    // A camera connected by bare IP carries no identity; ask it directly
+    // (unicast discovery gets through hosts that drop broadcast replies) so
+    // the log and diagnostics can name it.
+    let name = if info.model.is_empty() {
+        gvcp::discover_unicast(info.ip, gvcp::GVCP_PORT, Duration::from_millis(300))
+            .map(|d| GevDeviceInfo { ip: d.ip, model: d.model.unwrap_or_default(), manufacturer: d.manufacturer.unwrap_or_default(), id: info.id.clone() }.display_name())
+            .unwrap_or_else(|| info.display_name())
+    } else {
+        info.display_name()
+    };
     start_camera_at(
         SocketAddr::new(IpAddr::V4(info.ip), gvcp::GVCP_PORT),
-        info.display_name(),
+        name,
         frame_tx,
         log_tx,
     )

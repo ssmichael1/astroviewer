@@ -16,6 +16,15 @@ use gige::gvcp::{self, Device};
 fn main() -> anyhow::Result<()> {
     let ip: Ipv4Addr = std::env::args().nth(1).unwrap_or_else(|| "192.168.0.2".into()).parse()?;
     let port: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(gvcp::GVCP_PORT);
+    match gvcp::discover_unicast(ip, port, std::time::Duration::from_millis(500)) {
+        Some(d) => println!(
+            "Device: {} {} (mac {})",
+            d.manufacturer.as_deref().unwrap_or("?"),
+            d.model.as_deref().unwrap_or("?"),
+            d.mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+        ),
+        None => println!("Device: no answer to unicast discovery (continuing with register reads)"),
+    }
     let mut dev = Device::open(SocketAddr::new(IpAddr::V4(ip), port))?;
     let regs: &[(&str, u32)] = &[
         ("GevCapability", 0x0934),

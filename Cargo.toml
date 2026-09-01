@@ -68,6 +68,10 @@ required-features = ["gev"]
 name = "gev_regs"
 required-features = ["gev"]
 
+[[example]]
+name = "gev_force_ip"
+required-features = ["gev"]
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

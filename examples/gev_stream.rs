@@ -181,7 +181,6 @@ fn main() -> anyhow::Result<()> {
     let mut geom: Option<(u32, u32, u32)> = None;
     let (mut pkts, mut leaders, mut payloads, mut trailers, mut frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut first_pkt_ids: Vec<u32> = Vec::new();
-    let mut missing_snapshot: Option<Vec<std::ops::RangeInclusive<u32>>> = None;
     let deadline = Instant::now() + Duration::from_secs(listen_secs);
 
     while Instant::now() < deadline {
@@ -230,7 +229,7 @@ fn main() -> anyhow::Result<()> {
                 trailers += 1;
                 if assembly.as_ref().map(FrameAssembly::block_id) == Some(block_id) {
                     let a = assembly.take().unwrap();
-                    missing_snapshot = if a.is_complete() { None } else { Some(a.missing_ranges()) };
+                    let missing = if a.is_complete() { None } else { Some(a.missing_ranges()) };
                     match (a.finish(), geom) {
                         (Some(payload), Some((w, h, pf))) => {
                             frames += 1;
@@ -238,7 +237,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         (None, _) => if trailers <= 3 {
                             println!("  TRAILER block={block_id}: frame INCOMPLETE (missing packets)");
-                            if let Some(a) = missing_snapshot.take() {
+                            if let Some(a) = missing {
                                 let n: usize = a.iter().map(|r| (*r.end() - *r.start() + 1) as usize).sum();
                                 let show: Vec<String> = a.iter().take(12).map(|r| format!("{}-{}", r.start() + 1, r.end() + 1)).collect();
                                 println!("    missing {n} packets in {} ranges: {}{}", a.len(), show.join(" "), if a.len() > 12 { " …" } else { "" });

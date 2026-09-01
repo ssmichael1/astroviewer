@@ -5,6 +5,7 @@
 //! <https://github.com/VitalyVorobyev/viva-genicam>). This is a copy-minimal,
 //! std-only reimplementation owned by the app.
 
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
 /// Standard GVSP header size (8 bytes): status(2) block_id(2) format(1) id(3).
@@ -148,12 +149,30 @@ impl PacketBitmap {
     fn is_complete(&self) -> bool {
         self.received == self.total
     }
+
+    /// Missing packet indices as inclusive `[start, end]` ranges, ascending.
+    fn missing_ranges(&self) -> Vec<RangeInclusive<u32>> {
+        let mut out = Vec::new();
+        let mut run: Option<(u32, u32)> = None;
+        for id in 0..self.total {
+            let present = self.words[id / 64] & (1u64 << (id % 64)) != 0;
+            match (present, run) {
+                (false, None) => run = Some((id as u32, id as u32)),
+                (false, Some((s, _))) => run = Some((s, id as u32)),
+                (true, Some((s, e))) => { out.push(s..=e); run = None; }
+                (true, None) => {}
+            }
+        }
+        if let Some((s, e)) = run { out.push(s..=e); }
+        out
+    }
 }
 
 /// A partially received frame. Payload packets are placed at `id * stride`;
 /// [`finish`](Self::finish) returns the compacted image bytes once every
 /// expected packet is present.
 pub struct FrameAssembly {
+    #[allow(dead_code)]
     block_id: u64,
     expected: usize,
     stride: usize,
@@ -184,8 +203,22 @@ impl FrameAssembly {
         }
     }
 
+    /// The block this assembly belongs to (kept for the diagnostic examples;
+    /// the app tracks the id alongside).
+    #[allow(dead_code)]
     pub fn block_id(&self) -> u64 {
         self.block_id
+    }
+
+    /// Whether every expected packet has arrived.
+    pub fn is_complete(&self) -> bool {
+        self.bitmap.is_complete()
+    }
+
+    /// 0-based indices of packets not yet received, as inclusive ranges — the
+    /// input to a PACKETRESEND request.
+    pub fn missing_ranges(&self) -> Vec<RangeInclusive<u32>> {
+        self.bitmap.missing_ranges()
     }
 
     #[allow(dead_code)]

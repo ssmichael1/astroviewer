@@ -43,6 +43,12 @@ const WRITEMEM_CMD: u16 = 0x0086;
 const WRITEMEM_ACK: u16 = 0x0087;
 /// PENDING_ACK (GigE Vision 1.2 §18.5): the device wants more time.
 const PENDING_ACK: u16 = 0x0089;
+/// PACKETRESEND: ask the device to retransmit stream packets. GigE Vision 1.x
+/// payload (12 bytes, as aravis encodes it): `stream_channel(2) | block_id(2)
+/// | first_packet_id(4) | last_packet_id(4)`; packet ids are 24-bit in the
+/// 32-bit fields. (The 8-byte `block | reserved | first16 | last16` form some
+/// libraries send is not the specified layout and cameras ignore it.)
+const PACKET_RESEND_CMD: u16 = 0x0040;
 
 // ── Bootstrap registers ───────────────────────────────────────────────────--
 /// Control Channel Privilege.
@@ -509,6 +515,25 @@ impl Device {
             }
             offset += chunk;
         }
+        Ok(())
+    }
+
+    /// Ask the camera to retransmit payload packets `first..=last` of
+    /// `block_id` on the stream channel. Sent on this socket because the
+    /// command is only honored from the application holding control
+    /// privilege, and fire-and-forget: GigE Vision 1.x devices never
+    /// acknowledge PACKETRESEND, and an acknowledgement would arrive long
+    /// after the camera flushed the frame anyway. A stray ack from a device
+    /// that does answer is absorbed by the next transaction's id check.
+    pub fn request_resend_noack(&mut self, block_id: u16, first: u16, last: u16) -> Result<(), GvcpError> {
+        let mut payload = [0u8; 12];
+        // payload[0..2]: stream channel index 0
+        payload[2..4].copy_from_slice(&block_id.to_be_bytes());
+        payload[4..8].copy_from_slice(&(first as u32).to_be_bytes());
+        payload[8..12].copy_from_slice(&(last as u32).to_be_bytes());
+        let id = self.next_request_id();
+        let pkt = encode_command(0, PACKET_RESEND_CMD, id, &payload);
+        self.socket.send(&pkt)?;
         Ok(())
     }
 

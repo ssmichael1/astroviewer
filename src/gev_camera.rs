@@ -1,19 +1,19 @@
 //! GigE Vision (GEV) camera source — pure Rust, no C/system dependencies.
 //!
-//! Transport is provided by the `viva-gige` crate (GVCP discovery + control,
-//! GVSP streaming building blocks). GenICam feature access (Exposure, Gain,
-//! Width/Height, PixelFormat, AcquisitionStart/Stop, …) is provided by
-//! `cameleon-genapi`, which parses the camera's GenICam XML and interprets its
-//! feature nodes; its register reads/writes are bridged onto `viva-gige`'s
-//! async control channel via a small synchronous [`Device`] adapter.
+//! Transport is provided by the app-owned [`crate::gige`] module (GVCP
+//! discovery + control, GVSP stream parsing and reassembly, NIC/socket
+//! helpers) — a synchronous, std-socket implementation with no async runtime.
+//! GenICam feature access (Exposure, Gain, Width/Height, PixelFormat,
+//! AcquisitionStart/Stop, …) is provided by `cameleon-genapi`, which parses the
+//! camera's GenICam XML and interprets its feature nodes; its register
+//! reads/writes are bridged onto the GVCP [`Device`] via a small synchronous
+//! adapter.
 //!
-//! This module owns a self-contained
-//! capture thread that produces [`FrameData`] over the shared `frame_tx`
-//! channel and accepts control changes over a command channel. Because
-//! `viva-gige` is async (tokio) while the rest of the app is sync threads +
-//! crossbeam channels, the capture thread owns a current-thread tokio runtime
-//! and drives each async operation with a discrete `block_on` — never nested,
-//! so the sync `Device` bridge can itself `block_on` when applying controls.
+//! This module owns a self-contained control thread that services GenICam
+//! commands and heartbeats, plus a dedicated receive thread that drains the
+//! GVSP socket and reassembles frames. The control thread decodes each complete
+//! raw frame into [`FrameData`] on the shared `frame_tx` channel. Every GVCP
+//! call is a direct blocking transaction — no `block_on`, no tokio.
 
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -22,17 +22,16 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
-use tokio::runtime::Runtime;
 
 use cameleon_genapi::elem_type::{IntegerRepresentation, Visibility};
 use cameleon_genapi::interface::ICategoryKind;
 use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::{GenApiError, ValueCtxt};
-use viva_gige::gvcp::{self, DeviceInfo, GigeDevice};
-use viva_gige::gvsp::{self, FrameAssembly, GvspPacket, PacketBitmap};
-use viva_gige::nic::{self, Iface};
+
+use crate::gige::gvcp::{self, Device, DeviceInfo};
+use crate::gige::gvsp::{self, FrameAssembly, GvspPacket};
+use crate::gige::nic::{self, Iface};
 
 use crate::{FrameData, LogEntry};
 
@@ -55,8 +54,6 @@ const FRAME_DEADLINE: Duration = Duration::from_millis(1000);
 /// Stream channel 0 source-port register (`GevSCSP`): the UDP port the camera
 /// transmits GVSP from once the channel is open (0 = unspecified).
 const SCSP_REGISTER: u32 = 0x0d1c;
-/// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
-const SCPD_REGISTER: u32 = 0x0d08;
 /// Bytes of a GVSP data packet that are not image payload: IPv4 (20), UDP (8)
 /// and the GVSP header (8). `GevSCPSPacketSize` is the *full IP datagram*
 /// size, so the image bytes per packet (the stride reassembly places packets
@@ -69,6 +66,8 @@ const GVSP_PACKET_OVERHEAD: u32 = 20 + 8 + 8;
 const SILENCE_GRACE: Duration = Duration::from_secs(3);
 /// GVSP socket receive buffer to request (the OS may grant less).
 const RECV_BUFFER_REQUEST: usize = 64 << 20;
+/// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
+const SCPD_REGISTER: u32 = 0x0d08;
 /// Packet resend: how long to hold a block open for the packets a
 /// PACKETRESEND asked for before retrying or giving up. The camera only
 /// buffers a frame or two, so this is measured in frame periods, not seconds.
@@ -76,7 +75,7 @@ const RESEND_WINDOW: Duration = Duration::from_millis(100);
 /// Packet resend: requests per block before it is abandoned.
 const RESEND_MAX_ATTEMPTS: u32 = 2;
 /// Packet resend: a block missing more distinct ranges than this is dropped
-/// rather than asked for — each range is one control-channel round trip.
+/// rather than asked for — each range is one control-channel datagram.
 const RESEND_MAX_RANGES: usize = 32;
 /// Packet resend: gaps this close are merged into one range.
 const RESEND_COALESCE_GAP: u32 = 4;
@@ -88,12 +87,6 @@ const RESEND_MAX_MISSING: f64 = 0.25;
 /// Packet resend: requests after which, with no frame ever recovered, the log
 /// says the camera is not honoring them.
 const RESEND_SILENT_AFTER: u64 = 20;
-/// GVCP PACKETRESEND command code. Sent without the ack-required flag: GigE
-/// Vision 1.x devices never acknowledge it, and waiting for one would hold the
-/// request stream past the camera's frame buffer. Payload (12 bytes, as
-/// aravis encodes it): `stream_channel(2) | block_id(2) | first_packet_id(4)
-/// | last_packet_id(4)`. viva-gige's 8-byte form is not the specified layout.
-const PACKET_RESEND_CMD: u16 = 0x0040;
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -215,14 +208,10 @@ impl Drop for GevHandle {
 
 /// Discover GigE Vision cameras on all interfaces. Returns an empty vec on error.
 pub fn enumerate() -> Vec<GevDeviceInfo> {
-    let rt = match build_runtime() {
-        Ok(rt) => rt,
-        Err(_) => return Vec::new(),
-    };
-    let devices = rt
-        .block_on(gvcp::discover_all(Duration::from_millis(500)))
-        .unwrap_or_default();
-    devices.into_iter().map(device_info_to_gev).collect()
+    gvcp::discover_all(Duration::from_millis(500))
+        .into_iter()
+        .map(device_info_to_gev)
+        .collect()
 }
 
 fn device_info_to_gev(d: DeviceInfo) -> GevDeviceInfo {
@@ -240,12 +229,6 @@ fn device_info_to_gev(d: DeviceInfo) -> GevDeviceInfo {
     }
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Ok(tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?)
-}
-
 // ── GenICam node store + value context bundle ───────────────────────────────
 
 /// The parsed GenICam model plus the value/cache context needed to evaluate it.
@@ -254,14 +237,11 @@ struct GenApi {
     ctxt: ValueCtxt<DefaultValueStore, DefaultCacheStore>,
 }
 
-/// Synchronous [`cameleon_genapi::Device`] bridge over the async `viva-gige`
-/// control channel. Holds raw pointers to the runtime and device owned by the
-/// capture thread; only ever used transiently while applying a feature, and
-/// never while already inside `runtime.block_on`, so the nested-`block_on`
-/// panic is avoided by construction.
+/// Synchronous [`cameleon_genapi::Device`] bridge over the GVCP control channel.
+/// Borrows the device owned by the control thread and issues each GenApi
+/// register access as a direct blocking GVCP transaction.
 struct DeviceBridge<'a> {
-    rt: &'a Runtime,
-    dev: &'a mut GigeDevice,
+    dev: &'a mut Device,
 }
 
 impl<'a> cameleon_genapi::Device for DeviceBridge<'a> {
@@ -270,9 +250,7 @@ impl<'a> cameleon_genapi::Device for DeviceBridge<'a> {
         address: i64,
         buf: &mut [u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let data = self
-            .rt
-            .block_on(self.dev.read_mem(address as u64, buf.len()))?;
+        let data = self.dev.read_mem(address as u64, buf.len())?;
         let n = buf.len().min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(())
@@ -283,7 +261,7 @@ impl<'a> cameleon_genapi::Device for DeviceBridge<'a> {
         address: i64,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.rt.block_on(self.dev.write_mem(address as u64, data))?;
+        self.dev.write_mem(address as u64, data)?;
         Ok(())
     }
 }
@@ -315,16 +293,35 @@ pub fn start_camera(
     frame_tx: Sender<FrameData>,
     log_tx: Sender<LogEntry>,
 ) -> anyhow::Result<GevHandle> {
-    let rt = build_runtime()?;
-    let ip = info.ip;
+    start_camera_at(
+        SocketAddr::new(IpAddr::V4(info.ip), gvcp::GVCP_PORT),
+        info.display_name(),
+        frame_tx,
+        log_tx,
+    )
+}
+
+/// Open a GigE camera addressed by an explicit GVCP `SocketAddr`. `start_camera`
+/// wraps this with the well-known port; tests use it to target a simulator on a
+/// non-standard port.
+pub(crate) fn start_camera_at(
+    gvcp_addr: SocketAddr,
+    cam_name: String,
+    frame_tx: Sender<FrameData>,
+    log_tx: Sender<LogEntry>,
+) -> anyhow::Result<GevHandle> {
+    let ip = match gvcp_addr.ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => anyhow::bail!("IPv6 GigE addresses are not supported"),
+    };
 
     // Connect + claim exclusive control.
-    let mut dev = rt.block_on(GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)))?;
-    rt.block_on(dev.claim_control())?;
-    let _ = log_tx.try_send(LogEntry::info(format!("GigE: claimed control of {}", info.display_name())));
+    let mut dev = Device::open(gvcp_addr).map_err(|e| anyhow::anyhow!("GVCP open {gvcp_addr}: {e}"))?;
+    dev.claim_control().map_err(|e| anyhow::anyhow!("GVCP claim control: {e}"))?;
+    let _ = log_tx.try_send(LogEntry::info(format!("GigE: claimed control of {cam_name}")));
 
     // Fetch + parse the GenICam XML.
-    let mut genapi = match load_genapi(&rt, &mut dev) {
+    let mut genapi = match load_genapi(&mut dev) {
         Ok(g) => Some(g),
         Err(e) => {
             let _ = log_tx.try_send(LogEntry::warn(format!(
@@ -335,30 +332,30 @@ pub fn start_camera(
     };
 
     // Configure mono full-frame acquisition and read back geometry, then build
-    // the control list. All of this uses synchronous GenICam access (which
-    // internally block_on's the device) — we are not inside block_on here.
+    // the control list. All GVCP access here is a direct blocking transaction.
     let mut controls = Vec::new();
     if let Some(g) = genapi.as_mut() {
         // best-effort configuration; ignore individual feature failures.
-        configure_acquisition(g, &mut dev, &rt, &log_tx);
-        controls = build_controls(g, &mut dev, &rt, ip);
+        configure_acquisition(g, &mut dev, &log_tx);
+        controls = build_controls(g, &mut dev, ip);
     }
 
-    // Negotiate the GVSP stream channel against our receiving interface.
-    let iface = Iface::from_ipv4(local_ipv4_towards(ip)).ok();
-    // Bind the GVSP receive socket first, then point the camera at it.
+    // Negotiate the GVSP stream channel against our receiving interface. Route
+    // the probe over the same GVCP port so a simulator on a loopback port is
+    // reached on the interface it actually answers on.
+    let iface = Iface::from_ipv4(nic::local_ipv4_towards(ip, gvcp_addr.port())).ok();
+    // Bind the GVSP receive socket first, then point the camera at it. Ask for a
+    // large receive buffer: a frame arrives as a line-rate burst and the buffer
+    // is the only slack the receive thread has. The OS clamps (macOS
+    // kern.ipc.maxsockbuf, Linux net.core.rmem_max, Windows grants it); log
+    // what we actually got.
     let bind_ip = iface
         .as_ref()
         .and_then(|i| i.ipv4())
         .map(IpAddr::V4)
-        .unwrap_or(nic::default_bind_addr());
-    // Ask for a large receive buffer: a frame arrives as a line-rate burst and
-    // the buffer is the only slack the receive thread has. The OS clamps
-    // (macOS kern.ipc.maxsockbuf ≈ 8 MiB, Linux net.core.rmem_max, Windows
-    // grants it); log what we actually got.
-    let socket = rt.block_on(nic::bind_udp(bind_ip, 0, iface.clone(), Some(RECV_BUFFER_REQUEST)))?;
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let (socket, recv_buffer) = nic::bind_gvsp_socket(bind_ip, RECV_BUFFER_REQUEST, POLL_TIMEOUT)?;
     let local_port = socket.local_addr()?.port();
-    let recv_buffer = socket2::SockRef::from(&socket).recv_buffer_size().unwrap_or(0);
 
     // Optional cap on the GVSP packet size (bytes, full IP datagram), e.g. to
     // force 1500 on a jumbo-capable NIC whose path can't actually carry jumbo
@@ -366,17 +363,19 @@ pub fn start_camera(
     let packet_cap: Option<u32> = std::env::var("GEV_PACKET_SIZE")
         .ok()
         .and_then(|s| s.trim().parse().ok());
-    let stream_params = rt.block_on(dev.negotiate_stream(
-        STREAM_CHANNEL,
-        iface.as_ref().ok_or_else(|| anyhow::anyhow!("no usable network interface for GigE streaming"))?,
-        local_port,
-        packet_cap,
-    ))?;
+    let stream_params = dev
+        .negotiate_stream(
+            STREAM_CHANNEL,
+            iface.as_ref().ok_or_else(|| anyhow::anyhow!("no usable network interface for GigE streaming"))?,
+            local_port,
+            packet_cap,
+        )
+        .map_err(|e| anyhow::anyhow!("GVSP stream negotiation: {e}"))?;
     // A camera may silently clamp the requested size; the wire follows what the
     // register actually holds, so read it back over raw GVCP (not GenApi, whose
     // cache the raw write bypassed).
-    let effective_packet_size = rt
-        .block_on(dev.get_stream_packet_size(STREAM_CHANNEL))
+    let effective_packet_size = dev
+        .get_stream_packet_size(STREAM_CHANNEL)
         .ok()
         .filter(|&v| v > GVSP_PACKET_OVERHEAD)
         .unwrap_or(stream_params.packet_size);
@@ -385,12 +384,12 @@ pub fn start_camera(
     // that bursts faster than the host NIC absorbs loses packets below the
     // socket; spacing packets out trades frame rate for completeness.
     if let Some(ticks) = std::env::var("GEV_SCPD").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
-        match rt.block_on(dev.set_stream_packet_delay(STREAM_CHANNEL, ticks)) {
+        match dev.write_register(SCPD_REGISTER, ticks) {
             Ok(()) => { let _ = log_tx.try_send(LogEntry::info(format!("GigE: packet delay set to {ticks} ticks (GEV_SCPD)"))); }
             Err(e) => { let _ = log_tx.try_send(LogEntry::warn(format!("GigE: GEV_SCPD={ticks} rejected: {e}"))); }
         }
     }
-    let packet_delay = rt.block_on(dev.read_register(SCPD_REGISTER)).unwrap_or(stream_params.packet_delay);
+    let packet_delay = dev.read_register(SCPD_REGISTER).unwrap_or(0);
     let _ = log_tx.try_send(LogEntry::info(format!(
         "GigE: stream to {}:{} (mtu={}, packet_size={} requested / {} effective, {} image bytes per packet, \
          packet delay {} ticks, {} MiB socket buffer)",
@@ -404,31 +403,18 @@ pub fn start_camera(
         )));
     }
 
-    // GVSP is received on a plain blocking socket owned by the capture thread:
-    // no tokio in the packet path. (viva-genicam's own Windows fix, #72: the
-    // async receive path delivered no frames there; a blocking thread did.)
-    let socket = socket.into_std()?;
-    socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(POLL_TIMEOUT))?;
-    // PACKETRESEND goes out fire-and-forget on its own socket from the same
-    // host address (see `issue_resends`); connected so `send` suffices.
-    let resend_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(stream_params.host), 0))
-        .and_then(|s| s.connect(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)).map(|_| s))
-        .ok();
-
     // Acquisition is started inside the capture thread once everything is wired.
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
-    let cam_name = info.display_name();
 
     let snapshot = controls.clone();
     let join_handle = std::thread::Builder::new()
         .name("gev-capture".into())
         .spawn(move || {
             capture_loop(
-                rt, dev, socket, resend_socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx,
-                controls_tx, snapshot, log_tx,
+                dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
+                snapshot, log_tx,
             );
         })?;
 
@@ -442,8 +428,8 @@ pub fn start_camera(
 
 /// Read the bootstrap First-URL register, resolve the on-device XML location, and
 /// parse it into a GenICam model.
-fn load_genapi(rt: &Runtime, dev: &mut GigeDevice) -> anyhow::Result<GenApi> {
-    let raw = rt.block_on(dev.read_mem(FIRST_URL_REGISTER, 512))?;
+fn load_genapi(dev: &mut Device) -> anyhow::Result<GenApi> {
+    let raw = dev.read_mem(FIRST_URL_REGISTER, 512).map_err(|e| anyhow::anyhow!("READMEM First-URL: {e}"))?;
     // The register is NUL-terminated; bytes past the terminator are undefined
     // (some cameras pad with 0xFF garbage), so cut at the first NUL.
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
@@ -463,7 +449,7 @@ fn load_genapi(rt: &Runtime, dev: &mut GigeDevice) -> anyhow::Result<GenApi> {
     let len = parse_hex_field(parts.next(), "length", url)? as usize;
     anyhow::ensure!(len > 0 && len < 16 * 1024 * 1024, "implausible GenICam XML length {len}");
 
-    let bytes = read_mem_chunked(rt, dev, addr, len)?;
+    let bytes = read_mem_chunked(dev, addr, len)?;
 
     let xml = if filename.to_ascii_lowercase().ends_with(".zip") {
         inflate_genicam_zip(&bytes)
@@ -508,12 +494,7 @@ fn inflate_genicam_zip(bytes: &[u8]) -> anyhow::Result<String> {
 }
 
 /// Read a memory region larger than a single GenCP block by chunking.
-fn read_mem_chunked(
-    rt: &Runtime,
-    dev: &mut GigeDevice,
-    addr: u64,
-    len: usize,
-) -> anyhow::Result<Vec<u8>> {
+fn read_mem_chunked(dev: &mut Device, addr: u64, len: usize) -> anyhow::Result<Vec<u8>> {
     const CHUNK: usize = 512;
     let mut out = Vec::with_capacity(len);
     let mut off = 0usize;
@@ -522,8 +503,8 @@ fn read_mem_chunked(
         // GVCP READMEM requires a 4-byte-aligned count; round up, then keep
         // only the bytes we actually need.
         let req = (want + 3) & !3;
-        let part = rt
-            .block_on(dev.read_mem(addr + off as u64, req))
+        let part = dev
+            .read_mem(addr + off as u64, req)
             .map_err(|e| anyhow::anyhow!("READMEM {req} B @ {:#x}: {e}", addr + off as u64))?;
         out.extend_from_slice(&part[..want.min(part.len())]);
         off += want;
@@ -533,13 +514,8 @@ fn read_mem_chunked(
 
 /// Configure full-frame mono acquisition: set PixelFormat to the widest mono
 /// format the camera offers, set Width/Height to max, AcquisitionMode=Continuous.
-fn configure_acquisition(
-    g: &mut GenApi,
-    dev: &mut GigeDevice,
-    rt: &Runtime,
-    log_tx: &Sender<LogEntry>,
-) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn configure_acquisition(g: &mut GenApi, dev: &mut Device, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
 
     // Width/Height to their max.
     for dim in ["Width", "Height"] {
@@ -589,9 +565,9 @@ fn configure_acquisition(
 /// enum options). Invisible nodes and non-value kinds (ports, registers,
 /// plain strings) are skipped; nested categories are flattened under their
 /// own display name.
-fn build_controls(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, cam_ip: Ipv4Addr) -> Vec<GevControl> {
+fn build_controls(g: &mut GenApi, dev: &mut Device, cam_ip: Ipv4Addr) -> Vec<GevControl> {
     let mut out = Vec::new();
-    let mut b = DeviceBridge { rt, dev };
+    let mut b = DeviceBridge { dev };
     let Some(root) = g.store.id_by_name("Root") else { return out };
     walk_category(g, &mut b, root, None, &mut out);
     orient_addresses(&mut out, cam_ip);
@@ -774,14 +750,9 @@ fn control_from_node(
 /// Re-read the current values of non-writable (telemetry) controls in place.
 /// Returns true if any value changed. Much cheaper than `build_controls`:
 /// skips ranges, writability, and all writable features.
-fn refresh_telemetry(
-    g: &mut GenApi,
-    dev: &mut GigeDevice,
-    rt: &Runtime,
-    controls: &mut [GevControl],
-) -> bool {
+fn refresh_telemetry(g: &mut GenApi, dev: &mut Device, controls: &mut [GevControl]) -> bool {
     enum Upd { I(i64), F(f64) }
-    let mut b = DeviceBridge { rt, dev };
+    let mut b = DeviceBridge { dev };
     let mut changed = false;
     for c in controls.iter_mut().filter(|c| !c.writable) {
         let Some(nid) = g.store.id_by_name(&c.name) else { continue };
@@ -867,14 +838,11 @@ struct ResendReq {
     ranges: Vec<(u16, u16)>,
 }
 
-/// One block (frame) being reassembled. `bitmap` mirrors what the assembly
-/// accepted, because `FrameAssembly` keeps its own private, so gaps can be
-/// turned into resend ranges.
+/// One block (frame) being reassembled.
 struct Block {
     id: u64,
     geom: FrameGeometry,
     assembly: FrameAssembly,
-    bitmap: PacketBitmap,
     expected: usize,
     /// Resend attempts issued for this block.
     attempts: u32,
@@ -886,12 +854,10 @@ impl Block {
     fn new(id: u64, geom: FrameGeometry, stride: usize) -> Self {
         let total = frame_payload_bytes(geom.pixel_format, geom.width as usize * geom.height as usize);
         let expected = total.div_ceil(stride).max(1);
-        let pool = BytesMut::zeroed(expected * stride);
         Self {
             id,
             geom,
-            assembly: FrameAssembly::new(id, expected, stride, pool, Instant::now() + FRAME_DEADLINE),
-            bitmap: PacketBitmap::new(expected),
+            assembly: FrameAssembly::new(id, expected, stride, Instant::now() + FRAME_DEADLINE),
             expected,
             attempts: 0,
             deadline: Instant::now() + FRAME_DEADLINE,
@@ -902,23 +868,21 @@ impl Block {
     /// ids are 1-based.
     fn ingest(&mut self, packet_id: u32, data: &[u8]) {
         let idx = packet_id.saturating_sub(1) as usize;
-        if self.assembly.ingest(idx, data) {
-            self.bitmap.set(idx);
-        }
+        self.assembly.ingest(idx, data);
     }
 
     fn is_complete(&self) -> bool {
-        self.bitmap.is_complete()
+        self.assembly.is_complete()
     }
 
-    fn finish(self) -> Option<(Bytes, FrameGeometry)> {
+    fn finish(self) -> Option<(Vec<u8>, FrameGeometry)> {
         let g = self.geom;
         self.assembly.finish().map(|p| (p, g))
     }
 
     /// Packets not yet received.
     fn missing_count(&self) -> usize {
-        self.bitmap.missing_ranges().iter().map(|r| (*r.end() - *r.start() + 1) as usize).sum()
+        self.assembly.missing_ranges().iter().map(|r| (*r.end() - *r.start() + 1) as usize).sum()
     }
 
     /// Whether a PACKETRESEND can name this block's packets (16-bit ids).
@@ -981,7 +945,7 @@ impl RxState {
     /// The block's packets stopped (its trailer, or the next block's leader).
     /// Complete → the frame. Gaps → ask the camera for them and keep the block
     /// open. Otherwise it is dropped.
-    fn boundary(&mut self, block: Block) -> Option<(Bytes, FrameGeometry)> {
+    fn boundary(&mut self, block: Block) -> Option<(Vec<u8>, FrameGeometry)> {
         if block.is_complete() {
             return block.finish();
         }
@@ -999,7 +963,7 @@ impl RxState {
                 && block.attempts < RESEND_MAX_ATTEMPTS
                 && (block.missing_count() as f64) <= RESEND_MAX_MISSING * block.expected as f64
             {
-                let ranges = coalesce_ranges(block.bitmap.missing_ranges());
+                let ranges = coalesce_ranges(block.assembly.missing_ranges());
                 if !ranges.is_empty() && ranges.len() <= RESEND_MAX_RANGES {
                     let req = ResendReq { block_id: block.id as u16, ranges };
                     if tx.try_send(req).is_ok() {
@@ -1035,7 +999,7 @@ impl RxState {
 fn rx_thread(
     socket: UdpSocket,
     mut rx: RxState,
-    raw_tx: Sender<(Bytes, FrameGeometry)>,
+    raw_tx: Sender<(Vec<u8>, FrameGeometry)>,
     stop: Arc<AtomicBool>,
     log_tx: Sender<LogEntry>,
 ) {
@@ -1048,40 +1012,16 @@ fn rx_thread(
     }
 }
 
-/// Control-thread bookkeeping for relaying resend requests.
-struct ResendCtl {
-    /// GVCP request id for the next PACKETRESEND (1..=65535, never 0).
-    next_id: u16,
-}
-
-/// Send one PACKETRESEND per range, fire-and-forget, on `socket` (bound to the
-/// host address the camera streams to and connected to its GVCP port).
-///
-/// viva-gige's `request_resend` insists on an acknowledgement and blocks up
-/// to 500 ms per range waiting for it, but GigE Vision 1.x cameras never
-/// send one, and the ranges of one request would then trickle out over
-/// seconds — long after the camera has flushed the frame. So the command is
-/// encoded here (magic 0x42, flags 0, command, length, request id; payload
-/// block id, reserved, first, last — all big-endian) and simply sent. The
-/// `resend_recovered` counter is the only confirmation the camera honors it.
-fn issue_resends(socket: &UdpSocket, req: ResendReq, ctl: &mut ResendCtl, shared: &RxShared) {
+/// Send one PACKETRESEND per range on the control socket — the one holding
+/// the privilege the camera requires — fire-and-forget (see
+/// `Device::request_resend_noack`). The `resend_recovered` counter is the
+/// only confirmation the camera honors it.
+fn issue_resends(dev: &mut Device, req: ResendReq, shared: &RxShared) {
     if !shared.resend_enabled.load(Ordering::Relaxed) {
         return;
     }
     for (first, last) in req.ranges {
-        let id = ctl.next_id;
-        ctl.next_id = if ctl.next_id == u16::MAX { 1 } else { ctl.next_id + 1 };
-        let mut pkt = [0u8; 20];
-        pkt[0] = 0x42;
-        pkt[1] = 0x00; // no ack required
-        pkt[2..4].copy_from_slice(&PACKET_RESEND_CMD.to_be_bytes());
-        pkt[4..6].copy_from_slice(&12u16.to_be_bytes());
-        pkt[6..8].copy_from_slice(&id.to_be_bytes());
-        // pkt[8..10]: stream channel index 0
-        pkt[10..12].copy_from_slice(&req.block_id.to_be_bytes());
-        pkt[12..16].copy_from_slice(&(first as u32).to_be_bytes());
-        pkt[16..20].copy_from_slice(&(last as u32).to_be_bytes());
-        if socket.send(&pkt).is_err() {
+        if dev.request_resend_noack(req.block_id, first, last).is_err() {
             return;
         }
     }
@@ -1089,10 +1029,8 @@ fn issue_resends(socket: &UdpSocket, req: ResendReq, ctl: &mut ResendCtl, shared
 
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
-    rt: Runtime,
-    mut dev: GigeDevice,
+    mut dev: Device,
     socket: UdpSocket,
-    resend_socket: Option<UdpSocket>,
     mut genapi: Option<GenApi>,
     packet_payload: usize,
     cam_name: &str,
@@ -1118,7 +1056,7 @@ fn capture_loop(
         let _ = log_tx.try_send(LogEntry::info("GigE: packet resend disabled by GEV_RESEND=0".into()));
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let (raw_tx, raw_rx) = bounded::<(Bytes, FrameGeometry)>(2);
+    let (raw_tx, raw_rx) = bounded::<(Vec<u8>, FrameGeometry)>(2);
     let rx_join = {
         let stop = Arc::clone(&stop);
         let log_tx = log_tx.clone();
@@ -1127,26 +1065,26 @@ fn capture_loop(
             .spawn(move || rx_thread(socket, rx, raw_tx, stop, log_tx))
             .ok()
     };
-    let shutdown = |dev: &mut GigeDevice, genapi: &mut Option<GenApi>| {
+    let shutdown = |dev: &mut Device, genapi: &mut Option<GenApi>| {
         stop.store(true, Ordering::Relaxed);
         if let Some(g) = genapi.as_mut() {
-            execute_command(g, dev, &rt, "AcquisitionStop", &log_tx);
-            set_int_feature(g, dev, &rt, "TLParamsLocked", 0, &log_tx);
+            execute_command(g, dev, "AcquisitionStop", &log_tx);
+            set_int_feature(g, dev, "TLParamsLocked", 0, &log_tx);
         }
-        let _ = rt.block_on(dev.release_control());
+        let _ = dev.release_control();
     };
 
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
     // the stream transport — required by FLIR/Point Grey before frames flow.
     if let Some(g) = genapi.as_mut() {
-        set_int_feature(g, &mut dev, &rt, "TLParamsLocked", 1, &log_tx);
-        execute_command(g, &mut dev, &rt, "AcquisitionStart", &log_tx);
+        set_int_feature(g, &mut dev, "TLParamsLocked", 1, &log_tx);
+        execute_command(g, &mut dev, "AcquisitionStart", &log_tx);
     }
     // Open the reverse path through stateful host firewalls (Windows Defender
     // Firewall, macOS network-extension filters): they admit inbound UDP only
     // for a flow the socket has already sent on — which is why GVCP replies get
     // through — and the GVSP socket otherwise never transmits.
-    let mut scsp = punch_stream_port(&rt, &mut dev, punch_socket.as_ref(), cam_ip, None, &shared);
+    let mut scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, None, &shared);
 
     let started = Instant::now();
     let mut warned_silence = false;
@@ -1154,19 +1092,15 @@ fn capture_loop(
     let mut last_telemetry = Instant::now();
     let mut frames = 0u64;
     let mut short_frames = 0u64;
-    let mut resend_ctl = ResendCtl { next_id: 1 };
     let mut announced_resend = false;
     let mut warned_resend_silent = false;
-    if resend_socket.is_none() {
-        shared.resend_enabled.store(false, Ordering::Relaxed);
-    }
     // GEV_TRACE=1: log once a second where the time goes.
     let trace = std::env::var_os("GEV_TRACE").is_some();
     let mut tr = TraceAcc::default();
 
     loop {
         let t_loop = Instant::now();
-        // 1. Service pending commands (sync GenICam access, not inside block_on).
+        // 1. Service pending commands (synchronous GenICam access).
         let mut stop_req = false;
         let mut changed = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -1174,7 +1108,7 @@ fn capture_loop(
                 GevCmd::Stop => { stop_req = true; break; }
                 other => {
                     if let Some(g) = genapi.as_mut() {
-                        apply_set(g, &mut dev, &rt, other, &log_tx);
+                        apply_set(g, &mut dev, other, &log_tx);
                         changed = true;
                     }
                 }
@@ -1184,7 +1118,7 @@ fn capture_loop(
         // values and writability (e.g. ExposureAuto=Off unlocks ExposureTime).
         if changed {
             if let Some(g) = genapi.as_mut() {
-                snapshot = build_controls(g, &mut dev, &rt, cam_ip);
+                snapshot = build_controls(g, &mut dev, cam_ip);
                 let _ = controls_tx.try_send(snapshot.clone());
             }
         }
@@ -1197,14 +1131,14 @@ fn capture_loop(
         // 2. Heartbeat; re-punch the stream flow while we're at it (a camera
         //    that reported GevSCSP=0 at start may know it now).
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            if rt.block_on(dev.read_register(CCP_REGISTER)).is_err() {
+            if dev.read_register(CCP_REGISTER).is_err() {
                 let _ = log_tx.try_send(LogEntry::error(format!("{cam_name}: camera disconnected")));
                 stop.store(true, Ordering::Relaxed);
                 if let Some(jh) = rx_join { let _ = jh.join(); }
                 return;
             }
             last_heartbeat = Instant::now();
-            scsp = punch_stream_port(&rt, &mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
+            scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
         }
 
         // 2b. Telemetry: re-read non-writable feature values periodically so
@@ -1212,7 +1146,7 @@ fn capture_loop(
         if last_telemetry.elapsed() >= TELEMETRY_INTERVAL {
             last_telemetry = Instant::now();
             if let Some(g) = genapi.as_mut() {
-                if refresh_telemetry(g, &mut dev, &rt, &mut snapshot) {
+                if refresh_telemetry(g, &mut dev, &mut snapshot) {
                     let _ = controls_tx.try_send(snapshot.clone());
                 }
             }
@@ -1282,8 +1216,8 @@ fn capture_loop(
                 }
             },
             recv(resend_rx) -> req => {
-                if let (Ok(req), Some(sock)) = (req, resend_socket.as_ref()) {
-                    issue_resends(sock, req, &mut resend_ctl, &shared);
+                if let Ok(req) = req {
+                    issue_resends(&mut dev, req, &shared);
                 }
                 trace_tick(trace, &mut tr, &shared, frames, &log_tx);
                 continue;
@@ -1392,8 +1326,7 @@ fn gvsp_stride(packet_size: u32) -> usize {
 /// the usual range. Returns the port for reuse. Best-effort: every failure is
 /// ignored, and hosts without such a firewall are unaffected.
 fn punch_stream_port(
-    rt: &Runtime,
-    dev: &mut GigeDevice,
+    dev: &mut Device,
     socket: Option<&UdpSocket>,
     cam_ip: Ipv4Addr,
     known: Option<u16>,
@@ -1403,7 +1336,7 @@ fn punch_stream_port(
     let port = if observed != 0 {
         Some(observed)
     } else {
-        match rt.block_on(dev.read_register(SCSP_REGISTER)) {
+        match dev.read_register(SCSP_REGISTER) {
             Ok(v) if (v & 0xFFFF) != 0 => Some((v & 0xFFFF) as u16),
             _ => known,
         }
@@ -1433,7 +1366,7 @@ fn receive_until_frame(
     buf: &mut [u8],
     rx: &mut RxState,
     log_tx: &Sender<LogEntry>,
-) -> Option<(Bytes, FrameGeometry)> {
+) -> Option<(Vec<u8>, FrameGeometry)> {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let n = match socket.recv_from(buf) {
@@ -1494,13 +1427,13 @@ fn receive_until_frame(
                         rx.stride = wire;
                         *b = Block::new(block_id, b.geom, wire);
                     }
-                    b.ingest(packet_id, &data);
+                    b.ingest(packet_id, data);
                     None
                 } else if rx.pending.as_ref().is_some_and(|b| b.id == block_id) {
                     // A resent packet for the block we asked about.
                     let complete = {
                         let b = rx.pending.as_mut().unwrap();
-                        b.ingest(packet_id, &data);
+                        b.ingest(packet_id, data);
                         b.is_complete()
                     };
                     if complete {
@@ -1622,8 +1555,8 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
 
 // ── GenICam feature setters ─────────────────────────────────────────────────
 
-fn set_float_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, v: f64, log_tx: &Sender<LogEntry>) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn set_float_feature(g: &mut GenApi, dev: &mut Device, name: &str, v: f64, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(f) = nid.as_ifloat_kind(&g.store) {
             if let Err(e) = f.set_value(v, &mut bridge, &g.store, &mut g.ctxt) {
@@ -1633,8 +1566,8 @@ fn set_float_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &
     }
 }
 
-fn set_int_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, v: i64, log_tx: &Sender<LogEntry>) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn set_int_feature(g: &mut GenApi, dev: &mut Device, name: &str, v: i64, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(i) = nid.as_iinteger_kind(&g.store) {
             if let Err(e) = i.set_value(v, &mut bridge, &g.store, &mut g.ctxt) {
@@ -1644,8 +1577,8 @@ fn set_int_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &st
     }
 }
 
-fn set_enum_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, sym: &str, log_tx: &Sender<LogEntry>) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn set_enum_feature(g: &mut GenApi, dev: &mut Device, name: &str, sym: &str, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(en) = nid.as_ienumeration_kind(&g.store) {
             if let Err(e) = en.set_entry_by_symbolic(sym, &mut bridge, &g.store, &mut g.ctxt) {
@@ -1655,8 +1588,8 @@ fn set_enum_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &s
     }
 }
 
-fn set_bool_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, v: bool, log_tx: &Sender<LogEntry>) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn set_bool_feature(g: &mut GenApi, dev: &mut Device, name: &str, v: bool, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(bn) = nid.as_iboolean_kind(&g.store) {
             if let Err(e) = bn.set_value(v, &mut bridge, &g.store, &mut g.ctxt) {
@@ -1666,8 +1599,8 @@ fn set_bool_feature(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &s
     }
 }
 
-fn execute_command(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &str, log_tx: &Sender<LogEntry>) {
-    let mut bridge = DeviceBridge { rt, dev };
+fn execute_command(g: &mut GenApi, dev: &mut Device, name: &str, log_tx: &Sender<LogEntry>) {
+    let mut bridge = DeviceBridge { dev };
     if let Some(nid) = g.store.id_by_name(name) {
         if let Some(c) = nid.as_icommand_kind(&g.store) {
             if let Err(e) = c.execute(&mut bridge, &g.store, &mut g.ctxt) {
@@ -1680,43 +1613,27 @@ fn execute_command(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, name: &st
 /// Apply a Set* / Execute command. Features that change frame geometry
 /// (PixelFormat, Width/Height, binning) can't be written while streaming, so for
 /// those we stop acquisition, apply, and restart.
-fn apply_set(g: &mut GenApi, dev: &mut GigeDevice, rt: &Runtime, cmd: GevCmd, log_tx: &Sender<LogEntry>) {
+fn apply_set(g: &mut GenApi, dev: &mut Device, cmd: GevCmd, log_tx: &Sender<LogEntry>) {
     let restart = match &cmd {
         GevCmd::SetInt(n, _) | GevCmd::SetFloat(n, _) | GevCmd::SetEnum(n, _) | GevCmd::SetBool(n, _) => needs_restart(n),
         _ => false,
     };
     if restart {
-        execute_command(g, dev, rt, "AcquisitionStop", log_tx);
-        set_int_feature(g, dev, rt, "TLParamsLocked", 0, log_tx);
+        execute_command(g, dev, "AcquisitionStop", log_tx);
+        set_int_feature(g, dev, "TLParamsLocked", 0, log_tx);
     }
     match cmd {
-        GevCmd::SetInt(n, v) => set_int_feature(g, dev, rt, &n, v, log_tx),
-        GevCmd::SetFloat(n, v) => set_float_feature(g, dev, rt, &n, v, log_tx),
-        GevCmd::SetEnum(n, s) => set_enum_feature(g, dev, rt, &n, &s, log_tx),
-        GevCmd::SetBool(n, v) => set_bool_feature(g, dev, rt, &n, v, log_tx),
-        GevCmd::Execute(n) => execute_command(g, dev, rt, &n, log_tx),
+        GevCmd::SetInt(n, v) => set_int_feature(g, dev, &n, v, log_tx),
+        GevCmd::SetFloat(n, v) => set_float_feature(g, dev, &n, v, log_tx),
+        GevCmd::SetEnum(n, s) => set_enum_feature(g, dev, &n, &s, log_tx),
+        GevCmd::SetBool(n, v) => set_bool_feature(g, dev, &n, v, log_tx),
+        GevCmd::Execute(n) => execute_command(g, dev, &n, log_tx),
         GevCmd::Stop => {}
     }
     if restart {
-        set_int_feature(g, dev, rt, "TLParamsLocked", 1, log_tx);
-        execute_command(g, dev, rt, "AcquisitionStart", log_tx);
+        set_int_feature(g, dev, "TLParamsLocked", 1, log_tx);
+        execute_command(g, dev, "AcquisitionStart", log_tx);
     }
-}
-
-// ── Misc ────────────────────────────────────────────────────────────────--
-
-/// Best-effort: pick a local IPv4 on the same network as the camera by opening a
-/// UDP socket "towards" it (no packets are sent). Falls back to 0.0.0.0.
-fn local_ipv4_towards(target: Ipv4Addr) -> Ipv4Addr {
-    use std::net::UdpSocket as StdUdp;
-    if let Ok(sock) = StdUdp::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-        if sock.connect((target, gvcp::GVCP_PORT)).is_ok() {
-            if let Ok(SocketAddr::V4(local)) = sock.local_addr() {
-                return *local.ip();
-            }
-        }
-    }
-    Ipv4Addr::UNSPECIFIED
 }
 
 #[cfg(test)]
@@ -1755,7 +1672,7 @@ mod tests {
 
     /// Send one Mono8 frame split at `wire_stride` bytes per packet, and
     /// reassemble it with a receiver seeded with `seed_stride`.
-    fn round_trip(wire_stride: usize, seed_stride: usize) -> (Vec<u8>, Option<Bytes>, usize) {
+    fn round_trip(wire_stride: usize, seed_stride: usize) -> (Vec<u8>, Option<Vec<u8>>, usize) {
         let (w, h) = (100u32, 40u32);
         let image: Vec<u8> = (0..(w * h) as usize).map(|i| (i * 7 % 251) as u8).collect();
 
@@ -1781,24 +1698,25 @@ mod tests {
         (image, got, rx.stride)
     }
 
-    /// Full `start_camera` → capture-thread path against a running simulator
-    /// (viva-fake-gige on 127.0.0.1:3956). Ignored: needs the simulator.
+    /// Full `start_camera_at` → capture-thread path against a running simulator
+    /// (viva-fake-gige). Ignored: needs the simulator. The GVCP port defaults to
+    /// 3957 (a second instance alongside one on the standard 3956) and can be
+    /// overridden with `GEV_TEST_PORT`. Run the fake with
+    /// `GEV_PIXEL_FORMAT=Mono8`, since it emits 1 byte/pixel regardless of the
+    /// selected PixelFormat.
     ///
     ///   cargo test --features gev -- --ignored streams_frames_from_fake_camera --nocapture
     #[test]
     #[ignore]
     fn streams_frames_from_fake_camera() {
-        // GEV_TEST_IP=<addr> points it at a real camera instead.
-        let ip: Ipv4Addr = std::env::var("GEV_TEST_IP").ok().and_then(|s| s.parse().ok()).unwrap_or(Ipv4Addr::LOCALHOST);
-        let info = GevDeviceInfo {
-            ip,
-            model: "fake".into(),
-            manufacturer: String::new(),
-            id: "fake".into(),
-        };
+        let port: u16 = std::env::var("GEV_TEST_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3957);
+        let addr = SocketAddr::new(IpAddr::V4(std::env::var("GEV_TEST_IP").ok().and_then(|s| s.parse().ok()).unwrap_or(Ipv4Addr::LOCALHOST)), port);
         let (frame_tx, frame_rx) = bounded::<FrameData>(2);
         let (log_tx, log_rx) = bounded::<LogEntry>(256);
-        let mut handle = start_camera(&info, frame_tx, log_tx).expect("start_camera");
+        let mut handle = start_camera_at(addr, "fake".into(), frame_tx, log_tx).expect("start_camera_at");
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut frames = 0;
         while Instant::now() < deadline && frames < 3 {

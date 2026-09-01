@@ -3,40 +3,55 @@
 //! (no streaming), so it works even when the GVSP stream is blocked.
 //!
 //!   cargo run --example gev_features --features gev -- 192.168.0.2
+//!
+//! A second positional argument overrides the GVCP port (default 3956), so this
+//! can target a simulator: `… -- 127.0.0.1 3957`.
+
+// The app-owned GigE transport lives in the binary crate, which is not a
+// library, so pull the module in by path for this standalone example.
+#[path = "../src/gige/mod.rs"]
+#[allow(dead_code)]
+mod gige;
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::interface::{IBoolean, ICategory, IEnumeration, IFloat, IInteger};
+use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::ValueCtxt;
-use tokio::runtime::Runtime;
-use viva_gige::gvcp::{self, GigeDevice};
 
-struct Bridge<'a> { rt: &'a Runtime, dev: &'a mut GigeDevice }
+use gige::gvcp::{self, Device};
+
+struct Bridge<'a> {
+    dev: &'a mut Device,
+}
 impl cameleon_genapi::Device for Bridge<'_> {
     fn read_mem(&mut self, a: i64, buf: &mut [u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let d = self.rt.block_on(self.dev.read_mem(a as u64, buf.len()))?;
-        let n = buf.len().min(d.len()); buf[..n].copy_from_slice(&d[..n]); Ok(())
+        let d = self.dev.read_mem(a as u64, buf.len())?;
+        let n = buf.len().min(d.len());
+        buf[..n].copy_from_slice(&d[..n]);
+        Ok(())
     }
     fn write_mem(&mut self, a: i64, d: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.rt.block_on(self.dev.write_mem(a as u64, d))?; Ok(())
+        self.dev.write_mem(a as u64, d)?;
+        Ok(())
     }
 }
 
 fn main() -> anyhow::Result<()> {
     let ip: Ipv4Addr = std::env::args().nth(1).unwrap_or_else(|| "192.168.0.2".into()).parse()?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let mut dev = rt.block_on(GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)))?;
-    rt.block_on(dev.claim_control())?;
+    let port: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(gvcp::GVCP_PORT);
+    let mut dev = Device::open(SocketAddr::new(IpAddr::V4(ip), port))
+        .map_err(|e| anyhow::anyhow!("open {ip}:{port}: {e}"))?;
+    dev.claim_control().map_err(|e| anyhow::anyhow!("claim control: {e}"))?;
 
-    let (store, mut ctxt) = load_genapi(&rt, &mut dev)?;
+    let (store, mut ctxt) = load_genapi(&mut dev)?;
     let root = store.id_by_name("Root").ok_or_else(|| anyhow::anyhow!("no Root category"))?;
-    let mut b = Bridge { rt: &rt, dev: &mut dev };
+    let mut b = Bridge { dev: &mut dev };
     let mut seen = std::collections::HashSet::new();
     walk(root, &store, &mut b, &mut ctxt, 0, &mut seen);
 
-    rt.block_on(b.dev.release_control()).ok();
+    let _ = b.dev.release_control();
     Ok(())
 }
 
@@ -54,7 +69,6 @@ fn walk(
     if let Some(cat) = nid.as_icategory_kind(store) {
         println!("{pad}[{name}]");
         for &child in cat.nodes(store) {
-            // NodeId is Copy; guard against cycles/dups by raw index.
             let raw = format!("{child:?}");
             if seen.insert(hash(&raw)) {
                 walk(child, store, dev, ctxt, depth + 1, seen);
@@ -100,10 +114,10 @@ fn walk(
 fn rw(w: bool) -> &'static str { if w { "(writable)" } else { "(read-only)" } }
 fn hash(s: &str) -> u32 { s.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619)) }
 
-fn load_genapi(rt: &Runtime, dev: &mut GigeDevice)
+fn load_genapi(dev: &mut Device)
     -> anyhow::Result<(DefaultNodeStore, ValueCtxt<DefaultValueStore, DefaultCacheStore>)>
 {
-    let raw = rt.block_on(dev.read_mem(0x0200, 512))?;
+    let raw = dev.read_mem(0x0200, 512).map_err(|e| anyhow::anyhow!("READMEM First-URL: {e}"))?;
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len()); // cut at NUL; tail may be garbage
     let url = String::from_utf8_lossy(&raw[..end]);
     let url = url.trim();
@@ -119,7 +133,7 @@ fn load_genapi(rt: &Runtime, dev: &mut GigeDevice)
     while off < len {
         let want = 512.min(len - off);
         let req = (want + 3) & !3; // GVCP READMEM count must be 4-byte aligned
-        let part = rt.block_on(dev.read_mem(addr + off as u64, req))?;
+        let part = dev.read_mem(addr + off as u64, req).map_err(|e| anyhow::anyhow!("READMEM: {e}"))?;
         bytes.extend_from_slice(&part[..want.min(part.len())]);
         off += want;
     }

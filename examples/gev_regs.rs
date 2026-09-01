@@ -1,17 +1,22 @@
 //! Read GigE Vision bootstrap registers without claiming control, so it can
 //! run alongside a viewer that holds the camera. Shows what the camera thinks
-//! the stream channel is configured to.
+//! the stream channel is configured to, and what it advertises in
+//! GevCapability. Uses the app-owned synchronous GigE transport.
 //!
-//!   cargo run --example gev_regs --features gev -- 192.168.0.2
+//!   cargo run --example gev_regs --features gev -- 192.168.0.2 [gvcp_port]
+
+#[path = "../src/gige/mod.rs"]
+#[allow(dead_code)]
+mod gige;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use viva_gige::gvcp::{self, GigeDevice};
+use gige::gvcp::{self, Device};
 
 fn main() -> anyhow::Result<()> {
     let ip: Ipv4Addr = std::env::args().nth(1).unwrap_or_else(|| "192.168.0.2".into()).parse()?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let mut dev = rt.block_on(GigeDevice::open(SocketAddr::new(IpAddr::V4(ip), gvcp::GVCP_PORT)))?;
+    let port: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(gvcp::GVCP_PORT);
+    let mut dev = Device::open(SocketAddr::new(IpAddr::V4(ip), port))?;
     let regs: &[(&str, u32)] = &[
         ("GevCapability", 0x0934),
         ("CCP (control privilege)", 0x0A00),
@@ -28,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         ("SCCFG0 Config", 0x0D24),
     ];
     for (name, addr) in regs {
-        match rt.block_on(dev.read_register(*addr)) {
+        match dev.read_register(*addr) {
             Ok(v) => {
                 let extra = match *addr {
                     0x0934 => format!(

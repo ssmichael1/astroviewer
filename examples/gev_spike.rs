@@ -73,14 +73,14 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Receive a handful of packets and report the first Leader's geometry.
-    let mut buf = vec![0u8; 65536];
+    let mut buf = nic::RecvBuf::new();
     let mut leaders = 0;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline && leaders < 3 {
-        match socket.recv_from(&mut buf) {
-            Ok((n, _)) => {
+        match buf.next_datagram(&socket) {
+            Ok((pkt, _)) => {
                 if let Ok(GvspPacket::Leader { width, height, pixel_format, block_id }) =
-                    gvsp::parse_packet(&buf[..n])
+                    gvsp::parse_packet(pkt)
                 {
                     println!("frame {block_id}: {width}x{height} pixel_format=0x{pixel_format:08x}");
                     leaders += 1;

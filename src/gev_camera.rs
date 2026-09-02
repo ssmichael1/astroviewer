@@ -31,7 +31,8 @@ use cameleon_genapi::{GenApiError, ValueCtxt};
 
 use crate::gige::gvcp::{self, Device, DeviceInfo};
 use crate::gige::gvsp::{self, FrameAssembly, GvspPacket};
-use crate::gige::nic::{self, Iface};
+use crate::gige::nic::{self, GvspSocket, Iface, RecvBuf};
+use crate::gige::platform;
 
 use crate::{FrameData, LogEntry};
 
@@ -402,9 +403,9 @@ pub(crate) fn start_camera_at(
     let packet_delay = dev.read_register(SCPD_REGISTER).unwrap_or(0);
     let _ = log_tx.try_send(LogEntry::info(format!(
         "GigE: stream to {}:{} (mtu={}, packet_size={} requested / {} effective, {} image bytes per packet, \
-         packet delay {} ticks, {} MiB socket buffer)",
+         packet delay {} ticks, {} MiB socket buffer, receive coalescing {})",
         stream_params.host, local_port, stream_params.mtu, stream_params.packet_size,
-        effective_packet_size, packet_payload, packet_delay, recv_buffer >> 20
+        effective_packet_size, packet_payload, packet_delay, recv_buffer >> 20, socket.coalescing_status()
     )));
     if effective_packet_size != stream_params.packet_size {
         let _ = log_tx.try_send(LogEntry::warn(format!(
@@ -1007,13 +1008,18 @@ impl RxState {
 /// a burst is only ever competing with a memcpy for the socket buffer. Frames
 /// the decoder hasn't picked up yet are dropped, never queued.
 fn rx_thread(
-    socket: UdpSocket,
+    socket: GvspSocket,
     mut rx: RxState,
     raw_tx: Sender<(Vec<u8>, FrameGeometry)>,
     stop: Arc<AtomicBool>,
     log_tx: Sender<LogEntry>,
 ) {
-    let mut buf = vec![0u8; 65536];
+    // Win the CPU from the UI and decode threads while a frame bursts in.
+    let _ = log_tx.try_send(match platform::raise_thread_priority() {
+        Ok(what) => LogEntry::info(format!("GigE: receive thread priority raised ({what})")),
+        Err(e) => LogEntry::info(format!("GigE: receive thread priority not raised ({e})")),
+    });
+    let mut buf = RecvBuf::new();
     while !stop.load(Ordering::Relaxed) {
         if let Some(frame) = receive_until_frame(&socket, &mut buf, &mut rx, &log_tx) {
             rx.shared.completed.fetch_add(1, Ordering::Relaxed);
@@ -1040,7 +1046,7 @@ fn issue_resends(dev: &mut Device, req: ResendReq, shared: &RxShared) {
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     mut dev: Device,
-    socket: UdpSocket,
+    socket: GvspSocket,
     mut genapi: Option<GenApi>,
     packet_payload: usize,
     cam_name: &str,
@@ -1057,7 +1063,7 @@ fn capture_loop(
 
     // Start the receive thread before acquisition so the first packets land
     // in a drained socket. The control thread keeps a clone for hole-punching.
-    let punch_socket = socket.try_clone().ok();
+    let punch_socket = socket.try_clone_sender().ok();
     let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
     let rx = RxState::with_resend(packet_payload, resend_tx);
     let shared = Arc::clone(&rx.shared);
@@ -1367,25 +1373,26 @@ fn punch_stream_port(
 }
 
 /// Drain GVSP packets from the blocking socket, assembling the current frame.
+/// `buf` may still hold the tail of a coalesced receive from the last call.
 /// Returns the finished payload + geometry when a block completes — at its
 /// trailer, or later once resent packets fill its gaps — or `None` once the
 /// poll window elapses (the socket's read timeout) so the caller can service
 /// commands. Partially received blocks persist in `rx` across calls.
 fn receive_until_frame(
-    socket: &UdpSocket,
-    buf: &mut [u8],
+    socket: &GvspSocket,
+    buf: &mut RecvBuf,
     rx: &mut RxState,
     log_tx: &Sender<LogEntry>,
 ) -> Option<(Vec<u8>, FrameGeometry)> {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
-        let n = match socket.recv_from(buf) {
-            Ok((n, src)) => {
+        let pkt = match buf.next_datagram(socket) {
+            Ok((pkt, src)) => {
                 if src.port() != rx.src_port {
                     rx.src_port = src.port();
                     rx.shared.src_port.store(src.port() as u32, Ordering::Relaxed);
                 }
-                n
+                pkt
             }
             Err(e) => match e.kind() {
                 // Read timeout: the poll window is over.
@@ -1394,7 +1401,9 @@ fn receive_until_frame(
                     return None;
                 }
                 // Windows reports an ICMP port-unreachable for an earlier send
-                // (our hole punch) as ConnectionReset on the next recv. Harmless.
+                // (our hole punch) as ConnectionReset on the next recv. The
+                // app's socket turns that off (SIO_UDP_CONNRESET); harmless
+                // on any that does not.
                 ErrorKind::Interrupted | ErrorKind::ConnectionReset => {
                     if Instant::now() >= deadline { return None; }
                     continue;
@@ -1403,7 +1412,7 @@ fn receive_until_frame(
             },
         };
         rx.shared.packets.fetch_add(1, Ordering::Relaxed);
-        let packet = match gvsp::parse_packet(&buf[..n]) {
+        let packet = match gvsp::parse_packet(pkt) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -1686,7 +1695,7 @@ mod tests {
         let (w, h) = (100u32, 40u32);
         let image: Vec<u8> = (0..(w * h) as usize).map(|i| (i * 7 % 251) as u8).collect();
 
-        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
         rx_sock.set_read_timeout(Some(POLL_TIMEOUT)).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dst = rx_sock.local_addr().unwrap();
@@ -1703,7 +1712,7 @@ mod tests {
 
         let (log_tx, _log_rx) = bounded::<LogEntry>(16);
         let mut rx = RxState::new(seed_stride);
-        let mut buf = vec![0u8; 65536];
+        let mut buf = RecvBuf::new();
         let got = receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).map(|(p, _)| p);
         (image, got, rx.stride)
     }
@@ -1781,14 +1790,14 @@ mod tests {
     #[test]
     fn gap_at_trailer_requests_resend_and_completes_when_it_arrives() {
         let image = test_image();
-        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
         rx_sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dst = rx_sock.local_addr().unwrap();
         let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
         let (log_tx, _log_rx) = bounded::<LogEntry>(16);
         let mut rx = RxState::with_resend(1464, resend_tx);
-        let mut buf = vec![0u8; 65536];
+        let mut buf = RecvBuf::new();
 
         send_block(&tx, dst, 7, &image, 1464, &[2], true);
         assert!(receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).is_none());
@@ -1806,14 +1815,14 @@ mod tests {
     #[test]
     fn lost_trailer_requests_resend_at_the_next_leader() {
         let image = test_image();
-        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
         rx_sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dst = rx_sock.local_addr().unwrap();
         let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
         let (log_tx, _log_rx) = bounded::<LogEntry>(16);
         let mut rx = RxState::with_resend(1464, resend_tx);
-        let mut buf = vec![0u8; 65536];
+        let mut buf = RecvBuf::new();
 
         // Block 7 loses packet 3 and its trailer; block 8's leader follows.
         send_block(&tx, dst, 7, &image, 1464, &[3], false);
@@ -1831,13 +1840,13 @@ mod tests {
     #[test]
     fn without_resend_an_incomplete_block_is_dropped_and_the_next_still_completes() {
         let image = test_image();
-        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
         rx_sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dst = rx_sock.local_addr().unwrap();
         let (log_tx, _log_rx) = bounded::<LogEntry>(16);
         let mut rx = RxState::new(1464);
-        let mut buf = vec![0u8; 65536];
+        let mut buf = RecvBuf::new();
 
         send_block(&tx, dst, 7, &image, 1464, &[1], true);
         send_block(&tx, dst, 8, &image, 1464, &[], true);

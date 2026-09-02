@@ -1,6 +1,8 @@
 //! App-owned GigE Vision transport: a synchronous, pure-Rust GVCP control plane
-//! ([`gvcp`]), GVSP stream parsing and reassembly ([`gvsp`]), and network
-//! interface / socket helpers ([`nic`]).
+//! ([`gvcp`]), GVSP stream parsing and reassembly ([`gvsp`]), network
+//! interface / socket helpers ([`nic`]), receive-thread scheduling
+//! ([`platform`]) and, on Windows, the Winsock extensions the receive socket
+//! uses ([`winsock`]).
 //!
 //! This replaces the external `viva-gige` crate (and its `tokio` + `bytes`
 //! dependencies) with a std-socket implementation the app owns end to end. Wire
@@ -15,3 +17,6 @@
 pub mod gvcp;
 pub mod gvsp;
 pub mod nic;
+pub mod platform;
+#[cfg(windows)]
+pub mod winsock;

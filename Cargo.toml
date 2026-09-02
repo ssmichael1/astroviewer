@@ -44,7 +44,7 @@ default = []
 svbony = ["dep:svbony"]
 toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
-gev = ["dep:cameleon-genapi", "dep:zip", "dep:socket2", "dep:if-addrs", "dep:windows-sys"]
+gev = ["dep:cameleon-genapi", "dep:zip", "dep:socket2", "dep:if-addrs", "dep:windows-sys", "dep:libc"]
 indi = ["dep:quick-xml", "dep:base64"]
 all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
 
@@ -75,12 +75,23 @@ required-features = ["gev"]
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
-# Interface MTU via GetIfEntry2 for the GigE transport (src/gige/nic.rs).
+# GigE transport, Windows: interface MTU via GetIfEntry2 (src/gige/nic.rs),
+# UDP receive coalescing + WSARecvMsg + SIO_UDP_CONNRESET (src/gige/winsock.rs),
+# receive-thread priority (src/gige/platform.rs).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_Threading",
 ], optional = true }
+
+# GigE transport, unix: receive-thread scheduling (QoS class on macOS, nice
+# elsewhere) in src/gige/platform.rs.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [profile.test]
 opt-level = 3

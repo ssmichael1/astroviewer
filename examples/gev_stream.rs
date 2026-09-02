@@ -125,8 +125,8 @@ fn main() -> anyhow::Result<()> {
     // IPv4 (20) + UDP (8) + GVSP (8) = 36 bytes of headers.
     let mut stride = effective.saturating_sub(36).max(1) as usize;
     println!(
-        "stream negotiated: host={} port={} mtu={} packet_size={} requested / {} effective (stride={}, {} MiB rcvbuf)",
-        params.host, local_port, params.mtu, params.packet_size, effective, stride, recv_buffer >> 20
+        "stream negotiated: host={} port={} mtu={} packet_size={} requested / {} effective (stride={}, {} MiB rcvbuf, receive coalescing {})",
+        params.host, local_port, params.mtu, params.packet_size, effective, stride, recv_buffer >> 20, socket.coalescing_status()
     );
     for (name, addr) in [("SCPHostPort", 0x0D00u32), ("SCPSPacketSize", 0x0D04), ("SCPD", 0x0D08), ("SCDA", 0x0D18)] {
         match dev.read_register(addr) {
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\nlistening for GVSP packets for {listen_secs} s…");
-    let mut buf = vec![0u8; 65536];
+    let mut buf = nic::RecvBuf::new();
     let mut assembly: Option<FrameAssembly> = None;
     let mut geom: Option<(u32, u32, u32)> = None;
     let (mut pkts, mut leaders, mut payloads, mut trailers, mut frames) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -184,8 +184,8 @@ fn main() -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(listen_secs);
 
     while Instant::now() < deadline {
-        let (n, _src) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
+        let pkt = match buf.next_datagram(&socket) {
+            Ok((pkt, _src)) => pkt,
             Err(e) => match e.kind() {
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => continue,
                 std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::Interrupted => continue,
@@ -193,7 +193,7 @@ fn main() -> anyhow::Result<()> {
             },
         };
         pkts += 1;
-        match gvsp::parse_packet(&buf[..n]) {
+        match gvsp::parse_packet(pkt) {
             Ok(GvspPacket::Leader { block_id, width, height, pixel_format }) => {
                 leaders += 1;
                 if leaders <= 3 {
@@ -247,7 +247,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(e) => if pkts <= 5 { println!("  parse error: {e:?} (len {n})"); },
+            Err(e) => if pkts <= 5 { println!("  parse error: {e:?} (len {})", pkt.len()); },
         }
     }
 

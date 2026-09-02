@@ -22,6 +22,9 @@ const CMD_KEY: u8 = 0x42;
 /// Flags byte bits.
 const FLAG_ACK_REQUIRED: u8 = 0x01;
 const FLAG_BROADCAST: u8 = 0x10;
+/// PACKETRESEND flag: the payload uses the GigE Vision 2.0 extended-ID layout
+/// (64-bit block id). The same bit as `FLAG_BROADCAST`; flags are per command.
+const FLAG_EXTENDED_IDS: u8 = 0x10;
 
 /// GenCP / GVCP acknowledgement header size.
 const HEADER_SIZE: usize = 8;
@@ -536,23 +539,10 @@ impl Device {
         Ok(())
     }
 
-    /// Ask the camera to retransmit payload packets `first..=last` of
-    /// `block_id` on the stream channel. Sent on this socket because the
-    /// command is only honored from the application holding control
-    /// privilege, and fire-and-forget: GigE Vision 1.x devices never
-    /// acknowledge PACKETRESEND, and an acknowledgement would arrive long
-    /// after the camera flushed the frame anyway. A stray ack from a device
-    /// that does answer is absorbed by the next transaction's id check.
-    pub fn request_resend_noack(&mut self, block_id: u16, first: u16, last: u16) -> Result<(), GvcpError> {
-        let mut payload = [0u8; 12];
-        // payload[0..2]: stream channel index 0
-        payload[2..4].copy_from_slice(&block_id.to_be_bytes());
-        payload[4..8].copy_from_slice(&(first as u32).to_be_bytes());
-        payload[8..12].copy_from_slice(&(last as u32).to_be_bytes());
-        let id = self.next_request_id();
-        let pkt = encode_command(0, PACKET_RESEND_CMD, id, &payload);
-        self.socket.send(&pkt)?;
-        Ok(())
+    /// A [`ResendSender`] for the receive thread: a second handle on this
+    /// socket, so PACKETRESEND leaves from the port holding control privilege.
+    pub fn resend_sender(&self, channel: u16) -> io::Result<ResendSender> {
+        Ok(ResendSender { socket: self.socket.try_clone()?, channel, request_id: 0x8000 })
     }
 
     /// Read the persistent (boot-time) IP, subnet mask and gateway.
@@ -653,6 +643,95 @@ impl Device {
         let addr = Self::stream_reg(channel, STREAM_PACKET_SIZE) as u32;
         Ok(self.read_register(addr)? & STREAM_PACKET_SIZE_MASK)
     }
+}
+
+/// Encode a PACKETRESEND payload. GigE Vision 1.x layout, 12 bytes:
+/// `stream_channel(2) | block_id(2) | first_packet_id(4) | last_packet_id(4)`
+/// (packet ids are 24-bit in the 32-bit fields). Extended-ID layout (2.0, sent
+/// with `FLAG_EXTENDED_IDS`), 20 bytes: `stream_channel(2) | reserved(2) |
+/// first_packet_id(4) | last_packet_id(4) | block_id(8)`. Both as aravis
+/// encodes them (`arv_gvcp_packet_new_packet_resend_cmd`).
+pub fn encode_packet_resend(channel: u16, block_id: u64, first: u32, last: u32, extended: bool) -> Vec<u8> {
+    let mut p = Vec::with_capacity(20);
+    p.extend_from_slice(&channel.to_be_bytes());
+    if extended {
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(&first.to_be_bytes());
+        p.extend_from_slice(&last.to_be_bytes());
+        p.extend_from_slice(&block_id.to_be_bytes());
+    } else {
+        p.extend_from_slice(&(block_id as u16).to_be_bytes());
+        p.extend_from_slice(&first.to_be_bytes());
+        p.extend_from_slice(&last.to_be_bytes());
+    }
+    p
+}
+
+/// Fire-and-forget PACKETRESEND for the receive thread: a handle on the
+/// control socket (the camera honors the command only from the port holding
+/// control privilege) with its own request-id sequence. GigE Vision 1.x
+/// devices never acknowledge PACKETRESEND and this never asks for one, so it
+/// cannot collide with the control thread's transactions; a stray ack from a
+/// device that answers anyway is absorbed by the next transaction's id check.
+pub struct ResendSender {
+    socket: UdpSocket,
+    channel: u16,
+    request_id: u16,
+}
+
+impl ResendSender {
+    /// A sender toward `addr` on a fresh socket, for tests and tools without
+    /// a [`Device`]; a camera ignores it unless that socket holds control.
+    #[allow(dead_code)]
+    pub fn to(addr: SocketAddr, channel: u16) -> io::Result<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+        socket.connect(addr)?;
+        Ok(Self { socket, channel, request_id: 0x8000 })
+    }
+
+    /// Ask for payload packets `first..=last` (1-based) of `block_id`. The
+    /// extended layout is required once block ids exceed 16 bits.
+    pub fn request(&mut self, block_id: u64, first: u32, last: u32, extended: bool) -> io::Result<()> {
+        let payload = encode_packet_resend(self.channel, block_id, first, last, extended);
+        let flags = if extended { FLAG_EXTENDED_IDS } else { 0 };
+        let id = self.request_id;
+        self.request_id = self.request_id.wrapping_add(1).max(1);
+        self.socket.send(&encode_command(flags, PACKET_RESEND_CMD, id, &payload)).map(|_| ())
+    }
+}
+
+/// A decoded PACKETRESEND command (tests).
+#[cfg(test)]
+pub(crate) struct ResendRequest {
+    pub request_id: u16,
+    pub block_id: u64,
+    pub first: u32,
+    pub last: u32,
+    pub extended: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn decode_packet_resend(pkt: &[u8]) -> Option<ResendRequest> {
+    if pkt.len() < HEADER_SIZE || pkt[0] != CMD_KEY {
+        return None;
+    }
+    if u16::from_be_bytes([pkt[2], pkt[3]]) != PACKET_RESEND_CMD {
+        return None;
+    }
+    let len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+    let request_id = u16::from_be_bytes([pkt[6], pkt[7]]);
+    let p = &pkt[HEADER_SIZE..];
+    if p.len() != len {
+        return None;
+    }
+    let extended = pkt[1] & FLAG_EXTENDED_IDS != 0;
+    let u32_at = |o: usize| u32::from_be_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    let (block_id, first, last) = match (extended, len) {
+        (true, 20) => (u64::from_be_bytes(p[12..20].try_into().ok()?), u32_at(4), u32_at(8)),
+        (false, 12) => (u16::from_be_bytes([p[2], p[3]]) as u64, u32_at(4), u32_at(8)),
+        _ => return None,
+    };
+    Some(ResendRequest { request_id, block_id, first, last, extended })
 }
 
 enum RecvOutcome {
@@ -1062,5 +1141,39 @@ mod tests {
         wrong_status[0..2].copy_from_slice(&0x8002u16.to_be_bytes());
         assert!(parse_discovery_ack(&wrong_status, 0x0100).is_none());
         assert!(parse_discovery_ack(&[0u8; 4], 0x0100).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+
+    #[test]
+    fn packet_resend_payloads_match_the_aravis_layouts() {
+        assert_eq!(encode_packet_resend(0, 0x1234, 5, 9, false), [0, 0, 0x12, 0x34, 0, 0, 0, 5, 0, 0, 0, 9]);
+        assert_eq!(
+            encode_packet_resend(0, 0x0001_0002_0003_0004, 5, 9, true),
+            [0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 9, 0, 1, 0, 2, 0, 3, 0, 4]
+        );
+    }
+
+    #[test]
+    fn resend_commands_round_trip_and_carry_the_extended_flag() {
+        let cam = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cam.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut s = ResendSender::to(cam.local_addr().unwrap(), 0).unwrap();
+        s.request(7, 2, 3, false).unwrap();
+        s.request(70_000, 4, 4, true).unwrap();
+        let mut b = [0u8; 64];
+        let n = cam.recv(&mut b).unwrap();
+        let r = decode_packet_resend(&b[..n]).expect("standard request");
+        assert_eq!((r.block_id, r.first, r.last, r.extended), (7, 2, 3, false));
+        assert_eq!(b[1], 0, "no flags on a standard request");
+        let n = cam.recv(&mut b).unwrap();
+        let r2 = decode_packet_resend(&b[..n]).expect("extended request");
+        assert_eq!((r2.block_id, r2.first, r2.last, r2.extended), (70_000, 4, 4, true));
+        assert_eq!(b[1], FLAG_EXTENDED_IDS);
+        assert_ne!(r.request_id, r2.request_id);
+        assert_ne!(r.request_id, 0);
     }
 }

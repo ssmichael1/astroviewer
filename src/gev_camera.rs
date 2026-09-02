@@ -15,6 +15,7 @@
 //! raw frame into [`FrameData`] on the shared `frame_tx` channel. Every GVCP
 //! call is a direct blocking transaction — no `block_on`, no tokio.
 
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -29,7 +30,7 @@ use cameleon_genapi::interface::ICategoryKind;
 use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeId, NodeStore};
 use cameleon_genapi::{GenApiError, ValueCtxt};
 
-use crate::gige::gvcp::{self, Device, DeviceInfo};
+use crate::gige::gvcp::{self, Device, DeviceInfo, ResendSender};
 use crate::gige::gvsp::{self, FrameAssembly, GvspPacket};
 use crate::gige::nic::{self, GvspSocket, Iface, RecvBuf};
 use crate::gige::platform;
@@ -50,6 +51,10 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 const STREAM_CHANNEL: u32 = 0;
 /// How long to wait for stream packets before returning to service commands.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
+/// The receive socket's read timeout: how long the receive thread can sit in
+/// a receive with the stream idle before it services resend timers, so a
+/// retry is never later than this.
+const RX_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 /// How long an in-flight frame may take to reassemble before being abandoned.
 const FRAME_DEADLINE: Duration = Duration::from_millis(1000);
 /// Stream channel 0 source-port register (`GevSCSP`): the UDP port the camera
@@ -69,24 +74,27 @@ const SILENCE_GRACE: Duration = Duration::from_secs(3);
 const RECV_BUFFER_REQUEST: usize = 64 << 20;
 /// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
 const SCPD_REGISTER: u32 = 0x0d08;
-/// Packet resend: how long to hold a block open for the packets a
-/// PACKETRESEND asked for before retrying or giving up. The camera only
-/// buffers a frame or two, so this is measured in frame periods, not seconds.
-const RESEND_WINDOW: Duration = Duration::from_millis(100);
-/// Packet resend: requests per block before it is abandoned.
-const RESEND_MAX_ATTEMPTS: u32 = 2;
-/// Packet resend: a block missing more distinct ranges than this is dropped
-/// rather than asked for — each range is one control-channel datagram.
-const RESEND_MAX_RANGES: usize = 32;
-/// Packet resend: gaps this close are merged into one range.
+/// Packet resend, the policy eBUS applies: a gap is requested as soon as the
+/// packet after it arrives (after `RESEND_DELAY`, for a reordered packet to
+/// show up), re-requested every `RESEND_RETRY` until `RESEND_ATTEMPTS` are
+/// spent, and a block whose transmission ended is held open for the
+/// retransmissions — `RESEND_PENDING_MAX` such blocks at once, since cameras
+/// buffer only a frame or two — until `RESEND_WINDOW` after it ended.
+/// `GEV_RESEND_ATTEMPTS` / `GEV_RESEND_RETRY_MS` override the timing at run
+/// time; `GEV_RESEND=0` turns resend off.
+const RESEND_DELAY: Duration = Duration::from_millis(1);
+const RESEND_RETRY: Duration = Duration::from_millis(25);
+const RESEND_ATTEMPTS: u32 = 3;
+const RESEND_PENDING_MAX: usize = 4;
+const RESEND_WINDOW: Duration = Duration::from_millis(250);
+/// Packet resend: a block with more distinct gaps than this is given up
+/// rather than asked for — each gap is a control-channel datagram, and a
+/// link losing that much of a frame is not one retransmission will repair.
+const RESEND_MAX_GAPS: usize = 64;
+/// Packet resend: gaps this close are merged into one request.
 const RESEND_COALESCE_GAP: u32 = 4;
-/// Packet resend: a block missing more than this fraction of its packets is
-/// dropped, not requested. Resend is for the occasional gap; asking a camera
-/// to retransmit most of a frame into a link that is already dropping 60% of
-/// it only deepens the congestion.
-const RESEND_MAX_MISSING: f64 = 0.25;
-/// Packet resend: requests after which, with no frame ever recovered, the log
-/// says the camera is not honoring them.
+/// Packet resend: requests after which, with no packet ever recovered, the
+/// log says the camera is not honoring them.
 const RESEND_SILENT_AFTER: u64 = 20;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -365,7 +373,7 @@ pub(crate) fn start_camera_at(
         .and_then(|i| i.ipv4())
         .map(IpAddr::V4)
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let (socket, recv_buffer) = nic::bind_gvsp_socket(bind_ip, RECV_BUFFER_REQUEST, POLL_TIMEOUT)?;
+    let (socket, recv_buffer) = nic::bind_gvsp_socket(bind_ip, RECV_BUFFER_REQUEST, RX_POLL_TIMEOUT)?;
     let local_port = socket.local_addr()?.port();
 
     // Optional cap on the GVSP packet size (bytes, full IP datagram), e.g. to
@@ -811,10 +819,14 @@ struct RxShared {
     dropped: AtomicU64,
     /// Resend requests handed to the control thread.
     resend_requests: AtomicU64,
-    /// Frames that completed only after a resend.
+    /// Frames that completed after at least one resend request.
     resend_recovered: AtomicU64,
     /// Frames abandoned after resend attempts ran out.
     resend_failed: AtomicU64,
+    /// Packets that arrived after being asked for.
+    packets_recovered: AtomicU64,
+    /// Packets never received, from every abandoned block.
+    packets_lost: AtomicU64,
     /// Cleared by the control thread when the camera rejects resend requests.
     resend_enabled: AtomicBool,
     src_port: AtomicU32,
@@ -829,6 +841,8 @@ impl Default for RxShared {
             resend_requests: AtomicU64::new(0),
             resend_recovered: AtomicU64::new(0),
             resend_failed: AtomicU64::new(0),
+            packets_recovered: AtomicU64::new(0),
+            packets_lost: AtomicU64::new(0),
             resend_enabled: AtomicBool::new(true),
             src_port: AtomicU32::new(0),
         }
@@ -840,46 +854,99 @@ impl Default for RxShared {
 /// arrived and the camera reports `GevSCSP` = 0.
 const PUNCH_SPRAY_PORTS: std::ops::RangeInclusive<u16> = 1024..=2048;
 
-/// A resend request from the receive thread: 1-based payload packet ranges
-/// still missing from `block_id`, coalesced and capped. Relayed by the control
-/// thread, whose GVCP socket holds the control privilege the camera requires
-/// on a PACKETRESEND command.
-struct ResendReq {
-    block_id: u16,
-    ranges: Vec<(u16, u16)>,
+/// How often resend timers are looked at while packets are flowing; they are
+/// also serviced whenever the socket goes idle (`RX_POLL_TIMEOUT`).
+const RESEND_SERVICE_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Packet-resend timing. Settable at run time (`GEV_RESEND_ATTEMPTS`,
+/// `GEV_RESEND_RETRY_MS`) so a camera's resend behavior can be probed
+/// without a rebuild.
+#[derive(Clone, Copy, Debug)]
+struct ResendPolicy {
+    /// Settling time between spotting a gap and asking for it, so a merely
+    /// reordered packet is not requested.
+    delay: Duration,
+    /// How long to wait for a requested packet before asking again.
+    retry: Duration,
+    /// Requests per gap before the block is given up.
+    attempts: u32,
 }
 
-/// One block (frame) being reassembled.
+impl Default for ResendPolicy {
+    fn default() -> Self {
+        Self { delay: RESEND_DELAY, retry: RESEND_RETRY, attempts: RESEND_ATTEMPTS }
+    }
+}
+
+impl ResendPolicy {
+    fn from_env() -> Self {
+        let mut p = Self::default();
+        if let Some(n) = std::env::var("GEV_RESEND_ATTEMPTS").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            p.attempts = n.max(1);
+        }
+        if let Some(ms) = std::env::var("GEV_RESEND_RETRY_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            p.retry = Duration::from_millis(ms.max(1));
+        }
+        p
+    }
+}
+
+/// A run of payload packets (1-based ids, inclusive) missing from a block,
+/// with its request history.
+#[derive(Clone, Copy, Debug)]
+struct Gap {
+    first: u32,
+    last: u32,
+    /// PACKETRESEND commands sent for this run so far.
+    attempts: u32,
+    /// When to (re)request it.
+    due: Instant,
+}
+
+/// One block (frame) being reassembled, with the resend bookkeeping the
+/// receive thread does for it: a gap is noticed when the packet after it
+/// arrives, requested after a settling delay, re-requested on a timer, and
+/// the block is held open past its trailer until the gaps fill or the
+/// attempts run out.
 struct Block {
     id: u64,
+    /// The block streams with extended (64-bit) ids, so requests must too.
+    extended_ids: bool,
     geom: FrameGeometry,
     assembly: FrameAssembly,
     expected: usize,
-    /// Resend attempts issued for this block.
-    attempts: u32,
-    /// While awaiting resent packets: when to retry or give up.
+    /// Highest payload id seen: anything skipped below it is a gap.
+    highest: u32,
+    /// Outstanding gaps, ascending.
+    gaps: Vec<Gap>,
+    /// PACKETRESEND commands sent for this block.
+    requests: u32,
+    /// The camera finished transmitting it (trailer, or the next leader):
+    /// only retransmissions can still arrive.
+    ended: bool,
+    /// Give-up time once ended.
     deadline: Instant,
+    /// No more requests: too many gaps, or the camera said a packet is gone.
+    abandoned: bool,
 }
 
 impl Block {
-    fn new(id: u64, geom: FrameGeometry, stride: usize) -> Self {
+    fn new(id: u64, extended_ids: bool, geom: FrameGeometry, stride: usize, now: Instant) -> Self {
         let total = frame_payload_bytes(geom.pixel_format, geom.width as usize * geom.height as usize);
         let expected = total.div_ceil(stride).max(1);
         Self {
             id,
+            extended_ids,
             geom,
-            assembly: FrameAssembly::new(id, expected, stride, Instant::now() + FRAME_DEADLINE),
+            assembly: FrameAssembly::new(id, expected, stride, now + FRAME_DEADLINE),
             expected,
-            attempts: 0,
-            deadline: Instant::now() + FRAME_DEADLINE,
+            highest: 0,
+            gaps: Vec::new(),
+            requests: 0,
+            ended: false,
+            deadline: now + FRAME_DEADLINE,
+            abandoned: false,
         }
-    }
-
-    /// Place a payload packet. Leader/Trailer are packet 0 and N+1; payload
-    /// ids are 1-based.
-    fn ingest(&mut self, packet_id: u32, data: &[u8]) {
-        let idx = packet_id.saturating_sub(1) as usize;
-        self.assembly.ingest(idx, data);
     }
 
     fn is_complete(&self) -> bool {
@@ -891,30 +958,134 @@ impl Block {
         self.assembly.finish().map(|p| (p, g))
     }
 
-    /// Packets not yet received.
+    /// Packets not received.
     fn missing_count(&self) -> usize {
         self.assembly.missing_ranges().iter().map(|r| (*r.end() - *r.start() + 1) as usize).sum()
     }
 
-    /// Whether a PACKETRESEND can name this block's packets (16-bit ids).
+    /// Whether a PACKETRESEND can name this block's packets: always with
+    /// extended ids; otherwise 16-bit block and 24-bit packet ids.
     fn resendable(&self) -> bool {
-        self.id <= u16::MAX as u64 && self.expected <= u16::MAX as usize
+        self.extended_ids || (self.id <= u16::MAX as u64 && self.expected <= 0x00FF_FFFF)
+    }
+
+    /// A payload packet — or a status-only reply to a resend request — for
+    /// this block. Leader/Trailer are packet 0 and N+1; payload ids are 1-based.
+    fn receive(&mut self, packet_id: u32, status: u16, data: &[u8], now: Instant, policy: &ResendPolicy, shared: &RxShared) {
+        if packet_id == 0 || packet_id as usize > self.expected {
+            return;
+        }
+        if gvsp::status_is_error(status) {
+            // No data. Gone for good: stop asking. Not yet available: the
+            // gap's timer asks again.
+            if gvsp::status_is_permanent_loss(status) {
+                self.abandoned = true;
+            }
+            return;
+        }
+        if !self.ended && packet_id > self.highest + 1 {
+            self.add_gap(self.highest + 1, packet_id - 1, now + policy.delay);
+        }
+        self.highest = self.highest.max(packet_id);
+        let idx = packet_id as usize - 1;
+        let fresh = !self.assembly.has(idx);
+        if let Some(requested) = self.fill(packet_id) {
+            if requested && fresh {
+                shared.packets_recovered.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.assembly.ingest(idx, data);
+    }
+
+    /// Record a new gap, merging it into a close, not-yet-requested
+    /// neighbour: asking for a few extra packets is cheaper than another
+    /// command, and duplicates are ignored on arrival.
+    fn add_gap(&mut self, first: u32, last: u32, due: Instant) {
+        if let Some(prev) = self.gaps.last_mut() {
+            if prev.attempts == 0 && first <= prev.last + RESEND_COALESCE_GAP + 1 {
+                prev.last = last;
+                return;
+            }
+        }
+        self.gaps.push(Gap { first, last, attempts: 0, due });
+        if self.gaps.len() > RESEND_MAX_GAPS {
+            self.abandoned = true;
+        }
+    }
+
+    /// A packet inside one of the gaps arrived: shrink that gap. Returns
+    /// whether the gap had been requested — a retransmission rather than a
+    /// reordered packet — or `None` if the id was not in a gap.
+    fn fill(&mut self, id: u32) -> Option<bool> {
+        let i = self.gaps.iter().position(|g| g.first <= id && id <= g.last)?;
+        let g = self.gaps.remove(i);
+        if id < g.last {
+            self.gaps.insert(i, Gap { first: id + 1, ..g });
+        }
+        if g.first < id {
+            self.gaps.insert(i, Gap { last: id - 1, ..g });
+        }
+        Some(g.attempts > 0)
+    }
+
+    /// The camera finished transmitting the block. Everything still missing
+    /// — including the tail after the highest id seen — becomes a gap to ask
+    /// for now; gaps already requested keep their history.
+    fn end(&mut self, now: Instant) {
+        self.ended = true;
+        self.deadline = now + RESEND_WINDOW;
+        let old = std::mem::take(&mut self.gaps);
+        for r in self.assembly.missing_ranges() {
+            let (first, last) = (*r.start() + 1, *r.end() + 1);
+            let history = old
+                .iter()
+                .filter(|g| g.first <= last && first <= g.last)
+                .fold(None::<Gap>, |acc, g| {
+                    Some(match acc {
+                        Some(a) => Gap { attempts: a.attempts.max(g.attempts), due: a.due.min(g.due), ..a },
+                        None => *g,
+                    })
+                });
+            let (attempts, due) = history.map_or((0, now), |g| (g.attempts, g.due));
+            match self.gaps.last_mut() {
+                Some(prev) if prev.attempts == 0 && attempts == 0 && first <= prev.last + RESEND_COALESCE_GAP + 1 => {
+                    prev.last = last;
+                }
+                _ => self.gaps.push(Gap { first, last, attempts, due }),
+            }
+        }
+        if self.gaps.len() > RESEND_MAX_GAPS {
+            self.abandoned = true;
+        }
+    }
+
+    /// Send whatever is due. Returns `false` once the block should be given
+    /// up: abandoned, past its deadline, a gap out of attempts, or the
+    /// control socket gone.
+    fn service(&mut self, now: Instant, policy: &ResendPolicy, sender: &mut ResendSender, shared: &RxShared) -> bool {
+        if self.abandoned || (self.ended && now >= self.deadline) {
+            return false;
+        }
+        let (id, extended) = (self.id, self.extended_ids);
+        for g in self.gaps.iter_mut().filter(|g| g.due <= now) {
+            if g.attempts >= policy.attempts || sender.request(id, g.first, g.last, extended).is_err() {
+                return false;
+            }
+            g.attempts += 1;
+            g.due = now + policy.retry;
+            self.requests += 1;
+            shared.resend_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        true
     }
 }
 
-/// Turn 0-based missing indices into 1-based packet-id ranges, merging ranges
-/// separated by at most `RESEND_COALESCE_GAP` packets (asking for a few extra
-/// is cheaper than another command; duplicates are ignored on arrival).
-fn coalesce_ranges(missing: Vec<std::ops::RangeInclusive<u32>>) -> Vec<(u16, u16)> {
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    for r in missing {
-        let (s, e) = (*r.start() + 1, *r.end() + 1);
-        match out.last_mut() {
-            Some(last) if s <= last.1 + RESEND_COALESCE_GAP + 1 => last.1 = e,
-            _ => out.push((s, e)),
-        }
-    }
-    out.into_iter().map(|(s, e)| (s as u16, e as u16)).collect()
+/// Count a block given up on: a resend failure if it was ever asked for,
+/// else a plain drop; either way its missing packets are lost.
+fn abandon_block(shared: &RxShared, block: Block) {
+    let counter = if block.requests > 0 { &shared.resend_failed } else { &shared.dropped };
+    counter.fetch_add(1, Ordering::Relaxed);
+    shared.packets_lost.fetch_add(block.missing_count() as u64, Ordering::Relaxed);
 }
 
 /// Receive-side state, owned by the receive thread and persisting across poll
@@ -922,9 +1093,11 @@ fn coalesce_ranges(missing: Vec<std::ops::RangeInclusive<u32>>) -> Vec<(u16, u16
 struct RxState {
     /// The block currently being transmitted.
     active: Option<Block>,
-    /// A block whose transmission ended with gaps, held open for the packets
-    /// a resend request asked for. At most one; a newer one displaces it.
-    pending: Option<Block>,
+    /// Blocks whose transmission ended with gaps, held open for the
+    /// retransmissions they asked for. Oldest first; at most
+    /// `RESEND_PENDING_MAX`, since cameras keep only a frame or two to resend
+    /// from.
+    pending: VecDeque<Block>,
     /// Image bytes per GVSP payload packet — the stride reassembly places
     /// packets at. Seeded from the effective `GevSCPSPacketSize`, then
     /// corrected from the first payload packet actually seen on the wire, so a
@@ -933,80 +1106,168 @@ struct RxState {
     shared: Arc<RxShared>,
     /// Last source port published to `shared` (avoids a store per packet).
     src_port: u16,
-    /// Where resend requests go; `None` disables resend (tests).
-    resend_tx: Option<Sender<ResendReq>>,
+    /// Sends PACKETRESEND on the privileged control socket; `None` disables
+    /// resend (tests).
+    resend: Option<ResendSender>,
+    policy: ResendPolicy,
+    /// Next time the resend timers are looked at while packets are flowing.
+    next_service: Instant,
 }
 
 impl RxState {
     fn new(stride: usize) -> Self {
         Self {
             active: None,
-            pending: None,
+            pending: VecDeque::new(),
             stride: stride.max(1),
             shared: Arc::default(),
             src_port: 0,
-            resend_tx: None,
+            resend: None,
+            policy: ResendPolicy::default(),
+            next_service: Instant::now(),
         }
     }
 
-    fn with_resend(stride: usize, resend_tx: Sender<ResendReq>) -> Self {
-        Self { resend_tx: Some(resend_tx), ..Self::new(stride) }
+    fn with_resend(stride: usize, sender: ResendSender) -> Self {
+        Self { resend: Some(sender), ..Self::new(stride) }
     }
 
-    /// The block's packets stopped (its trailer, or the next block's leader).
-    /// Complete → the frame. Gaps → ask the camera for them and keep the block
-    /// open. Otherwise it is dropped.
-    fn boundary(&mut self, block: Block) -> Option<(Vec<u8>, FrameGeometry)> {
-        if block.is_complete() {
-            return block.finish();
+    fn resend_on(&self) -> bool {
+        self.resend.is_some() && self.shared.resend_enabled.load(Ordering::Relaxed)
+    }
+
+    /// A leader: the previous block, if still open, has ended.
+    fn on_leader(&mut self, block_id: u64, geom: FrameGeometry, extended_ids: bool, now: Instant) -> Option<(Vec<u8>, FrameGeometry)> {
+        let finished = match self.active.take() {
+            Some(old) => self.boundary(old, now),
+            None => None,
+        };
+        self.active = Some(Block::new(block_id, extended_ids, geom, self.stride, now));
+        finished
+    }
+
+    /// A payload packet, for the active block or one held open for resends.
+    fn on_payload(
+        &mut self,
+        block_id: u64,
+        packet_id: u32,
+        status: u16,
+        data: &[u8],
+        now: Instant,
+        log_tx: &Sender<LogEntry>,
+    ) -> Option<(Vec<u8>, FrameGeometry)> {
+        if self.active.as_ref().is_some_and(|b| b.id == block_id) {
+            if !gvsp::status_is_error(status) {
+                let b = self.active.as_mut().unwrap();
+                // The wire is the authority on the stride: the first payload
+                // packet of a block is full-sized unless the whole frame fits
+                // in one packet, and any packet larger than the assumed
+                // stride proves the assumption wrong. Re-seat the block.
+                let total = frame_payload_bytes(b.geom.pixel_format, b.geom.width as usize * b.geom.height as usize);
+                let wire = data.len();
+                if wire != self.stride && wire < total && (packet_id == 1 || wire > self.stride) {
+                    let _ = log_tx.try_send(LogEntry::warn(format!(
+                        "GigE: GVSP payload stride corrected {} -> {} B/packet (camera's packet size \
+                         differs from the negotiated value)",
+                        self.stride, wire
+                    )));
+                    self.stride = wire;
+                    *b = Block::new(block_id, b.extended_ids, b.geom, wire, now);
+                }
+            }
+            let b = self.active.as_mut().unwrap();
+            b.receive(packet_id, status, data, now, &self.policy, &self.shared);
+            // An active block finishes at its boundary, not here.
+            return None;
         }
-        self.request_or_drop(block);
+        let Some(i) = self.pending.iter().position(|b| b.id == block_id) else {
+            return None; // a straggler for a block already given up
+        };
+        let b = &mut self.pending[i];
+        b.receive(packet_id, status, data, now, &self.policy, &self.shared);
+        let (complete, abandoned) = (b.is_complete(), b.abandoned);
+        if complete {
+            let b = self.pending.remove(i).unwrap();
+            self.shared.resend_recovered.fetch_add(1, Ordering::Relaxed);
+            return b.finish();
+        }
+        if abandoned {
+            let b = self.pending.remove(i).unwrap();
+            abandon_block(&self.shared, b);
+        }
         None
     }
 
-    /// Issue a resend for the block's gaps (if resend is on, the ids fit, the
-    /// gaps are few enough, and attempts remain) and park it as `pending`;
-    /// otherwise count it as lost.
-    fn request_or_drop(&mut self, mut block: Block) {
-        let enabled = self.shared.resend_enabled.load(Ordering::Relaxed);
-        if let Some(tx) = self.resend_tx.as_ref().filter(|_| enabled) {
-            if block.resendable()
-                && block.attempts < RESEND_MAX_ATTEMPTS
-                && (block.missing_count() as f64) <= RESEND_MAX_MISSING * block.expected as f64
-            {
-                let ranges = coalesce_ranges(block.assembly.missing_ranges());
-                if !ranges.is_empty() && ranges.len() <= RESEND_MAX_RANGES {
-                    let req = ResendReq { block_id: block.id as u16, ranges };
-                    if tx.try_send(req).is_ok() {
-                        self.shared.resend_requests.fetch_add(1, Ordering::Relaxed);
-                        block.attempts += 1;
-                        block.deadline = Instant::now() + RESEND_WINDOW;
-                        if self.pending.replace(block).is_some() {
-                            self.shared.resend_failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                        return;
-                    }
-                }
-            }
+    /// A trailer: the active block ended.
+    fn on_trailer(&mut self, block_id: u64, now: Instant) -> Option<(Vec<u8>, FrameGeometry)> {
+        if self.active.as_ref().is_some_and(|b| b.id == block_id) {
+            let b = self.active.take().unwrap();
+            return self.boundary(b, now);
         }
-        let counter = if block.attempts > 0 { &self.shared.resend_failed } else { &self.shared.dropped };
-        counter.fetch_add(1, Ordering::Relaxed);
+        None
     }
 
-    /// Once the pending block's window passes: retry (attempts permitting) or
-    /// give up.
-    fn expire_pending(&mut self, now: Instant) {
-        if self.pending.as_ref().is_some_and(|b| now >= b.deadline) {
-            let block = self.pending.take().unwrap();
-            self.request_or_drop(block);
+    /// The block's packets stopped (its trailer, or the next block's leader).
+    /// Complete → the frame. Gaps → ask the camera and hold the block open
+    /// among the pending ones. Otherwise it is given up.
+    fn boundary(&mut self, mut block: Block, now: Instant) -> Option<(Vec<u8>, FrameGeometry)> {
+        if block.is_complete() {
+            if block.requests > 0 {
+                self.shared.resend_recovered.fetch_add(1, Ordering::Relaxed);
+            }
+            return block.finish();
+        }
+        if !self.resend_on() || !block.resendable() {
+            abandon_block(&self.shared, block);
+            return None;
+        }
+        block.end(now);
+        let sender = self.resend.as_mut().expect("resend_on");
+        if block.abandoned || !block.service(now, &self.policy, sender, &self.shared) {
+            abandon_block(&self.shared, block);
+            return None;
+        }
+        self.pending.push_back(block);
+        if self.pending.len() > RESEND_PENDING_MAX {
+            let oldest = self.pending.pop_front().unwrap();
+            abandon_block(&self.shared, oldest);
+        }
+        None
+    }
+
+    /// Send due resend requests and give up on blocks that ran out of time
+    /// or attempts. Called per packet and on every idle timeout; throttled.
+    fn service(&mut self, now: Instant) {
+        if now < self.next_service {
+            return;
+        }
+        self.next_service = now + RESEND_SERVICE_INTERVAL;
+        if !self.resend_on() {
+            return;
+        }
+        let sender = self.resend.as_mut().expect("resend_on");
+        if let Some(b) = self.active.as_mut() {
+            if !b.abandoned && !b.service(now, &self.policy, sender, &self.shared) {
+                b.abandoned = true;
+            }
+        }
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].service(now, &self.policy, sender, &self.shared) {
+                i += 1;
+            } else {
+                let b = self.pending.remove(i).unwrap();
+                abandon_block(&self.shared, b);
+            }
         }
     }
 }
 
-/// The receive thread: drain the GVSP socket, reassemble, and hand complete raw
-/// frames to the control thread. It does nothing else — no GVCP, no decode — so
-/// a burst is only ever competing with a memcpy for the socket buffer. Frames
-/// the decoder hasn't picked up yet are dropped, never queued.
+/// The receive thread: drain the GVSP socket, reassemble, request resends,
+/// and hand complete raw frames to the control thread. It does nothing else —
+/// no GVCP transactions, no decode — so a burst is only ever competing with a
+/// memcpy for the socket buffer. Frames the decoder hasn't picked up yet are
+/// dropped, never queued.
 fn rx_thread(
     socket: GvspSocket,
     mut rx: RxState,
@@ -1024,21 +1285,6 @@ fn rx_thread(
         if let Some(frame) = receive_until_frame(&socket, &mut buf, &mut rx, &log_tx) {
             rx.shared.completed.fetch_add(1, Ordering::Relaxed);
             let _ = raw_tx.try_send(frame);
-        }
-    }
-}
-
-/// Send one PACKETRESEND per range on the control socket — the one holding
-/// the privilege the camera requires — fire-and-forget (see
-/// `Device::request_resend_noack`). The `resend_recovered` counter is the
-/// only confirmation the camera honors it.
-fn issue_resends(dev: &mut Device, req: ResendReq, shared: &RxShared) {
-    if !shared.resend_enabled.load(Ordering::Relaxed) {
-        return;
-    }
-    for (first, last) in req.ranges {
-        if dev.request_resend_noack(req.block_id, first, last).is_err() {
-            return;
         }
     }
 }
@@ -1064,12 +1310,30 @@ fn capture_loop(
     // Start the receive thread before acquisition so the first packets land
     // in a drained socket. The control thread keeps a clone for hole-punching.
     let punch_socket = socket.try_clone_sender().ok();
-    let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
-    let rx = RxState::with_resend(packet_payload, resend_tx);
+    // Resend requests leave straight from the receive thread on a clone of
+    // the control socket: the camera only buffers a frame or two, so the
+    // request has to beat the next frame, not wait for this thread.
+    let mut rx = match dev.resend_sender(STREAM_CHANNEL as u16) {
+        Ok(sender) => RxState::with_resend(packet_payload, sender),
+        Err(e) => {
+            let _ = log_tx.try_send(LogEntry::warn(format!(
+                "GigE: packet resend unavailable (control socket clone failed: {e})"
+            )));
+            RxState::new(packet_payload)
+        }
+    };
+    rx.policy = ResendPolicy::from_env();
     let shared = Arc::clone(&rx.shared);
     if std::env::var("GEV_RESEND").is_ok_and(|v| v.trim() == "0") {
         shared.resend_enabled.store(false, Ordering::Relaxed);
         let _ = log_tx.try_send(LogEntry::info("GigE: packet resend disabled by GEV_RESEND=0".into()));
+    } else if rx.resend.is_some() {
+        let _ = log_tx.try_send(LogEntry::info(format!(
+            "GigE: packet resend on: gaps requested as seen, {} attempts {} ms apart, up to {} blocks held open",
+            rx.policy.attempts,
+            rx.policy.retry.as_millis(),
+            RESEND_PENDING_MAX
+        )));
     }
     let stop = Arc::new(AtomicBool::new(false));
     let (raw_tx, raw_rx) = bounded::<(Vec<u8>, FrameGeometry)>(2);
@@ -1199,11 +1463,11 @@ fn capture_loop(
             };
             let _ = log_tx.try_send(LogEntry::warn(msg));
         }
-        let recovered = shared.resend_recovered.load(Ordering::Relaxed);
+        let recovered = shared.packets_recovered.load(Ordering::Relaxed);
         if !announced_resend && recovered > 0 {
             announced_resend = true;
             let _ = log_tx.try_send(LogEntry::info(format!(
-                "{cam_name}: packet resend is working (a frame completed after retransmission)"
+                "{cam_name}: packet resend is working (a retransmitted packet arrived)"
             )));
         }
         if !warned_resend_silent && recovered == 0
@@ -1211,17 +1475,16 @@ fn capture_loop(
         {
             warned_resend_silent = true;
             let _ = log_tx.try_send(LogEntry::warn(format!(
-                "{cam_name}: {} resend requests sent, none recovered a frame — the camera is not honoring \
+                "{cam_name}: {} resend requests sent, no packet retransmitted — the camera is not honoring \
                  PACKETRESEND (unsupported, or it requires the primary control port)",
                 RESEND_SILENT_AFTER
             )));
         }
         tr.ctl += t_loop.elapsed();
 
-        // 3. Wait for the receive thread to complete a frame, relay a resend
-        //    request (it must go out on this privileged socket, and quickly —
-        //    the camera only buffers a frame or two), or let the poll window
-        //    expire. Decoding happens here so it never stalls the socket.
+        // 3. Wait for the receive thread to complete a frame, or let the poll
+        //    window expire. Decoding happens here so it never stalls the
+        //    socket.
         let (payload, g) = select! {
             recv(raw_rx) -> msg => match msg {
                 Ok(frame) => frame,
@@ -1230,13 +1493,6 @@ fn capture_loop(
                     shutdown(&mut dev, &mut genapi);
                     return;
                 }
-            },
-            recv(resend_rx) -> req => {
-                if let Ok(req) = req {
-                    issue_resends(&mut dev, req, &shared);
-                }
-                trace_tick(trace, &mut tr, &shared, frames, &log_tx);
-                continue;
             },
             default(POLL_TIMEOUT) => {
                 trace_tick(trace, &mut tr, &shared, frames, &log_tx);
@@ -1311,13 +1567,15 @@ fn trace_tick(enabled: bool, tr: &mut TraceAcc, shared: &RxShared, decoded: u64,
     let completed = shared.completed.load(Ordering::Relaxed);
     let _ = log_tx.try_send(LogEntry::info(format!(
         "trace: {} pkt/s, {} frames completed, {} decoded, control {} ms, decode {} ms; \
-         dropped {}, resend req {} / recovered {} / failed {}",
+         dropped {}, resend req {} / frames recovered {} / failed {}, packets recovered {} / lost {}",
         packets - tr.packets, completed - tr.completed, decoded - tr.decoded,
         tr.ctl.as_millis(), tr.decode.as_millis(),
         shared.dropped.load(Ordering::Relaxed),
         shared.resend_requests.load(Ordering::Relaxed),
         shared.resend_recovered.load(Ordering::Relaxed),
         shared.resend_failed.load(Ordering::Relaxed),
+        shared.packets_recovered.load(Ordering::Relaxed),
+        shared.packets_lost.load(Ordering::Relaxed),
     )));
     *tr = TraceAcc { since: Instant::now(), ctl: Duration::ZERO, decode: Duration::ZERO, packets, completed, decoded };
 }
@@ -1397,7 +1655,7 @@ fn receive_until_frame(
             Err(e) => match e.kind() {
                 // Read timeout: the poll window is over.
                 ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                    rx.expire_pending(Instant::now());
+                    rx.service(Instant::now());
                     return None;
                 }
                 // Windows reports an ICMP port-unreachable for an earlier send
@@ -1412,73 +1670,26 @@ fn receive_until_frame(
             },
         };
         rx.shared.packets.fetch_add(1, Ordering::Relaxed);
+        let extended_ids = gvsp::has_extended_ids(pkt);
         let packet = match gvsp::parse_packet(pkt) {
             Ok(p) => p,
             Err(_) => continue,
         };
+        let now = Instant::now();
         let out = match packet {
-            GvspPacket::Leader { block_id, width, height, pixel_format, .. } => {
-                let g = FrameGeometry { width, height, pixel_format };
-                // A new block while the last is unfinished means its trailer
-                // was lost: that is the old block's boundary.
-                let finished = match rx.active.take() {
-                    Some(old) => rx.boundary(old),
-                    None => None,
-                };
-                rx.active = Some(Block::new(block_id, g, rx.stride));
-                finished
+            GvspPacket::Leader { block_id, width, height, pixel_format } => {
+                rx.on_leader(block_id, FrameGeometry { width, height, pixel_format }, extended_ids, now)
             }
-            GvspPacket::Payload { block_id, packet_id, data } => {
-                if rx.active.as_ref().is_some_and(|b| b.id == block_id) {
-                    let b = rx.active.as_mut().unwrap();
-                    // The wire is the authority on the stride: the first payload
-                    // packet of a block is full-sized unless the whole frame fits
-                    // in one packet, and any packet larger than the assumed
-                    // stride proves the assumption wrong. Re-seat the block.
-                    let total = frame_payload_bytes(b.geom.pixel_format, b.geom.width as usize * b.geom.height as usize);
-                    let wire = data.len();
-                    if wire != rx.stride && wire < total && (packet_id == 1 || wire > rx.stride) {
-                        let _ = log_tx.try_send(LogEntry::warn(format!(
-                            "GigE: GVSP payload stride corrected {} -> {} B/packet (camera's packet size \
-                             differs from the negotiated value)",
-                            rx.stride, wire
-                        )));
-                        rx.stride = wire;
-                        *b = Block::new(block_id, b.geom, wire);
-                    }
-                    b.ingest(packet_id, data);
-                    None
-                } else if rx.pending.as_ref().is_some_and(|b| b.id == block_id) {
-                    // A resent packet for the block we asked about.
-                    let complete = {
-                        let b = rx.pending.as_mut().unwrap();
-                        b.ingest(packet_id, data);
-                        b.is_complete()
-                    };
-                    if complete {
-                        rx.shared.resend_recovered.fetch_add(1, Ordering::Relaxed);
-                        rx.pending.take().and_then(Block::finish)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            GvspPacket::Payload { block_id, packet_id, status, data } => {
+                rx.on_payload(block_id, packet_id, status, data, now, log_tx)
             }
-            GvspPacket::Trailer { block_id, .. } => {
-                if rx.active.as_ref().is_some_and(|b| b.id == block_id) {
-                    let b = rx.active.take().unwrap();
-                    rx.boundary(b)
-                } else {
-                    None
-                }
-            }
+            GvspPacket::Trailer { block_id } => rx.on_trailer(block_id, now),
         };
-        rx.expire_pending(Instant::now());
+        rx.service(now);
         if out.is_some() {
             return out;
         }
-        if Instant::now() >= deadline {
+        if now >= deadline {
             return None;
         }
     }
@@ -1773,7 +1984,8 @@ mod tests {
         }
     }
 
-    fn resend_packet(tx: &UdpSocket, dst: SocketAddr, block: u16, image: &[u8], stride: usize, id: u32) {
+    /// One payload packet of `block` (also how a retransmission looks).
+    fn send_packet(tx: &UdpSocket, dst: SocketAddr, block: u16, image: &[u8], stride: usize, id: u32) {
         let start = (id as usize - 1) * stride;
         let end = (start + stride).min(image.len());
         let mut v = header(0x03, block, id);
@@ -1781,60 +1993,271 @@ mod tests {
         tx.send_to(&v, dst).unwrap();
     }
 
-    /// 100x120 Mono8: 12,000 bytes, nine 1464-byte packets, so one lost packet
-    /// is 11% of the frame — under the resend guard.
+    /// A payload-format packet carrying only a status: the camera's reply to
+    /// a request for a packet it cannot supply.
+    fn status_reply(block: u16, id: u32, status: u16) -> Vec<u8> {
+        let mut v = header(0x03, block, id);
+        v[0..2].copy_from_slice(&status.to_be_bytes());
+        v
+    }
+
+    /// Extended-ID (GigE Vision 2.0) header: 20 bytes, 64-bit block id.
+    fn header_ext(format: u8, block: u64, packet_id: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 8];
+        v[4] = format | 0x80;
+        v.extend_from_slice(&block.to_be_bytes());
+        v.extend_from_slice(&packet_id.to_be_bytes());
+        v
+    }
+
+    /// Like `send_block` with extended ids.
+    fn send_block_ext(tx: &UdpSocket, dst: SocketAddr, block: u64, image: &[u8], stride: usize, skip: &[u32]) {
+        let (w, h) = (100u32, 120u32);
+        let mut l = header_ext(0x01, block, 0);
+        l.extend_from_slice(&[0, 0]);
+        l.extend_from_slice(&1u16.to_be_bytes());
+        l.extend_from_slice(&0u64.to_be_bytes());
+        l.extend_from_slice(&MONO8.to_be_bytes());
+        l.extend_from_slice(&w.to_be_bytes());
+        l.extend_from_slice(&h.to_be_bytes());
+        tx.send_to(&l, dst).unwrap();
+        let mut id = 1u32;
+        for chunk in image.chunks(stride) {
+            if !skip.contains(&id) {
+                let mut v = header_ext(0x03, block, id);
+                v.extend_from_slice(chunk);
+                tx.send_to(&v, dst).unwrap();
+            }
+            id += 1;
+        }
+        let mut t = header_ext(0x02, block, id);
+        t.extend_from_slice(&[0, 0]);
+        t.extend_from_slice(&1u16.to_be_bytes());
+        t.extend_from_slice(&h.to_be_bytes());
+        tx.send_to(&t, dst).unwrap();
+    }
+
+    /// 100x120 Mono8: 12,000 bytes, nine 1464-byte packets.
     fn test_image() -> Vec<u8> {
         (0..12_000usize).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    /// Loopback stand-ins for the camera: `tx` streams GVSP to the receiver,
+    /// `cam` is the control endpoint that receives PACKETRESEND commands.
+    struct Bench {
+        rx_sock: GvspSocket,
+        tx: UdpSocket,
+        dst: SocketAddr,
+        cam: UdpSocket,
+        rx: RxState,
+        buf: RecvBuf,
+        log_tx: Sender<LogEntry>,
+        _log_rx: Receiver<LogEntry>,
+    }
+
+    impl Bench {
+        fn new(read_timeout: Duration) -> Self {
+            let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
+            rx_sock.set_read_timeout(Some(read_timeout)).unwrap();
+            let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let dst = rx_sock.local_addr().unwrap();
+            let cam = UdpSocket::bind("127.0.0.1:0").unwrap();
+            cam.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let sender = ResendSender::to(cam.local_addr().unwrap(), STREAM_CHANNEL as u16).unwrap();
+            let (log_tx, _log_rx) = bounded::<LogEntry>(64);
+            let mut rx = RxState::with_resend(1464, sender);
+            // No settling delay; retries slower than a receive call's timeout
+            // so a test sees exactly the requests it provokes.
+            rx.policy = ResendPolicy { delay: Duration::ZERO, retry: Duration::from_millis(200), attempts: 3 };
+            Self { rx_sock, tx, dst, cam, rx, buf: RecvBuf::new(), log_tx, _log_rx }
+        }
+
+        fn receive(&mut self) -> Option<Vec<u8>> {
+            receive_until_frame(&self.rx_sock, &mut self.buf, &mut self.rx, &self.log_tx).map(|(p, _)| p)
+        }
+
+        /// The next PACKETRESEND at the control endpoint: (block, first, last, extended).
+        fn request(&self) -> (u64, u32, u32, bool) {
+            let mut b = [0u8; 64];
+            let n = self.cam.recv(&mut b).expect("a PACKETRESEND command");
+            let r = gvcp::decode_packet_resend(&b[..n]).expect("a well-formed PACKETRESEND");
+            (r.block_id, r.first, r.last, r.extended)
+        }
+
+        fn no_request_within(&self, wait: Duration) -> bool {
+            self.cam.set_read_timeout(Some(wait)).unwrap();
+            let none = self.cam.recv(&mut [0u8; 64]).is_err();
+            self.cam.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            none
+        }
+
+        fn counts(&self) -> (u64, u64, u64, u64, u64, u64) {
+            let s = &self.rx.shared;
+            (
+                s.resend_requests.load(Ordering::Relaxed),
+                s.resend_recovered.load(Ordering::Relaxed),
+                s.resend_failed.load(Ordering::Relaxed),
+                s.dropped.load(Ordering::Relaxed),
+                s.packets_recovered.load(Ordering::Relaxed),
+                s.packets_lost.load(Ordering::Relaxed),
+            )
+        }
     }
 
     #[test]
     fn gap_at_trailer_requests_resend_and_completes_when_it_arrives() {
         let image = test_image();
-        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
-        rx_sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dst = rx_sock.local_addr().unwrap();
-        let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
-        let (log_tx, _log_rx) = bounded::<LogEntry>(16);
-        let mut rx = RxState::with_resend(1464, resend_tx);
-        let mut buf = RecvBuf::new();
+        let mut b = Bench::new(Duration::from_millis(50));
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[2], true);
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (7, 2, 2, false));
+        assert_eq!(b.rx.pending.len(), 1, "block held open awaiting the resend");
 
-        send_block(&tx, dst, 7, &image, 1464, &[2], true);
-        assert!(receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).is_none());
-        let req = resend_rx.try_recv().expect("a resend request at the trailer");
-        assert_eq!(req.block_id, 7);
-        assert_eq!(req.ranges, vec![(2, 2)]);
-        assert!(rx.pending.is_some(), "block held open awaiting the resend");
+        send_packet(&b.tx, b.dst, 7, &image, 1464, 2);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+        assert!(b.rx.pending.is_empty());
+        assert_eq!(b.counts(), (1, 1, 0, 0, 1, 0));
+    }
 
-        resend_packet(&tx, dst, 7, &image, 1464, 2);
-        let got = receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).map(|(p, _)| p);
-        assert_eq!(got.as_deref(), Some(&image[..]));
-        assert_eq!(rx.shared.resend_recovered.load(Ordering::Relaxed), 1);
+    #[test]
+    fn adjacent_gaps_are_requested_as_one_range() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(50));
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[4, 5], true);
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (7, 4, 5, false));
+        send_packet(&b.tx, b.dst, 7, &image, 1464, 4);
+        send_packet(&b.tx, b.dst, 7, &image, 1464, 5);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+        assert_eq!(b.counts(), (1, 1, 0, 0, 2, 0));
+    }
+
+    #[test]
+    fn mid_block_gap_is_requested_before_the_trailer() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(50));
+        b.tx.send_to(&leader(7, 100, 120), b.dst).unwrap();
+        for id in [1u32, 2, 4, 5, 6] {
+            send_packet(&b.tx, b.dst, 7, &image, 1464, id);
+        }
+        // The stream pauses with the block still open: the gap at 3 is asked
+        // for without waiting for a trailer.
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (7, 3, 3, false));
+        assert!(b.rx.active.as_ref().is_some_and(|a| a.id == 7 && !a.ended));
+
+        for id in [3u32, 7, 8, 9] {
+            send_packet(&b.tx, b.dst, 7, &image, 1464, id);
+        }
+        b.tx.send_to(&trailer(7, 10, 120), b.dst).unwrap();
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+        assert_eq!(b.counts(), (1, 1, 0, 0, 1, 0));
     }
 
     #[test]
     fn lost_trailer_requests_resend_at_the_next_leader() {
         let image = test_image();
-        let rx_sock = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
-        rx_sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dst = rx_sock.local_addr().unwrap();
-        let (resend_tx, resend_rx) = bounded::<ResendReq>(8);
-        let (log_tx, _log_rx) = bounded::<LogEntry>(16);
-        let mut rx = RxState::with_resend(1464, resend_tx);
-        let mut buf = RecvBuf::new();
-
+        let mut b = Bench::new(Duration::from_millis(50));
         // Block 7 loses packet 3 and its trailer; block 8's leader follows.
-        send_block(&tx, dst, 7, &image, 1464, &[3], false);
-        tx.send_to(&leader(8, 100, 120), dst).unwrap();
-        assert!(receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).is_none());
-        let req = resend_rx.try_recv().expect("resend requested when the next leader arrived");
-        assert_eq!((req.block_id, req.ranges.clone()), (7, vec![(3, 3)]));
-        assert!(rx.active.as_ref().is_some_and(|b| b.id == 8), "block 8 is now active");
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[3], false);
+        b.tx.send_to(&leader(8, 100, 120), b.dst).unwrap();
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (7, 3, 3, false));
+        assert!(b.rx.active.as_ref().is_some_and(|a| a.id == 8), "block 8 is now active");
+        assert_eq!(b.rx.pending.len(), 1);
 
-        resend_packet(&tx, dst, 7, &image, 1464, 3);
-        let got = receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx).map(|(p, _)| p);
-        assert_eq!(got.as_deref(), Some(&image[..]));
+        send_packet(&b.tx, b.dst, 7, &image, 1464, 3);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+    }
+
+    #[test]
+    fn retries_then_gives_up() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(5));
+        b.rx.policy.retry = Duration::from_millis(10);
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[5], true);
+        assert!(b.receive().is_none());
+        assert_eq!(b.rx.pending.len(), 1);
+        // Nothing answers; keep servicing the timers until the block is given up.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !b.rx.pending.is_empty() && Instant::now() < deadline {
+            assert!(b.receive().is_none());
+        }
+        assert!(b.rx.pending.is_empty(), "given up after the attempts ran out");
+        let mut requests = 0;
+        while !b.no_request_within(Duration::from_millis(30)) {
+            requests += 1;
+        }
+        assert_eq!(requests, 3, "one request per attempt");
+        assert_eq!(b.counts(), (3, 0, 1, 0, 0, 1));
+    }
+
+    #[test]
+    fn unavailable_status_abandons_the_block_without_retries() {
+        let image = test_image();
+        // Receive calls shorter than the retry interval, so the first call
+        // sends exactly one request and the camera's reply is processed
+        // before a retry falls due.
+        let mut b = Bench::new(Duration::from_millis(5));
+        b.rx.policy.retry = Duration::from_millis(10);
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[5], true);
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (7, 5, 5, false));
+        // The camera no longer has packet 5.
+        b.tx.send_to(&status_reply(7, 5, gvsp::STATUS_PACKET_UNAVAILABLE), b.dst).unwrap();
+        assert!(b.receive().is_none());
+        assert!(b.rx.pending.is_empty(), "abandoned on the camera's word");
+        assert!(b.no_request_within(Duration::from_millis(60)), "no retry after a final status");
+        let (req, _, failed, dropped, recovered, lost) = b.counts();
+        assert_eq!((req, failed, dropped, recovered, lost), (1, 1, 0, 0, 1));
+    }
+
+    #[test]
+    fn several_blocks_stay_pending_and_complete_out_of_order() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(50));
+        send_block(&b.tx, b.dst, 7, &image, 1464, &[2], true);
+        send_block(&b.tx, b.dst, 8, &image, 1464, &[4], true);
+        send_block(&b.tx, b.dst, 9, &image, 1464, &[], true);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]), "block 9 completes at once");
+        assert_eq!(b.rx.pending.iter().map(|p| p.id).collect::<Vec<_>>(), [7, 8]);
+        assert_eq!(b.request(), (7, 2, 2, false));
+        assert_eq!(b.request(), (8, 4, 4, false));
+
+        send_packet(&b.tx, b.dst, 8, &image, 1464, 4);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+        assert_eq!(b.rx.pending.iter().map(|p| p.id).collect::<Vec<_>>(), [7]);
+        send_packet(&b.tx, b.dst, 7, &image, 1464, 2);
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
+        assert!(b.rx.pending.is_empty());
+        assert_eq!(b.counts(), (2, 2, 0, 0, 2, 0));
+    }
+
+    #[test]
+    fn the_pending_ring_gives_up_the_oldest_block() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(50));
+        for block in 1..=(RESEND_PENDING_MAX as u16 + 1) {
+            send_block(&b.tx, b.dst, block, &image, 1464, &[3], true);
+        }
+        assert!(b.receive().is_none());
+        assert_eq!(b.rx.pending.len(), RESEND_PENDING_MAX);
+        assert_eq!(b.rx.pending.front().map(|p| p.id), Some(2), "block 1 was evicted");
+        let (req, _, failed, dropped, _, lost) = b.counts();
+        assert_eq!((req, failed, dropped, lost), (5, 1, 0, 1));
+    }
+
+    #[test]
+    fn extended_id_blocks_get_extended_requests() {
+        let image = test_image();
+        let mut b = Bench::new(Duration::from_millis(50));
+        send_block_ext(&b.tx, b.dst, 70_000, &image, 1464, &[5]);
+        assert!(b.receive().is_none());
+        assert_eq!(b.request(), (70_000, 5, 5, true));
+        let mut v = header_ext(0x03, 70_000, 5);
+        v.extend_from_slice(&image[4 * 1464..5 * 1464]);
+        b.tx.send_to(&v, b.dst).unwrap();
+        assert_eq!(b.receive().as_deref(), Some(&image[..]));
     }
 
     #[test]
@@ -1853,14 +2276,8 @@ mod tests {
         let got = receive_until_frame(&rx_sock, &mut buf, &mut rx, &log_tx);
         assert!(got.is_some_and(|(_, g)| g.width == 100), "block 8 completes");
         assert_eq!(rx.shared.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.shared.packets_lost.load(Ordering::Relaxed), 1);
         assert_eq!(rx.shared.resend_requests.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn coalesce_merges_nearby_gaps_into_one_based_ranges() {
-        // 0-based missing indices 1, 2, 5 and 40..=41 → packet ids 2-6 (merged) and 41-42.
-        let ranges = coalesce_ranges(vec![1..=2, 5..=5, 40..=41]);
-        assert_eq!(ranges, vec![(2, 6), (41, 42)]);
     }
 
     #[test]

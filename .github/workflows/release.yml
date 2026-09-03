@@ -187,6 +187,18 @@ jobs:
         shell: bash
         run: cargo build --release --features "$FEATURES"
 
+      # The GigE transport's loopback tests (GVSP reassembly, packet resend,
+      # Windows control-message parsing, Linux recvmmsg batching) exercise
+      # platform-specific receive code that only runs for real on these
+      # runners. The vendor-SDK features are left out so the test binary needs
+      # no runtime DLLs; the release profile reuses the dependencies the build
+      # step just compiled.
+      - name: Test
+        shell: bash
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --release --features gev
+
       - name: Package (macOS)
         if: matrix.name == 'macos'
         shell: bash

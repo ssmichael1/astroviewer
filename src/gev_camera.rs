@@ -917,8 +917,8 @@ impl Default for RxShared {
 }
 
 /// UDP source ports GigE cameras are commonly seen streaming from (the Hawk
-/// uses 1051, 1054, …). Sprayed with one-byte punches only while no packet has
-/// arrived and the camera reports `GevSCSP` = 0.
+/// uses 1051, 1054, …). Sprayed with one-byte punches while no packet has
+/// arrived, whatever `GevSCSP` claims: the Hawk reports the host port there.
 const PUNCH_SPRAY_PORTS: std::ops::RangeInclusive<u16> = 1024..=2048;
 
 /// How often resend timers are looked at while packets are flowing; they are
@@ -1683,16 +1683,16 @@ fn punch_stream_port(
         }
     };
     let Some(s) = socket else { return port };
-    match port {
-        Some(p) => {
+    if let Some(p) = port {
+        let _ = s.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
+    }
+    // Until a packet has arrived the port is a guess — `GevSCSP` on the Hawk
+    // reads back the *host* port it was just given — so keep spraying the
+    // range cameras actually stream from; one packet through settles it.
+    if shared.packets.load(Ordering::Relaxed) == 0 {
+        for p in PUNCH_SPRAY_PORTS {
             let _ = s.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
         }
-        None if shared.packets.load(Ordering::Relaxed) == 0 => {
-            for p in PUNCH_SPRAY_PORTS {
-                let _ = s.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
-            }
-        }
-        None => {}
     }
     port
 }

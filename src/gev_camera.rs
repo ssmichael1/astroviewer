@@ -86,6 +86,22 @@ const SCPD_REGISTER: u32 = 0x0d08;
 /// silence diagnostic: if it still holds our host IP, the stream was
 /// configured and the silence is the camera's, not a lost configuration.
 const SCDA_REGISTER: u32 = 0x0d18;
+/// Stream channel 0 host-port register (`GevSCPHostPort`). Raw-writing this to
+/// 0 is how aravis stops a stream channel (it tells the camera the
+/// destination is gone) without touching any other register.
+const SCP_HOSTPORT_REGISTER: u32 = 0x0d00;
+
+/// An on/off knob read from the environment, defaulting to `default` when the
+/// variable is unset. `1`/`true`/`yes`/`on` (case-insensitive) is on, anything
+/// else is off. Used to A/B the connect and teardown sequences against a
+/// camera whose stream engine wedges (see the `GEV_STOP_*` / `GEV_TLLOCK`
+/// diagnostics in the connect log).
+fn env_on(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
+}
 /// Packet resend, the policy eBUS applies: a gap is requested as soon as the
 /// packet after it arrives (after `RESEND_DELAY`, for a reordered packet to
 /// show up), re-requested every `RESEND_RETRY` until `RESEND_ATTEMPTS` are
@@ -1439,19 +1455,52 @@ fn capture_loop(
             .spawn(move || rx_thread(socket, rx, raw_tx, stop, log_tx))
             .ok()
     };
+    // Teardown sequence, each step gated so we can find which one wedges a
+    // camera's stream engine (the Hawk stalls until power-cycled after a full
+    // teardown, though the GenICam Stop/Start commands alone are clean).
+    // Defaults reproduce the historical behavior; the aravis-style teardown is
+    //   GEV_STOP_UNLOCK=0 GEV_STOP_ZERO_HOSTPORT=1
+    // (never unlock the transport; stop the channel by zeroing GevSCPHostPort).
+    //   GEV_STOP_ACQSTOP   (default 1) send AcquisitionStop
+    //   GEV_STOP_UNLOCK    (default 1) set TLParamsLocked=0
+    //   GEV_STOP_ZERO_HOSTPORT (default 0) raw-write GevSCPHostPort=0 (aravis)
+    //   GEV_STOP_RELEASE   (default 1) release control privilege
+    let stop_acqstop = env_on("GEV_STOP_ACQSTOP", true);
+    let stop_unlock = env_on("GEV_STOP_UNLOCK", true);
+    let stop_zero_hostport = env_on("GEV_STOP_ZERO_HOSTPORT", false);
+    let stop_release = env_on("GEV_STOP_RELEASE", true);
     let shutdown = |dev: &mut Device, genapi: &mut Option<GenApi>| {
         stop.store(true, Ordering::Relaxed);
         if let Some(g) = genapi.as_mut() {
-            execute_command(g, dev, "AcquisitionStop", &log_tx);
-            set_int_feature(g, dev, "TLParamsLocked", 0, &log_tx);
+            if stop_acqstop {
+                execute_command(g, dev, "AcquisitionStop", &log_tx);
+            }
+            if stop_unlock {
+                set_int_feature(g, dev, "TLParamsLocked", 0, &log_tx);
+            }
         }
-        let _ = dev.release_control();
+        if stop_zero_hostport {
+            let _ = dev.write_register(SCP_HOSTPORT_REGISTER, 0);
+        }
+        let _ = log_tx.try_send(LogEntry::info(format!(
+            "GigE: teardown (acqstop={stop_acqstop}, unlock={stop_unlock}, zero_hostport={stop_zero_hostport}, release={stop_release})"
+        )));
+        if stop_release {
+            let _ = dev.release_control();
+        }
     };
 
     // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
-    // the stream transport — required by FLIR/Point Grey before frames flow.
+    // the stream transport — required by FLIR/Point Grey before frames flow,
+    // but aravis never touches TLParamsLocked and is a suspect for wedging the
+    // Hawk. GEV_TLLOCK=0 skips it (aravis-style) to test that.
+    let use_tllock = env_on("GEV_TLLOCK", true);
     if let Some(g) = genapi.as_mut() {
-        set_int_feature(g, &mut dev, "TLParamsLocked", 1, &log_tx);
+        if use_tllock {
+            set_int_feature(g, &mut dev, "TLParamsLocked", 1, &log_tx);
+        } else {
+            let _ = log_tx.try_send(LogEntry::info("GigE: GEV_TLLOCK=0: leaving TLParamsLocked untouched (aravis-style)".into()));
+        }
         execute_command(g, &mut dev, "AcquisitionStart", &log_tx);
     }
     // Open the reverse path through stateful host firewalls (Windows Defender
@@ -1991,7 +2040,9 @@ fn apply_set(g: &mut GenApi, dev: &mut Device, cmd: GevCmd, log_tx: &Sender<LogE
         GevCmd::Pause | GevCmd::Resume | GevCmd::Stop => {}
     }
     if restart {
-        set_int_feature(g, dev, "TLParamsLocked", 1, log_tx);
+        if env_on("GEV_TLLOCK", true) {
+            set_int_feature(g, dev, "TLParamsLocked", 1, log_tx);
+        }
         execute_command(g, dev, "AcquisitionStart", log_tx);
     }
 }

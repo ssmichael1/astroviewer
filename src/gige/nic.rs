@@ -12,6 +12,17 @@ use std::time::Duration;
 use if_addrs::{get_if_addrs, IfAddr};
 use socket2::{Domain, Protocol, Socket, Type};
 
+/// The OS's batched receive, where it has one: `recvmmsg` on Linux,
+/// `recvmsg_x` on macOS. Windows batches differently (coalescing).
+#[cfg(target_os = "linux")]
+use super::linux::Batcher;
+#[cfg(target_os = "macos")]
+use super::macos::Batcher;
+#[cfg(target_os = "linux")]
+const BATCH_MECHANISM: &str = "recvmmsg";
+#[cfg(target_os = "macos")]
+const BATCH_MECHANISM: &str = "recvmsg_x";
+
 /// Largest packet an IPv4 datagram can carry. The IPv4 total-length field is 16
 /// bits, so no datagram exceeds this regardless of the link MTU. Loopback
 /// routinely reports more (Linux `lo` 65536, macOS `lo0` 16384), and an
@@ -116,9 +127,9 @@ pub fn local_ipv4_towards(target: Ipv4Addr, port: u16) -> Ipv4Addr {
 
 /// Read the link MTU for `iface`.
 ///
-/// Linux reads `/sys/class/net/<if>/mtu`; Windows uses `GetIfEntry2`; every
-/// other platform (macOS included) defaults to the canonical Ethernet MTU.
-/// Mirrors viva-gige `nic::mtu`.
+/// Linux reads `/sys/class/net/<if>/mtu`; Windows uses `GetIfEntry2`; macOS
+/// asks the interface with `SIOCGIFMTU`; every other platform defaults to the
+/// canonical Ethernet MTU. Mirrors viva-gige `nic::mtu`.
 pub fn mtu(iface: &Iface) -> u32 {
     #[cfg(target_os = "linux")]
     {
@@ -144,7 +155,14 @@ pub fn mtu(iface: &Iface) -> u32 {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(mtu) = super::macos::interface_mtu(iface.name()) {
+            return mtu;
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         let _ = iface;
     }
@@ -173,7 +191,7 @@ pub const DATAGRAM_SLOT: usize = 65536;
 
 /// Whether the environment variable `name` is set to `0`: the run-time opt-out
 /// switches for the OS receive extensions.
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn env_is_zero(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v.trim() == "0")
 }
@@ -186,6 +204,7 @@ fn env_is_zero(name: &str) -> bool {
 ///   `GEV_COALESCE=0` skips it), plus ICMP port-unreachable reporting turned
 ///   off — see `winsock`.
 /// * Linux: `recvmmsg` batching (`GEV_BATCH=0` skips it) — see `linux`.
+/// * macOS: `recvmsg_x` batching (`GEV_BATCH=0` skips it) — see `macos`.
 ///
 /// Returns the socket and the receive-buffer size the OS actually granted.
 pub fn bind_gvsp_socket(
@@ -214,14 +233,14 @@ pub fn bind_gvsp_socket(
             Err(e) => (None, format!("off (not available: {e})")),
         }
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let (batch, coalesce_status) = if env_is_zero("GEV_BATCH") {
         (None, "off (GEV_BATCH=0)".to_string())
     } else {
-        let b = super::linux::Batcher::new();
-        (Some(b), format!("batched (recvmmsg, up to {} per call)", b.depth()))
+        let b = Batcher::new();
+        (Some(b), format!("batched ({BATCH_MECHANISM}, up to {} per call)", b.depth()))
     };
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let coalesce_status = "off (not supported on this OS)".to_string();
     socket.bind(&SocketAddr::new(bind, 0).into())?;
     let socket: UdpSocket = socket.into();
@@ -234,7 +253,7 @@ pub fn bind_gvsp_socket(
             inner: socket,
             #[cfg(windows)]
             coalesce,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             batch,
             coalesce_status,
         },
@@ -273,9 +292,9 @@ pub enum Layout {
     /// last possibly shorter; a single datagram has `segment == len`.
     Packed { len: usize, segment: usize },
     /// `count` datagrams at `stride`-byte slots, slot `i` holding `lens[i]`
-    /// bytes of the length table the receive was handed. Produced by `linux`;
-    /// elsewhere only tests build one.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// bytes of the length table the receive was handed. Produced by `linux`
+    /// and `macos`; elsewhere only tests build one.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     Slots { count: usize, stride: usize },
 }
 
@@ -303,14 +322,14 @@ impl Layout {
 
 /// The GVSP receive socket: a blocking UDP socket plus, where the OS offers
 /// one, the extension that lets one receive return many packets (coalescing
-/// on Windows, `recvmmsg` batching on Linux). Read it through a [`RecvBuf`],
+/// on Windows, `recvmmsg` on Linux, `recvmsg_x` on macOS). Read it through a [`RecvBuf`],
 /// which hands such a receive out one datagram at a time.
 pub struct GvspSocket {
     inner: UdpSocket,
     #[cfg(windows)]
     coalesce: Option<super::winsock::Coalescer>,
-    #[cfg(target_os = "linux")]
-    batch: Option<super::linux::Batcher>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    batch: Option<Batcher>,
     coalesce_status: String,
 }
 
@@ -322,7 +341,7 @@ impl GvspSocket {
             inner,
             #[cfg(windows)]
             coalesce: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             batch: None,
             coalesce_status: "off".to_string(),
         }
@@ -346,7 +365,7 @@ impl GvspSocket {
     /// Datagrams one receive may return, each needing a [`DATAGRAM_SLOT`] of
     /// buffer: what a [`RecvBuf`] sizes itself to. One unless batching.
     pub fn batch_depth(&self) -> usize {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(b) = &self.batch {
             return b.depth();
         }
@@ -366,11 +385,11 @@ impl GvspSocket {
         if let Some(c) = &self.coalesce {
             return c.recv(&self.inner, buf).map(Received::layout);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(b) = &self.batch {
             return b.recv(&self.inner, buf, lens);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = lens;
         let (len, src) = self.inner.recv_from(buf)?;
         Ok((Layout::Packed { len, segment: len }, src))
@@ -688,14 +707,14 @@ mod recv_tests {
     /// Datagrams of a frame's shape through a bound (batching) socket arrive
     /// in order and intact. The kernel decides how many share a call; the
     /// test prints the split rather than asserting it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_batched_socket_delivers_every_datagram_in_order() {
+    fn batched_socket_delivers_every_datagram_in_order() {
         let (sock, _) =
             bind_gvsp_socket(IpAddr::V4(Ipv4Addr::LOCALHOST), 1 << 20, Duration::from_millis(500)).unwrap();
         assert!(sock.coalescing());
-        assert_eq!(sock.batch_depth(), super::super::linux::BATCH);
-        assert!(sock.coalescing_status().starts_with("batched (recvmmsg"), "{}", sock.coalescing_status());
+        assert_eq!(sock.batch_depth(), Batcher::new().depth());
+        assert!(sock.coalescing_status().starts_with("batched ("), "{}", sock.coalescing_status());
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dst = sock.local_addr().unwrap();
         // Leader-sized, full payloads, a short last payload, trailer-sized,
@@ -725,17 +744,16 @@ mod recv_tests {
             }
             last_next = rb.next;
         }
-        println!("recvmmsg returned {per_call:?} datagrams per call");
+        println!("{BATCH_MECHANISM} returned {per_call:?} datagrams per call");
         assert_eq!(got, sent.iter().filter(|d| !d.is_empty()).cloned().collect::<Vec<_>>());
         assert_timed_out(rb.next_datagram(&sock).unwrap_err());
     }
 
-    /// A batch depth of one still goes through `recvmmsg`, one datagram per
-    /// call, with the read timeout surfacing as the usual error kind.
-    #[cfg(target_os = "linux")]
+    /// A batch depth of one still goes through the batched call, one datagram
+    /// per call, with the read timeout surfacing as the usual error kind.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn linux_batcher_honors_the_read_timeout() {
-        use super::super::linux::Batcher;
+    fn batcher_honors_the_read_timeout() {
         let inner = UdpSocket::bind("127.0.0.1:0").unwrap();
         inner.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
         let b = Batcher::with_depth(1);
@@ -754,5 +772,14 @@ mod recv_tests {
         let (layout, _) = b.recv(&inner, &mut buf, &mut lens).unwrap();
         assert_eq!(layout, Layout::Slots { count: 1, stride: DATAGRAM_SLOT });
         assert_eq!(&buf[..lens[0]], b"two");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reads_the_interface_mtu() {
+        // Loopback on macOS is 16384; an unknown name is None, not 1500.
+        assert_eq!(super::super::macos::interface_mtu("lo0"), Some(16384));
+        assert_eq!(super::super::macos::interface_mtu("nosuch0"), None);
+        assert_eq!(super::super::macos::interface_mtu(""), None);
     }
 }

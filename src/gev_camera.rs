@@ -40,6 +40,15 @@ use crate::{FrameData, LogEntry};
 /// GVCP Control Channel Privilege register — re-read periodically as a heartbeat
 /// so the camera does not reclaim control from us.
 const CCP_REGISTER: u32 = 0x0a00;
+/// The CCP "control access" bit we hold while streaming (aravis
+/// `ARV_GVBS_CONTROL_CHANNEL_PRIVILEGE_CONTROL = 1 << 1`). If a readback shows
+/// it clear, another application has taken control.
+const CCP_CONTROL_BIT: u32 = 1 << 1;
+/// How many consecutive heartbeat reads may fail (or read back with our control
+/// bit clear) before the session is torn down. A single dropped GVCP datagram
+/// no longer kills a working stream; aravis likewise retries for several
+/// seconds. At the 1 s cadence this tolerates ~3 s of trouble.
+const HEARTBEAT_FAILURE_TOLERANCE: usize = 3;
 /// Bootstrap `GevHeartbeatTimeout` (ms): how long a control lease outlives the
 /// application that stopped heartbeating.
 const HEARTBEAT_TIMEOUT_REGISTER: u32 = 0x0938;
@@ -378,6 +387,111 @@ pub fn start_camera(
     )
 }
 
+/// IP + UDP header overhead: a received test-packet payload is the requested
+/// packet size minus the IP (20) and UDP (8) headers (aravis
+/// `ARV_GVSP_PACKET_UDP_OVERHEAD`).
+const PACKET_PROBE_UDP_OVERHEAD: u32 = 28;
+/// Smallest packet size the probe will settle for — a conservative IPv4 floor
+/// every path carries. Below this we do not bother probing.
+const PACKET_PROBE_FLOOR: u32 = 576;
+/// Per candidate, fire the test packet up to this many times, waiting for a
+/// reply between fires (aravis fires up to 3). One arrival is enough.
+const PACKET_PROBE_FIRES: usize = 3;
+/// How long to wait for the test packet after each fire.
+const PACKET_PROBE_WAIT: Duration = Duration::from_millis(60);
+
+/// Whether a test packet of `candidate` bytes fired now arrives on `socket`
+/// from `cam_ip`. Fires up to [`PACKET_PROBE_FIRES`] times, draining any
+/// late/stale packets whose size does not match the expected `candidate - 28`
+/// payload (aravis' `test_packet_check`). A write failure (the camera does not
+/// implement fire-test) counts as "did not arrive" so the probe falls back.
+fn test_packet_arrives(
+    dev: &mut Device,
+    socket: &GvspSocket,
+    rb: &mut RecvBuf,
+    channel: u32,
+    candidate: u32,
+    cam_ip: Ipv4Addr,
+) -> bool {
+    let want = candidate.saturating_sub(PACKET_PROBE_UDP_OVERHEAD) as usize;
+    for _ in 0..PACKET_PROBE_FIRES {
+        if dev.fire_test_packet(channel, candidate).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + PACKET_PROBE_WAIT;
+        while Instant::now() < deadline {
+            match rb.next_datagram(socket) {
+                // A datagram from the camera of the size we asked for: the path
+                // carries `candidate`. Other datagrams (late packets from an
+                // earlier candidate) are drained until the deadline.
+                Ok((data, src)) if src.ip() == IpAddr::V4(cam_ip) && data.len() == want => return true,
+                Ok(_) => continue,
+                Err(_) => break, // timed out; fire again
+            }
+        }
+    }
+    false
+}
+
+/// Probe the largest GVSP packet size the *path* to the camera actually
+/// carries (aravis `auto_packet_size`), leaving that size in `GevSCPSPacketSize`.
+/// Runs after the stream destination/host-port are set (so the test packet is
+/// routed to `socket`) and before acquisition starts. Returns the size settled
+/// on. `ceil` is the MTU-derived size already negotiated; on an inconclusive
+/// probe (a camera that ignores fire-test packets — some do) the register is
+/// restored to `ceil` and that is returned, so the stream is never left
+/// unconfigured and the default never regresses.
+fn probe_packet_size(
+    dev: &mut Device,
+    socket: &GvspSocket,
+    channel: u32,
+    ceil: u32,
+    cam_ip: Ipv4Addr,
+    log_tx: &Sender<LogEntry>,
+) -> u32 {
+    if ceil < PACKET_PROBE_FLOOR {
+        return ceil; // a sub-576 link: nothing to search
+    }
+    let mut rb = RecvBuf::new();
+    // Widen the read timeout for the duration of the probe, then restore it.
+    let _ = socket.set_read_timeout(Some(PACKET_PROBE_WAIT));
+    let chosen = gvcp::largest_carried_packet_size(PACKET_PROBE_FLOOR, ceil, |candidate| {
+        test_packet_arrives(dev, socket, &mut rb, channel, candidate, cam_ip)
+    });
+    let _ = socket.set_read_timeout(Some(RX_POLL_TIMEOUT));
+
+    match chosen {
+        Some(size) => {
+            // Settle on the probed size, flag bits cleared.
+            match dev.set_stream_packet_size(channel, size) {
+                Ok(()) => {
+                    let _ = log_tx.try_send(LogEntry::info(format!(
+                        "GigE: probed max packet size = {size} (path carries it)"
+                    )));
+                    size
+                }
+                Err(e) => {
+                    let _ = log_tx.try_send(LogEntry::warn(format!(
+                        "GigE: probe chose {size} but writing it back failed ({e}); keeping {ceil}"
+                    )));
+                    let _ = dev.set_stream_packet_size(channel, ceil);
+                    ceil
+                }
+            }
+        }
+        None => {
+            // Inconclusive: restore a clean register at the MTU-derived size
+            // (clearing any do-not-fragment bit our fires may have left).
+            let _ = dev.set_stream_packet_size(channel, ceil);
+            let _ = log_tx.try_send(LogEntry::info(format!(
+                "GigE: packet-size probe inconclusive (camera did not answer test packets); \
+                 using MTU-derived size {ceil}"
+            )));
+            ceil
+        }
+    }
+}
+
 /// Open a GigE camera addressed by an explicit GVCP `SocketAddr`. `start_camera`
 /// wraps this with the well-known port; tests use it to target a simulator on a
 /// non-standard port.
@@ -483,9 +597,23 @@ pub(crate) fn start_camera_at(
             packet_cap,
         )
         .map_err(|e| anyhow::anyhow!("GVSP stream negotiation: {e}"))?;
+
+    // Auto packet-size probe (aravis `auto_packet_size`): with the stream
+    // destination now set, ask the camera to fire test packets of decreasing
+    // size until one actually reaches us, and settle `GevSCPSPacketSize` on the
+    // largest that the path carries. Skipped when GEV_PACKET_SIZE hard-caps the
+    // size (the cap is honoured verbatim) or GEV_PROBE_PACKET_SIZE=0 selects the
+    // old MTU-derived behaviour. A camera that ignores fire-test packets falls
+    // back cleanly to the MTU-derived size, so the Hawk (jumbo path) never
+    // regresses.
+    let probe_on = !std::env::var("GEV_PROBE_PACKET_SIZE").is_ok_and(|v| v.trim() == "0");
+    if probe_on && packet_cap.is_none() {
+        probe_packet_size(&mut dev, &socket, STREAM_CHANNEL, stream_params.packet_size, ip, &log_tx);
+    }
+
     // A camera may silently clamp the requested size; the wire follows what the
     // register actually holds, so read it back over raw GVCP (not GenApi, whose
-    // cache the raw write bypassed).
+    // cache the raw write bypassed). The readback also reflects the probe.
     let effective_packet_size = dev
         .get_stream_packet_size(STREAM_CHANNEL)
         .ok()
@@ -1561,6 +1689,9 @@ fn capture_loop(
     let started = Instant::now();
     let mut warned_silence = false;
     let mut last_heartbeat = Instant::now();
+    // Consecutive heartbeat reads that failed, or read back with our control
+    // bit clear; reset on any healthy read. See [`HEARTBEAT_FAILURE_TOLERANCE`].
+    let mut heartbeat_failures = 0usize;
     let mut last_telemetry = Instant::now();
     let mut frames = 0u64;
     let mut short_frames = 0u64;
@@ -1613,16 +1744,43 @@ fn capture_loop(
         }
 
         // 2. Heartbeat; re-punch the stream flow while we're at it (a camera
-        //    that reported GevSCSP=0 at start may know it now).
+        //    that reported GevSCSP=0 at start may know it now). A single failed
+        //    read (a dropped GVCP datagram) no longer tears the session down:
+        //    tolerate a few consecutive failures, resetting on any success.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            if dev.read_register(CCP_REGISTER).is_err() {
-                let _ = log_tx.try_send(LogEntry::error(format!("{cam_name}: camera disconnected")));
-                stop.store(true, Ordering::Relaxed);
-                if let Some(jh) = rx_join { let _ = jh.join(); }
-                return;
-            }
             last_heartbeat = Instant::now();
-            scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
+            match dev.read_register(CCP_REGISTER) {
+                Ok(ccp) if ccp & CCP_CONTROL_BIT != 0 => {
+                    heartbeat_failures = 0;
+                    scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
+                }
+                // The read succeeded but our control bit is clear: another
+                // application has taken the camera. Confirm across a couple of
+                // heartbeats (a lone quirky read must not tear a stream down),
+                // then give up.
+                Ok(_) => {
+                    heartbeat_failures += 1;
+                    if heartbeat_failures >= HEARTBEAT_FAILURE_TOLERANCE {
+                        let _ = log_tx.try_send(LogEntry::error(format!(
+                            "{cam_name}: control lost (another application took over the camera)"
+                        )));
+                        stop.store(true, Ordering::Relaxed);
+                        if let Some(jh) = rx_join { let _ = jh.join(); }
+                        return;
+                    }
+                }
+                Err(_) => {
+                    heartbeat_failures += 1;
+                    if heartbeat_failures >= HEARTBEAT_FAILURE_TOLERANCE {
+                        let _ = log_tx.try_send(LogEntry::error(format!(
+                            "{cam_name}: camera disconnected ({heartbeat_failures} consecutive heartbeat failures)"
+                        )));
+                        stop.store(true, Ordering::Relaxed);
+                        if let Some(jh) = rx_join { let _ = jh.join(); }
+                        return;
+                    }
+                }
+            }
         }
 
         // 2b. Telemetry: re-read non-writable feature values periodically so
@@ -2580,3 +2738,94 @@ mod tests {
 
 // Trait imports needed for the `*Kind` method calls above.
 use cameleon_genapi::interface::{IBoolean, ICommand, IEnumeration, IFloat, IInteger};
+
+#[cfg(test)]
+mod packet_probe_integration_tests {
+    //! Drive the packet-size probe against a fake GVCP camera over loopback:
+    //! the fire-test-packet write path, the exact-size drain, and the clean
+    //! fallback when the camera answers nothing.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A minimal fake GVCP camera. It acknowledges every WRITEREG, and when a
+    /// `GevSCPSPacketSize` write carries the fire-test bit (1 << 31) for a size
+    /// at or below `threshold`, it sends a datagram of `size - 28` bytes to
+    /// `host` — mimicking a path whose MTU is `threshold`. `threshold == 0`
+    /// answers no test packet (a camera that ignores fire-test).
+    fn spawn_fake_camera(
+        threshold: u32,
+        host: SocketAddr,
+        stop: Arc<AtomicBool>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let out = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jh = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop.load(Ordering::Relaxed) {
+                let (n, from) = match sock.recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if n < 16 || buf[0] != 0x42 {
+                    continue;
+                }
+                let command = u16::from_be_bytes([buf[2], buf[3]]);
+                let request_id = u16::from_be_bytes([buf[6], buf[7]]);
+                if command != 0x0082 {
+                    continue; // WRITEREG only
+                }
+                let reg = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let value = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                if reg == 0x0d04 && value & (1 << 31) != 0 {
+                    let size = value & 0xffff;
+                    if threshold != 0 && (28..=threshold).contains(&size) {
+                        let _ = out.send_to(&vec![0u8; (size - 28) as usize], host);
+                    }
+                }
+                // WRITEREG_ACK: status(2)=0 | cmd(2)=0x0083 | len(2)=4 | id(2) | data(4).
+                let mut ack = Vec::with_capacity(12);
+                ack.extend_from_slice(&0u16.to_be_bytes());
+                ack.extend_from_slice(&0x0083u16.to_be_bytes());
+                ack.extend_from_slice(&4u16.to_be_bytes());
+                ack.extend_from_slice(&request_id.to_be_bytes());
+                ack.extend_from_slice(&0u32.to_be_bytes());
+                let _ = sock.send_to(&ack, from);
+            }
+        });
+        (addr, jh)
+    }
+
+    fn run_probe(threshold: u32, ceil: u32) -> u32 {
+        let host = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
+        host.set_read_timeout(Some(RX_POLL_TIMEOUT)).unwrap();
+        let host_addr = host.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cam_addr, jh) = spawn_fake_camera(threshold, host_addr, Arc::clone(&stop));
+        let mut dev = Device::open(cam_addr).unwrap();
+        let (log_tx, _log_rx) = bounded::<LogEntry>(64);
+        let chosen = probe_packet_size(&mut dev, &host, STREAM_CHANNEL, ceil, Ipv4Addr::LOCALHOST, &log_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = jh.join();
+        chosen
+    }
+
+    #[test]
+    fn probe_settles_on_the_path_mtu() {
+        // A path carrying up to 1000 bytes: the probe converges on 1000.
+        assert_eq!(run_probe(1000, 2000), 1000);
+    }
+
+    #[test]
+    fn probe_keeps_the_ceiling_when_the_whole_path_carries_it() {
+        // The current (ceiling) size already works — settled in one fire.
+        assert_eq!(run_probe(1500, 1500), 1500);
+    }
+
+    #[test]
+    fn probe_falls_back_when_the_camera_ignores_test_packets() {
+        // Nothing ever arrives: the probe leaves the MTU-derived ceiling in place.
+        assert_eq!(run_probe(0, 1500), 1500);
+    }
+}

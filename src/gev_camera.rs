@@ -1746,7 +1746,7 @@ fn capture_loop(
                     )));
                 }
                 frames += 1;
-                let frame = FrameData::new(mono, w, h, bit_depth);
+                let frame = FrameData::new_u16(mono, w, h, bit_depth);
                 match frame_tx.try_send(frame) {
                     Ok(()) => {}
                     Err(_) if frame_tx.is_empty() => {
@@ -1960,15 +1960,13 @@ fn frame_payload_bytes(pixel_format: u32, npix: usize) -> usize {
     }
 }
 
-/// Decode a reassembled mono payload into f32 pixels + bit depth.
-// TODO(perf): each call allocates a fresh `Vec<f32>` (~10-40 MB at 5 MP). A
-// recycling pool would need this buffer returned after the UI, solver, and
-// recorder are done with it — but `mono` is moved into `FrameData::mono`
-// (`Arc<Vec<f32>>`) and shared downstream, so reclaiming it requires a
-// return-channel from the UI thread back to this one (recycle a `Vec` once the
-// `Arc` is uniquely owned again on drop). That touches the frame lifecycle in
-// main.rs and is out of scope here; leaving the per-frame allocation in place.
-fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u32, u8)> {
+/// Decode a reassembled mono payload into native `u16` pixels + bit depth.
+/// Every GigE mono format is integer, so the output is always `u16` — the
+/// widening to `f32` is deferred to the handful of consumers that need it (see
+/// `pixels::Pixels`).
+// TODO(perf, Part 2): this allocates a fresh `Vec<u16>` per frame; a pool would
+// recycle it once the frame's `Arc` is uniquely owned again on the UI side.
+fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<u16>, u32, u32, u8)> {
     let npix = g.width as usize * g.height as usize;
     if npix == 0 {
         return None;
@@ -1977,7 +1975,7 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
         // Mono8
         0x01080001 => {
             if payload.len() < npix { return None; }
-            let mono = payload[..npix].iter().map(|&v| v as f32).collect();
+            let mono = payload[..npix].iter().map(|&v| v as u16).collect();
             Some((mono, g.width, g.height, 8))
         }
         // Mono10/12/14/16 unpacked little-endian 16-bit
@@ -1985,7 +1983,7 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
             if payload.len() < npix * 2 { return None; }
             let mono = payload[..npix * 2]
                 .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let bit_depth = match g.pixel_format {
                 0x01100003 => 10,
@@ -2003,8 +2001,8 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x0F) as u16) << 8);
                 let p1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                mono.push(p0);
+                mono.push(p1);
             }
             mono.truncate(npix);
             Some((mono, g.width, g.height, 12))
@@ -2017,8 +2015,8 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = ((chunk[0] as u16) << 4) | ((chunk[1] & 0x0F) as u16);
                 let p1 = ((chunk[2] as u16) << 4) | ((chunk[1] >> 4) as u16);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                mono.push(p0);
+                mono.push(p1);
             }
             mono.truncate(npix);
             Some((mono, g.width, g.height, 12))
@@ -2033,7 +2031,7 @@ fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u
                 let p1 = ((chunk[1] >> 2) as u16) | (((chunk[2] & 0x0F) as u16) << 6);
                 let p2 = ((chunk[2] >> 4) as u16) | (((chunk[3] & 0x3F) as u16) << 4);
                 let p3 = ((chunk[3] >> 6) as u16) | ((chunk[4] as u16) << 2);
-                mono.extend_from_slice(&[p0 as f32, p1 as f32, p2 as f32, p3 as f32]);
+                mono.extend_from_slice(&[p0, p1, p2, p3]);
             }
             mono.truncate(npix);
             Some((mono, g.width, g.height, 10))
@@ -2575,6 +2573,19 @@ mod tests {
         let (image, got, stride) = round_trip(1464, 1000);
         assert_eq!(got.as_deref(), Some(&image[..]));
         assert_eq!(stride, 1464);
+    }
+
+    /// Every GigE mono format decodes to native `u16`; spot-check the
+    /// little-endian unpack for the common Mono12 container.
+    #[test]
+    fn decode_produces_u16() {
+        let g = FrameGeometry { width: 64, height: 48, pixel_format: 0x0110_0005 }; // Mono12
+        let npix = (g.width * g.height) as usize;
+        let payload: Vec<u8> = (0..npix * 2).map(|i| (i * 37 % 256) as u8).collect();
+        let (mono, w, h, bd) = decode_payload(&payload, &g).expect("decode");
+        assert_eq!((w, h, bd), (64, 48, 12));
+        assert_eq!(mono.len(), npix);
+        assert_eq!(mono[0], u16::from_le_bytes([payload[0], payload[1]]));
     }
 }
 

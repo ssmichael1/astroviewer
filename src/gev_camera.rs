@@ -389,6 +389,12 @@ pub(crate) fn start_camera_at(
     // the control list. All GVCP access here is a direct blocking transaction.
     let mut controls = Vec::new();
     if let Some(g) = genapi.as_mut() {
+        // A previous session may have left the camera acquiring (an unclean
+        // exit, or a control lease that lapsed mid-stream) with the transport
+        // locked; an AcquisitionStart in that state can be ignored outright.
+        // Put both back as a fresh session would find them before configuring.
+        execute_command(g, &mut dev, "AcquisitionStop", &log_tx);
+        set_int_feature(g, &mut dev, "TLParamsLocked", 0, &log_tx);
         // best-effort configuration; ignore individual feature failures.
         configure_acquisition(g, &mut dev, &log_tx);
         controls = build_controls(g, &mut dev, ip);

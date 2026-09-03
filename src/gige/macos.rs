@@ -148,8 +148,9 @@ impl Batcher {
     }
 }
 
-/// The interface's link MTU, or `None` if the name is unknown.
-pub fn interface_mtu(name: &str) -> Option<u32> {
+/// Run an interface `ioctl` (`SIOCGIF*`) for `name` and return the filled
+/// request, or `None` if the name is unusable or the kernel refuses.
+fn ifreq_query(name: &str, request: libc::c_ulong) -> Option<libc::ifreq> {
     let bytes = name.as_bytes();
     // SAFETY: all-zero is a valid `ifreq` (empty name, zeroed union).
     let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -167,9 +168,26 @@ pub fn interface_mtu(name: &str) -> Option<u32> {
         if fd < 0 {
             return None;
         }
-        let rc = libc::ioctl(fd, libc::SIOCGIFMTU, &mut req as *mut libc::ifreq);
-        let mtu = req.ifr_ifru.ifru_mtu;
+        let rc = libc::ioctl(fd, request, &mut req as *mut libc::ifreq);
         libc::close(fd);
-        (rc == 0 && mtu > 0).then_some(mtu as u32)
+        (rc == 0).then_some(req)
     }
+}
+
+/// The interface's link MTU, or `None` if the name is unknown.
+pub fn interface_mtu(name: &str) -> Option<u32> {
+    let req = ifreq_query(name, libc::SIOCGIFMTU)?;
+    // SAFETY: SIOCGIFMTU fills the `ifru_mtu` member of the union.
+    let mtu = unsafe { req.ifr_ifru.ifru_mtu };
+    (mtu > 0).then_some(mtu as u32)
+}
+
+/// The largest MTU the interface's driver allows (`SIOCGIFDEVMTU`), or
+/// `None`. Tells a 1500-byte interface apart from one that cannot do better:
+/// Apple's USB-NCM class driver reports 1504, a jumbo-capable NIC 9000+.
+pub fn interface_max_mtu(name: &str) -> Option<u32> {
+    let req = ifreq_query(name, libc::SIOCGIFDEVMTU)?;
+    // SAFETY: SIOCGIFDEVMTU fills the `ifru_devmtu` member of the union.
+    let max = unsafe { req.ifr_ifru.ifru_devmtu.ifdm_max };
+    (max > 0).then_some(max as u32)
 }

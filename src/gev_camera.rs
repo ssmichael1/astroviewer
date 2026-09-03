@@ -421,6 +421,38 @@ pub(crate) fn start_camera_at(
             stream_params.packet_size, effective_packet_size
         )));
     }
+    // Jumbo packets are negotiated from the host interface's MTU alone. A
+    // switch or adapter between host and camera that cannot carry them means
+    // nothing arrives — and the Hawk has wedged outright (power-cycle only)
+    // when told to send 8192-byte packets down a 1500-byte path — so say
+    // what was decided and how to override it.
+    if stream_params.mtu > 1500 {
+        let _ = log_tx.try_send(LogEntry::info(format!(
+            "GigE: jumbo packets ({} bytes) negotiated from the host MTU; if the path to the camera \
+             cannot carry them no frames will arrive — set GEV_PACKET_SIZE=1500 to cap them",
+            effective_packet_size
+        )));
+    }
+    // At a standard MTU, say whether jumbo frames are a setting away or out
+    // of reach on this adapter: the packet rate, not the link rate, is what
+    // limits a fast camera on the host.
+    if stream_params.mtu <= 1500 {
+        if let Some((name, max)) = iface.as_ref().and_then(|i| nic::max_mtu(i).map(|m| (i.name().to_string(), m))) {
+            let _ = log_tx.try_send(if max >= 9000 {
+                LogEntry::warn(format!(
+                    "GigE: {name} supports an MTU up to {max} but is set to {}: enabling jumbo frames (MTU 9000) \
+                     would cut the packet rate {}x (every switch and adapter in the path must carry them; \
+                     GEV_PACKET_SIZE=1500 caps the size if not)",
+                    stream_params.mtu,
+                    9000 / stream_params.mtu.max(1)
+                ))
+            } else {
+                LogEntry::info(format!(
+                    "GigE: {name}'s driver caps its MTU at {max}: jumbo frames are not available on this adapter"
+                ))
+            });
+        }
+    }
 
     // Acquisition is started inside the capture thread once everything is wired.
 

@@ -184,6 +184,21 @@ pub enum GevCmd {
     Stop,
 }
 
+/// Software-pipeline frame-drop counters for one GEV capture, distinct from
+/// network loss. Shared between the capture thread (writer) and the UI (reader).
+#[derive(Default)]
+pub struct GevDropStats {
+    /// Complete frames dropped at the receive→control handoff (mirror of
+    /// `RxShared::raw_dropped`, republished here for the UI).
+    pub rx_to_control: AtomicU64,
+    /// Decoded frames dropped because the control→UI channel was full.
+    pub control_to_ui: AtomicU64,
+    /// Raw frames whose decode + stats were skipped because the UI channel was
+    /// already full and recording was off — the frame would have been dropped
+    /// anyway, so the work was skipped.
+    pub decode_skipped: AtomicU64,
+}
+
 /// Handle to a running GEV capture. Mirrors `camera::CameraHandle`.
 pub struct GevHandle {
     pub controls: Vec<GevControl>,
@@ -191,6 +206,14 @@ pub struct GevHandle {
     /// Refreshed control snapshots pushed by the capture thread (so flipping an
     /// `Auto` toggle live-unlocks its companion value control in the UI).
     pub controls_rx: Receiver<Vec<GevControl>>,
+    /// Software-pipeline drop counters, surfaced in the UI's Statistics panel.
+    pub drop_stats: Arc<GevDropStats>,
+    /// Running total of GVSP datagram bytes received (mirror of
+    /// `RxShared::bytes`); the UI derives a smoothed receive rate from deltas.
+    pub received_bytes: Arc<AtomicU64>,
+    /// Set by the UI while recording so the capture thread never skips a
+    /// frame's decode (the recorder wants every frame it can get).
+    pub recording: Arc<AtomicBool>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -428,12 +451,18 @@ pub(crate) fn start_camera_at(
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
 
     let snapshot = controls.clone();
+    let drop_stats = Arc::new(GevDropStats::default());
+    let recording = Arc::new(AtomicBool::new(false));
+    let received_bytes = Arc::new(AtomicU64::new(0));
+    let drop_stats_thread = Arc::clone(&drop_stats);
+    let recording_thread = Arc::clone(&recording);
+    let received_bytes_thread = Arc::clone(&received_bytes);
     let join_handle = std::thread::Builder::new()
         .name("gev-capture".into())
         .spawn(move || {
             capture_loop(
                 dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
-                snapshot, log_tx,
+                snapshot, drop_stats_thread, recording_thread, received_bytes_thread, log_tx,
             );
         })?;
 
@@ -441,6 +470,9 @@ pub(crate) fn start_camera_at(
         controls,
         cmd_tx,
         controls_rx,
+        drop_stats,
+        received_bytes,
+        recording,
         join_handle: Some(join_handle),
     })
 }
@@ -813,6 +845,9 @@ fn refresh_telemetry(g: &mut GenApi, dev: &mut Device, controls: &mut [GevContro
 /// hole-punch targets.
 struct RxShared {
     packets: AtomicU64,
+    /// Total GVSP datagram bytes received (headers included) — the source for
+    /// the UI's receive-rate readout.
+    bytes: AtomicU64,
     completed: AtomicU64,
     /// Frames abandoned incomplete without a resend (resend off, IDs too wide
     /// for the request, or too many gaps to be worth asking).
@@ -827,6 +862,10 @@ struct RxShared {
     packets_recovered: AtomicU64,
     /// Packets never received, from every abandoned block.
     packets_lost: AtomicU64,
+    /// Complete frames the receive thread produced but had to drop because the
+    /// control thread hadn't picked up the previous one (rx→control handoff
+    /// channel full). Software-pipeline loss, distinct from network `dropped`.
+    raw_dropped: AtomicU64,
     /// Cleared by the control thread when the camera rejects resend requests.
     resend_enabled: AtomicBool,
     src_port: AtomicU32,
@@ -836,6 +875,7 @@ impl Default for RxShared {
     fn default() -> Self {
         Self {
             packets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             resend_requests: AtomicU64::new(0),
@@ -843,6 +883,7 @@ impl Default for RxShared {
             resend_failed: AtomicU64::new(0),
             packets_recovered: AtomicU64::new(0),
             packets_lost: AtomicU64::new(0),
+            raw_dropped: AtomicU64::new(0),
             resend_enabled: AtomicBool::new(true),
             src_port: AtomicU32::new(0),
         }
@@ -1284,7 +1325,11 @@ fn rx_thread(
     while !stop.load(Ordering::Relaxed) {
         if let Some(frame) = receive_until_frame(&socket, &mut buf, &mut rx, &log_tx) {
             rx.shared.completed.fetch_add(1, Ordering::Relaxed);
-            let _ = raw_tx.try_send(frame);
+            // A full handoff channel means the control thread is still busy with
+            // the previous frame; this complete frame is dropped, not queued.
+            if raw_tx.try_send(frame).is_err() {
+                rx.shared.raw_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1300,6 +1345,9 @@ fn capture_loop(
     cmd_rx: Receiver<GevCmd>,
     controls_tx: Sender<Vec<GevControl>>,
     mut snapshot: Vec<GevControl>,
+    drop_stats: Arc<GevDropStats>,
+    recording: Arc<AtomicBool>,
+    received_bytes: Arc<AtomicU64>,
     log_tx: Sender<LogEntry>,
 ) {
     let cam_ip = match dev.remote_addr().ip() {
@@ -1436,6 +1484,10 @@ fn capture_loop(
         // for a firewall block, a packet-size mismatch, a lost privilege and an
         // untriggered camera. Say which half we're in and name the candidates.
         let packets = shared.packets.load(Ordering::Relaxed);
+        // Republish the receive thread's handoff-drop count and byte total
+        // where the UI reads them.
+        drop_stats.rx_to_control.store(shared.raw_dropped.load(Ordering::Relaxed), Ordering::Relaxed);
+        received_bytes.store(shared.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         if !warned_silence && frames == 0 && started.elapsed() >= SILENCE_GRACE {
             warned_silence = true;
             let msg = if packets == 0 {
@@ -1495,10 +1547,19 @@ fn capture_loop(
                 }
             },
             default(POLL_TIMEOUT) => {
-                trace_tick(trace, &mut tr, &shared, frames, &log_tx);
+                trace_tick(trace, &mut tr, &shared, &drop_stats, frames, &log_tx);
                 continue;
             },
         };
+        // If the UI still holds the previous frame, decoding this one only to
+        // have `frame_tx.try_send` drop it is wasted work — the two O(pixels)
+        // passes of decode + stats never reach the screen. Skip it unless we're
+        // recording, in which case we keep every frame for the recorder.
+        if frame_tx.is_full() && !recording.load(Ordering::Relaxed) {
+            drop_stats.decode_skipped.fetch_add(1, Ordering::Relaxed);
+            trace_tick(trace, &mut tr, &shared, &drop_stats, frames, &log_tx);
+            continue;
+        }
         let t_decode = Instant::now();
         let npix = g.width as usize * g.height as usize;
         match decode_payload(&payload, &g) {
@@ -1511,11 +1572,18 @@ fn capture_loop(
                 }
                 frames += 1;
                 let frame = FrameData::new(mono, w, h, bit_depth);
-                if frame_tx.try_send(frame).is_err() && frame_tx.is_empty() {
-                    // Receiver gone.
-                    shutdown(&mut dev, &mut genapi);
-                    if let Some(jh) = rx_join { let _ = jh.join(); }
-                    return;
+                match frame_tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(_) if frame_tx.is_empty() => {
+                        // Send failed on an empty channel: the receiver is gone.
+                        shutdown(&mut dev, &mut genapi);
+                        if let Some(jh) = rx_join { let _ = jh.join(); }
+                        return;
+                    }
+                    Err(_) => {
+                        // Channel full — the UI hasn't drained the last frame.
+                        drop_stats.control_to_ui.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             None => {
@@ -1539,7 +1607,7 @@ fn capture_loop(
             }
         }
         tr.decode += t_decode.elapsed();
-        trace_tick(trace, &mut tr, &shared, frames, &log_tx);
+        trace_tick(trace, &mut tr, &shared, &drop_stats, frames, &log_tx);
     }
 }
 
@@ -1559,7 +1627,7 @@ impl Default for TraceAcc {
     }
 }
 
-fn trace_tick(enabled: bool, tr: &mut TraceAcc, shared: &RxShared, decoded: u64, log_tx: &Sender<LogEntry>) {
+fn trace_tick(enabled: bool, tr: &mut TraceAcc, shared: &RxShared, drops: &GevDropStats, decoded: u64, log_tx: &Sender<LogEntry>) {
     if !enabled || tr.since.elapsed() < Duration::from_secs(1) {
         return;
     }
@@ -1567,7 +1635,8 @@ fn trace_tick(enabled: bool, tr: &mut TraceAcc, shared: &RxShared, decoded: u64,
     let completed = shared.completed.load(Ordering::Relaxed);
     let _ = log_tx.try_send(LogEntry::info(format!(
         "trace: {} pkt/s, {} frames completed, {} decoded, control {} ms, decode {} ms; \
-         dropped {}, resend req {} / frames recovered {} / failed {}, packets recovered {} / lost {}",
+         dropped {}, resend req {} / frames recovered {} / failed {}, packets recovered {} / lost {}; \
+         pipeline drops: rx->ctrl {}, ctrl->ui {}, decode skipped {}",
         packets - tr.packets, completed - tr.completed, decoded - tr.decoded,
         tr.ctl.as_millis(), tr.decode.as_millis(),
         shared.dropped.load(Ordering::Relaxed),
@@ -1576,6 +1645,9 @@ fn trace_tick(enabled: bool, tr: &mut TraceAcc, shared: &RxShared, decoded: u64,
         shared.resend_failed.load(Ordering::Relaxed),
         shared.packets_recovered.load(Ordering::Relaxed),
         shared.packets_lost.load(Ordering::Relaxed),
+        shared.raw_dropped.load(Ordering::Relaxed),
+        drops.control_to_ui.load(Ordering::Relaxed),
+        drops.decode_skipped.load(Ordering::Relaxed),
     )));
     *tr = TraceAcc { since: Instant::now(), ctl: Duration::ZERO, decode: Duration::ZERO, packets, completed, decoded };
 }
@@ -1670,6 +1742,7 @@ fn receive_until_frame(
             },
         };
         rx.shared.packets.fetch_add(1, Ordering::Relaxed);
+        rx.shared.bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
         let extended_ids = gvsp::has_extended_ids(pkt);
         let packet = match gvsp::parse_packet(pkt) {
             Ok(p) => p,
@@ -1709,6 +1782,13 @@ fn frame_payload_bytes(pixel_format: u32, npix: usize) -> usize {
 }
 
 /// Decode a reassembled mono payload into f32 pixels + bit depth.
+// TODO(perf): each call allocates a fresh `Vec<f32>` (~10-40 MB at 5 MP). A
+// recycling pool would need this buffer returned after the UI, solver, and
+// recorder are done with it — but `mono` is moved into `FrameData::mono`
+// (`Arc<Vec<f32>>`) and shared downstream, so reclaiming it requires a
+// return-channel from the UI thread back to this one (recycle a `Vec` once the
+// `Arc` is uniquely owned again on drop). That touches the frame lifecycle in
+// main.rs and is out of scope here; leaving the per-frame allocation in place.
 fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u32, u8)> {
     let npix = g.width as usize * g.height as usize;
     if npix == 0 {

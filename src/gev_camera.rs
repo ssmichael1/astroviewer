@@ -2195,11 +2195,10 @@ mod tests {
     #[test]
     fn unavailable_status_abandons_the_block_without_retries() {
         let image = test_image();
-        // Receive calls shorter than the retry interval, so the first call
-        // sends exactly one request and the camera's reply is processed
-        // before a retry falls due.
+        // The bench's 200 ms retry interval is far longer than any socket
+        // timeout rounding (Windows rounds a short SO_RCVTIMEO up to ~16 ms),
+        // so exactly one request is sent before the camera's reply lands.
         let mut b = Bench::new(Duration::from_millis(5));
-        b.rx.policy.retry = Duration::from_millis(10);
         send_block(&b.tx, b.dst, 7, &image, 1464, &[5], true);
         assert!(b.receive().is_none());
         assert_eq!(b.request(), (7, 5, 5, false));
@@ -2207,7 +2206,13 @@ mod tests {
         b.tx.send_to(&status_reply(7, 5, gvsp::STATUS_PACKET_UNAVAILABLE), b.dst).unwrap();
         assert!(b.receive().is_none());
         assert!(b.rx.pending.is_empty(), "abandoned on the camera's word");
-        assert!(b.no_request_within(Duration::from_millis(60)), "no retry after a final status");
+        // Keep servicing the timers well past the retry interval: an
+        // abandoned block must never be asked for again.
+        let until = Instant::now() + Duration::from_millis(350);
+        while Instant::now() < until {
+            assert!(b.receive().is_none());
+        }
+        assert!(b.no_request_within(Duration::from_millis(20)), "no retry after a final status");
         let (req, _, failed, dropped, recovered, lost) = b.counts();
         assert_eq!((req, failed, dropped, recovered, lost), (1, 1, 0, 0, 1));
     }

@@ -89,7 +89,8 @@ windows-sys = { version = "0.61", features = [
 ], optional = true }
 
 # GigE transport, unix: receive-thread scheduling (QoS class on macOS, nice
-# elsewhere) in src/gige/platform.rs.
+# elsewhere) in src/gige/platform.rs; recvmmsg batched receive on Linux in
+# src/gige/linux.rs.
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 

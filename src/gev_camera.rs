@@ -78,7 +78,14 @@ const GVSP_PACKET_OVERHEAD: u32 = 20 + 8 + 8;
 /// How long after AcquisitionStart to wait before warning that no packets (or
 /// no complete frame) have arrived, with the likely causes.
 const SILENCE_GRACE: Duration = Duration::from_secs(3);
-/// GVSP socket receive buffer to request (the OS may grant less).
+/// GVSP socket receive buffer to request (the OS may grant less). Windows
+/// honors large requests, so ask for more there — at 5 GigE, 64 MiB is only
+/// ~100 ms of slack, 256 MiB rides out longer scheduling stalls. macOS
+/// (kern.ipc.maxsockbuf, ~8 MiB) and Linux (net.core.rmem_max) clamp anyway,
+/// so a bigger number costs them nothing.
+#[cfg(windows)]
+const RECV_BUFFER_REQUEST: usize = 256 << 20;
+#[cfg(not(windows))]
 const RECV_BUFFER_REQUEST: usize = 64 << 20;
 /// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
 const SCPD_REGISTER: u32 = 0x0d08;

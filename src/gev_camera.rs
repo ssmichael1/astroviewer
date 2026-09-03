@@ -40,6 +40,14 @@ use crate::{FrameData, LogEntry};
 /// GVCP Control Channel Privilege register — re-read periodically as a heartbeat
 /// so the camera does not reclaim control from us.
 const CCP_REGISTER: u32 = 0x0a00;
+/// Bootstrap `GevHeartbeatTimeout` (ms): how long a control lease outlives the
+/// application that stopped heartbeating.
+const HEARTBEAT_TIMEOUT_REGISTER: u32 = 0x0938;
+/// Longest the connect will wait for a stale control lease to lapse. The wait
+/// is normally the camera's own heartbeat timeout plus a margin (3 s on the
+/// Hawk); this only bounds a camera that reports something silly.
+const CLAIM_WAIT_MAX: Duration = Duration::from_secs(5);
+const CLAIM_RETRY: Duration = Duration::from_millis(250);
 /// Bootstrap "First URL" register pointing at the on-device GenICam XML.
 const FIRST_URL_REGISTER: u64 = 0x0200;
 /// Heartbeat period. GigE devices default to a ~3 s heartbeat timeout.
@@ -334,9 +342,36 @@ pub(crate) fn start_camera_at(
         IpAddr::V6(_) => anyhow::bail!("IPv6 GigE addresses are not supported"),
     };
 
-    // Connect + claim exclusive control.
+    // Connect + claim exclusive control. A control lease outlives the
+    // application that held it by the camera's heartbeat timeout, and this
+    // app reconnects to its last camera the moment it launches, so an
+    // ACCESS_DENIED right after a relaunch (or after a tool that claimed
+    // control exited) is normal: wait the lease out before giving up.
     let mut dev = Device::open(gvcp_addr).map_err(|e| anyhow::anyhow!("GVCP open {gvcp_addr}: {e}"))?;
-    dev.claim_control().map_err(|e| anyhow::anyhow!("GVCP claim control: {e}"))?;
+    let lease = dev
+        .read_register(HEARTBEAT_TIMEOUT_REGISTER)
+        .map(|ms| Duration::from_millis(ms as u64) + Duration::from_millis(500))
+        .unwrap_or(CLAIM_WAIT_MAX)
+        .min(CLAIM_WAIT_MAX);
+    let claim_deadline = Instant::now() + lease;
+    let mut waited = false;
+    loop {
+        match dev.claim_control() {
+            Ok(()) => break,
+            Err(gvcp::GvcpError::Status(gvcp::Status::AccessDenied)) if Instant::now() < claim_deadline => {
+                if !waited {
+                    waited = true;
+                    let _ = log_tx.try_send(LogEntry::info(format!(
+                        "GigE: {cam_name} is held by another application, or by a session that just ended; \
+                         waiting up to {:.1} s for the lease to lapse",
+                        lease.as_secs_f64()
+                    )));
+                }
+                std::thread::sleep(CLAIM_RETRY);
+            }
+            Err(e) => return Err(anyhow::anyhow!("GVCP claim control: {e}")),
+        }
+    }
     let _ = log_tx.try_send(LogEntry::info(format!("GigE: claimed control of {cam_name}")));
 
     // Fetch + parse the GenICam XML.

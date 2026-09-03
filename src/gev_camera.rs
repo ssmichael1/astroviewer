@@ -620,11 +620,15 @@ pub(crate) fn start_camera_at(
     // destination now set, ask the camera to fire test packets of decreasing
     // size until one actually reaches us, and settle `GevSCPSPacketSize` on the
     // largest that the path carries. Skipped when GEV_PACKET_SIZE hard-caps the
-    // size (the cap is honoured verbatim) or GEV_PROBE_PACKET_SIZE=0 selects the
-    // old MTU-derived behaviour. A camera that ignores fire-test packets falls
+    // size (the cap is honoured verbatim) and is opt-in via GEV_PROBE_PACKET_SIZE=1 (off by default; it prevents
+    // the Hawk from streaming). A camera that ignores fire-test packets falls
     // back cleanly to the MTU-derived size, so the Hawk (jumbo path) never
     // regresses.
-    let probe_on = !std::env::var("GEV_PROBE_PACKET_SIZE").is_ok_and(|v| v.trim() == "0");
+    // Opt-in (GEV_PROBE_PACKET_SIZE=1): the fire-test probe stops the Photonic
+    // Science Hawk from streaming at all on the bench, so the default keeps the
+    // MTU-derived size. Enable it for a path where jumbo is negotiated but a
+    // switch/adapter cannot carry it (the probe would step the size down).
+    let probe_on = std::env::var("GEV_PROBE_PACKET_SIZE").is_ok_and(|v| v.trim() == "1");
     if probe_on && packet_cap.is_none() {
         probe_packet_size(&mut dev, &socket, STREAM_CHANNEL, stream_params.packet_size, ip, &log_tx);
     }

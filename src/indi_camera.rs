@@ -780,13 +780,17 @@ fn decode_fits_bytes(data: &[u8]) -> Result<super::FrameData> {
         if pixels.len() < npix {
             continue;
         }
-        let mono: Vec<f32> = pixels[..npix].iter().map(|&v| v as f32).collect();
-        let max_val = mono.iter().copied().fold(0.0_f32, f32::max);
+        // INDI camera BLOBs are integer FITS (BITPIX 8/16, unsigned via
+        // BZERO=32768). Keep the pixels native `u16`: the scaled physical values
+        // are non-negative integers in range, so round-to-nearest and clamp are
+        // exact here and avoid a widening f32 copy through the pipeline.
+        let max_val = pixels[..npix].iter().copied().fold(0.0_f64, f64::max);
         let bit_depth = if max_val <= 255.0 { 8 }
             else if max_val <= 4095.0 { 12 }
             else if max_val <= 16383.0 { 14 }
             else { 16 };
-        return Ok(super::FrameData::new(mono, width, height, bit_depth));
+        let mono: Vec<u16> = pixels[..npix].iter().map(|&v| v.clamp(0.0, 65535.0).round() as u16).collect();
+        return Ok(super::FrameData::new_u16(mono, width, height, bit_depth));
     }
     bail!("no image HDU in BLOB")
 }
@@ -928,8 +932,8 @@ mod tests {
         // BLOB → FrameData.
         let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((frame.width, frame.height), (4, 4));
-        assert_eq!(frame.mono[0], 100.0);
-        assert_eq!(frame.mono[15], 115.0);
+        assert_eq!(frame.mono.value_at(0), Some(100.0));
+        assert_eq!(frame.mono.value_at(15), Some(115.0));
 
         handle.stop();
         server.join().unwrap();
@@ -1002,8 +1006,8 @@ mod tests {
 
         let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!((frame.width, frame.height), (4, 4));
-        assert_eq!(frame.mono[0], 100.0);
-        assert_eq!(frame.mono[15], 115.0);
+        assert_eq!(frame.mono.value_at(0), Some(100.0));
+        assert_eq!(frame.mono.value_at(15), Some(115.0));
 
         handle.stop();
         server.join().unwrap();

@@ -2,6 +2,7 @@ use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, 
 
 use crate::colormaps::{Colormap, ColormapKind};
 use crate::overlays::{self, OverlayItem};
+use crate::pixels::Pixels;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TransferFn {
@@ -113,7 +114,7 @@ impl ImageViewer {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        mono_data: &[f32],
+        mono_data: &Pixels,
         frame_serial: u64,
         width: u32,
         height: u32,
@@ -199,9 +200,7 @@ impl ImageViewer {
                     let py = py.min(height - 1);
                     response.hovered_pixel = Some((px, py));
                     let idx = (py * width + px) as usize;
-                    if idx < mono_data.len() {
-                        response.hovered_value = Some(mono_data[idx]);
-                    }
+                    response.hovered_value = mono_data.value_at(idx);
                 }
             }
 
@@ -305,7 +304,25 @@ impl ImageViewer {
 
     fn update_rgba(
         &mut self,
-        mono_data: &[f32],
+        mono_data: &Pixels,
+        width: u32,
+        height: u32,
+        params: &DisplayParams,
+        colormap: &Colormap,
+    ) {
+        // Recolor from the frame's native pixel type: `u16` frames feed the loop
+        // widened per-pixel (`x as f32`, exact) rather than via a whole-buffer
+        // f32 copy. The normalize + transfer + LUT math below is identical for
+        // both, so the produced RGBA bytes are identical.
+        match mono_data {
+            Pixels::F32(v) => self.recolor(v.iter().copied(), width, height, params, colormap),
+            Pixels::U16(v) => self.recolor(v.iter().map(|&x| x as f32), width, height, params, colormap),
+        }
+    }
+
+    fn recolor<I: Iterator<Item = f32>>(
+        &mut self,
+        vals: I,
         width: u32,
         height: u32,
         params: &DisplayParams,
@@ -336,7 +353,7 @@ impl ImageViewer {
             (0.0, 0.0, 1.0)
         };
 
-        for (i, &val) in mono_data.iter().take(npix).enumerate() {
+        for (i, val) in vals.take(npix).enumerate() {
             let mut t = ((val - params.scale_min) * inv_range).clamp(0.0, 1.0);
             match params.transfer {
                 TransferFn::Linear => {
@@ -455,6 +472,57 @@ impl ImageViewer {
                 font.clone(),
                 text_color,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::colormaps::ColormapKind;
+    use std::sync::Arc;
+
+    /// Recoloring a `u16` frame must produce byte-for-byte identical RGBA to the
+    /// same pixels widened to `f32`. This is the display half of the dual-type
+    /// equivalence guarantee: a `u16` GigE frame looks exactly as it did when
+    /// every frame was stored as `f32`.
+    fn assert_recolor_identical(raw: &[u16], w: u32, h: u32, params: &DisplayParams, kind: ColormapKind) {
+        let cmap = Colormap::new(kind);
+        let u = Pixels::U16(Arc::new(raw.to_vec()));
+        let f = Pixels::F32(Arc::new(raw.iter().map(|&x| x as f32).collect()));
+
+        let mut vu = ImageViewer::new();
+        vu.update_rgba(&u, w, h, params, &cmap);
+        let bytes_u = vu.rgba_buf.clone();
+
+        let mut vf = ImageViewer::new();
+        vf.update_rgba(&f, w, h, params, &cmap);
+
+        assert_eq!(bytes_u, vf.rgba_buf, "u16 vs f32 RGBA differ for {kind:?}");
+    }
+
+    #[test]
+    fn recolor_u16_matches_f32_all_transfers() {
+        let (w, h) = (16u32, 16u32);
+        let raw: Vec<u16> = (0..(w * h)).map(|i| ((i * 271) % 65536) as u16).collect();
+
+        for kind in [ColormapKind::Grayscale, ColormapKind::Viridis, ColormapKind::Inferno] {
+            // Linear, gamma == 1.
+            let mut p = DisplayParams { scale_min: 0.0, scale_max: 65535.0, gamma: 1.0,
+                transfer: TransferFn::Linear, ..Default::default() };
+            assert_recolor_identical(&raw, w, h, &p, kind);
+
+            // Linear with gamma.
+            p.gamma = 2.2;
+            assert_recolor_identical(&raw, w, h, &p, kind);
+
+            // Asinh with a nonzero pivot and a tighter window.
+            p.transfer = TransferFn::Asinh;
+            p.gamma = 5.0;
+            p.scale_min = 1000.0;
+            p.scale_max = 40000.0;
+            p.asinh_offset = 3000.0;
+            assert_recolor_identical(&raw, w, h, &p, kind);
         }
     }
 }

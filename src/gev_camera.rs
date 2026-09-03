@@ -40,6 +40,15 @@ use crate::{FrameData, LogEntry};
 /// GVCP Control Channel Privilege register — re-read periodically as a heartbeat
 /// so the camera does not reclaim control from us.
 const CCP_REGISTER: u32 = 0x0a00;
+/// The CCP "control access" bit we hold while streaming (aravis
+/// `ARV_GVBS_CONTROL_CHANNEL_PRIVILEGE_CONTROL = 1 << 1`). If a readback shows
+/// it clear, another application has taken control.
+const CCP_CONTROL_BIT: u32 = 1 << 1;
+/// How many consecutive heartbeat reads may fail (or read back with our control
+/// bit clear) before the session is torn down. A single dropped GVCP datagram
+/// no longer kills a working stream; aravis likewise retries for several
+/// seconds. At the 1 s cadence this tolerates ~3 s of trouble.
+const HEARTBEAT_FAILURE_TOLERANCE: usize = 3;
 /// Bootstrap `GevHeartbeatTimeout` (ms): how long a control lease outlives the
 /// application that stopped heartbeating.
 const HEARTBEAT_TIMEOUT_REGISTER: u32 = 0x0938;
@@ -57,6 +66,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Stream channel index (single-channel cameras use 0).
 const STREAM_CHANNEL: u32 = 0;
+
+/// Spare decode buffers the frame pool holds. A handful covers the frames in
+/// flight (one displayed, one decoding, up to two queued in the frame channel);
+/// beyond that, returned buffers are simply dropped rather than growing the pool.
+const FRAME_POOL_CAPACITY: usize = 4;
 /// How long to wait for stream packets before returning to service commands.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// The receive socket's read timeout: how long the receive thread can sit in
@@ -78,7 +92,14 @@ const GVSP_PACKET_OVERHEAD: u32 = 20 + 8 + 8;
 /// How long after AcquisitionStart to wait before warning that no packets (or
 /// no complete frame) have arrived, with the likely causes.
 const SILENCE_GRACE: Duration = Duration::from_secs(3);
-/// GVSP socket receive buffer to request (the OS may grant less).
+/// GVSP socket receive buffer to request (the OS may grant less). Windows
+/// honors large requests, so ask for more there — at 5 GigE, 64 MiB is only
+/// ~100 ms of slack, 256 MiB rides out longer scheduling stalls. macOS
+/// (kern.ipc.maxsockbuf, ~8 MiB) and Linux (net.core.rmem_max) clamp anyway,
+/// so a bigger number costs them nothing.
+#[cfg(windows)]
+const RECV_BUFFER_REQUEST: usize = 256 << 20;
+#[cfg(not(windows))]
 const RECV_BUFFER_REQUEST: usize = 64 << 20;
 /// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
 const SCPD_REGISTER: u32 = 0x0d08;
@@ -249,6 +270,12 @@ pub struct GevHandle {
     /// Set by the UI while recording so the capture thread never skips a
     /// frame's decode (the recorder wants every frame it can get).
     pub recording: Arc<AtomicBool>,
+    /// Return path for spent `u16` decode buffers. The UI thread sends a frame's
+    /// inner `Vec<u16>` here once it replaces the frame and holds the only
+    /// reference; the capture thread reuses it, so a warm pipeline decodes with
+    /// no per-frame allocation. Bounded and non-blocking on both ends — a full
+    /// pool just drops the returned buffer.
+    pub buffer_return: Sender<Vec<u16>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -378,6 +405,111 @@ pub fn start_camera(
     )
 }
 
+/// IP + UDP header overhead: a received test-packet payload is the requested
+/// packet size minus the IP (20) and UDP (8) headers (aravis
+/// `ARV_GVSP_PACKET_UDP_OVERHEAD`).
+const PACKET_PROBE_UDP_OVERHEAD: u32 = 28;
+/// Smallest packet size the probe will settle for — a conservative IPv4 floor
+/// every path carries. Below this we do not bother probing.
+const PACKET_PROBE_FLOOR: u32 = 576;
+/// Per candidate, fire the test packet up to this many times, waiting for a
+/// reply between fires (aravis fires up to 3). One arrival is enough.
+const PACKET_PROBE_FIRES: usize = 3;
+/// How long to wait for the test packet after each fire.
+const PACKET_PROBE_WAIT: Duration = Duration::from_millis(60);
+
+/// Whether a test packet of `candidate` bytes fired now arrives on `socket`
+/// from `cam_ip`. Fires up to [`PACKET_PROBE_FIRES`] times, draining any
+/// late/stale packets whose size does not match the expected `candidate - 28`
+/// payload (aravis' `test_packet_check`). A write failure (the camera does not
+/// implement fire-test) counts as "did not arrive" so the probe falls back.
+fn test_packet_arrives(
+    dev: &mut Device,
+    socket: &GvspSocket,
+    rb: &mut RecvBuf,
+    channel: u32,
+    candidate: u32,
+    cam_ip: Ipv4Addr,
+) -> bool {
+    let want = candidate.saturating_sub(PACKET_PROBE_UDP_OVERHEAD) as usize;
+    for _ in 0..PACKET_PROBE_FIRES {
+        if dev.fire_test_packet(channel, candidate).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + PACKET_PROBE_WAIT;
+        while Instant::now() < deadline {
+            match rb.next_datagram(socket) {
+                // A datagram from the camera of the size we asked for: the path
+                // carries `candidate`. Other datagrams (late packets from an
+                // earlier candidate) are drained until the deadline.
+                Ok((data, src)) if src.ip() == IpAddr::V4(cam_ip) && data.len() == want => return true,
+                Ok(_) => continue,
+                Err(_) => break, // timed out; fire again
+            }
+        }
+    }
+    false
+}
+
+/// Probe the largest GVSP packet size the *path* to the camera actually
+/// carries (aravis `auto_packet_size`), leaving that size in `GevSCPSPacketSize`.
+/// Runs after the stream destination/host-port are set (so the test packet is
+/// routed to `socket`) and before acquisition starts. Returns the size settled
+/// on. `ceil` is the MTU-derived size already negotiated; on an inconclusive
+/// probe (a camera that ignores fire-test packets — some do) the register is
+/// restored to `ceil` and that is returned, so the stream is never left
+/// unconfigured and the default never regresses.
+fn probe_packet_size(
+    dev: &mut Device,
+    socket: &GvspSocket,
+    channel: u32,
+    ceil: u32,
+    cam_ip: Ipv4Addr,
+    log_tx: &Sender<LogEntry>,
+) -> u32 {
+    if ceil < PACKET_PROBE_FLOOR {
+        return ceil; // a sub-576 link: nothing to search
+    }
+    let mut rb = RecvBuf::new();
+    // Widen the read timeout for the duration of the probe, then restore it.
+    let _ = socket.set_read_timeout(Some(PACKET_PROBE_WAIT));
+    let chosen = gvcp::largest_carried_packet_size(PACKET_PROBE_FLOOR, ceil, |candidate| {
+        test_packet_arrives(dev, socket, &mut rb, channel, candidate, cam_ip)
+    });
+    let _ = socket.set_read_timeout(Some(RX_POLL_TIMEOUT));
+
+    match chosen {
+        Some(size) => {
+            // Settle on the probed size, flag bits cleared.
+            match dev.set_stream_packet_size(channel, size) {
+                Ok(()) => {
+                    let _ = log_tx.try_send(LogEntry::info(format!(
+                        "GigE: probed max packet size = {size} (path carries it)"
+                    )));
+                    size
+                }
+                Err(e) => {
+                    let _ = log_tx.try_send(LogEntry::warn(format!(
+                        "GigE: probe chose {size} but writing it back failed ({e}); keeping {ceil}"
+                    )));
+                    let _ = dev.set_stream_packet_size(channel, ceil);
+                    ceil
+                }
+            }
+        }
+        None => {
+            // Inconclusive: restore a clean register at the MTU-derived size
+            // (clearing any do-not-fragment bit our fires may have left).
+            let _ = dev.set_stream_packet_size(channel, ceil);
+            let _ = log_tx.try_send(LogEntry::info(format!(
+                "GigE: packet-size probe inconclusive (camera did not answer test packets); \
+                 using MTU-derived size {ceil}"
+            )));
+            ceil
+        }
+    }
+}
+
 /// Open a GigE camera addressed by an explicit GVCP `SocketAddr`. `start_camera`
 /// wraps this with the well-known port; tests use it to target a simulator on a
 /// non-standard port.
@@ -483,9 +615,27 @@ pub(crate) fn start_camera_at(
             packet_cap,
         )
         .map_err(|e| anyhow::anyhow!("GVSP stream negotiation: {e}"))?;
+
+    // Auto packet-size probe (aravis `auto_packet_size`): with the stream
+    // destination now set, ask the camera to fire test packets of decreasing
+    // size until one actually reaches us, and settle `GevSCPSPacketSize` on the
+    // largest that the path carries. Skipped when GEV_PACKET_SIZE hard-caps the
+    // size (the cap is honoured verbatim) and is opt-in via GEV_PROBE_PACKET_SIZE=1 (off by default; it prevents
+    // the Hawk from streaming). A camera that ignores fire-test packets falls
+    // back cleanly to the MTU-derived size, so the Hawk (jumbo path) never
+    // regresses.
+    // Opt-in (GEV_PROBE_PACKET_SIZE=1): the fire-test probe stops the Photonic
+    // Science Hawk from streaming at all on the bench, so the default keeps the
+    // MTU-derived size. Enable it for a path where jumbo is negotiated but a
+    // switch/adapter cannot carry it (the probe would step the size down).
+    let probe_on = std::env::var("GEV_PROBE_PACKET_SIZE").is_ok_and(|v| v.trim() == "1");
+    if probe_on && packet_cap.is_none() {
+        probe_packet_size(&mut dev, &socket, STREAM_CHANNEL, stream_params.packet_size, ip, &log_tx);
+    }
+
     // A camera may silently clamp the requested size; the wire follows what the
     // register actually holds, so read it back over raw GVCP (not GenApi, whose
-    // cache the raw write bypassed).
+    // cache the raw write bypassed). The readback also reflects the probe.
     let effective_packet_size = dev
         .get_stream_packet_size(STREAM_CHANNEL)
         .ok()
@@ -551,6 +701,11 @@ pub(crate) fn start_camera_at(
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
+    // Decode-buffer pool: the UI returns spent frame buffers here and the
+    // capture thread pulls from it. Bounded to a few buffers — that covers the
+    // frames in flight (one on screen, one decoding, a couple in the channel)
+    // without letting the pool grow unbounded.
+    let (buffer_return_tx, buffer_return_rx) = bounded::<Vec<u16>>(FRAME_POOL_CAPACITY);
 
     let snapshot = controls.clone();
     let drop_stats = Arc::new(GevDropStats::default());
@@ -564,7 +719,8 @@ pub(crate) fn start_camera_at(
         .spawn(move || {
             capture_loop(
                 dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
-                snapshot, drop_stats_thread, recording_thread, received_bytes_thread, log_tx,
+                snapshot, drop_stats_thread, recording_thread, received_bytes_thread,
+                buffer_return_rx, log_tx,
             );
         })?;
 
@@ -575,6 +731,7 @@ pub(crate) fn start_camera_at(
         drop_stats,
         received_bytes,
         recording,
+        buffer_return: buffer_return_tx,
         join_handle: Some(join_handle),
     })
 }
@@ -1450,6 +1607,9 @@ fn capture_loop(
     drop_stats: Arc<GevDropStats>,
     recording: Arc<AtomicBool>,
     received_bytes: Arc<AtomicU64>,
+    // Spent `u16` decode buffers returned by the UI thread; pulled from here to
+    // decode into, allocating only when the pool is empty. Never blocks.
+    pool_rx: Receiver<Vec<u16>>,
     log_tx: Sender<LogEntry>,
 ) {
     let cam_ip = match dev.remote_addr().ip() {
@@ -1561,9 +1721,15 @@ fn capture_loop(
     let started = Instant::now();
     let mut warned_silence = false;
     let mut last_heartbeat = Instant::now();
+    // Consecutive heartbeat reads that failed, or read back with our control
+    // bit clear; reset on any healthy read. See [`HEARTBEAT_FAILURE_TOLERANCE`].
+    let mut heartbeat_failures = 0usize;
     let mut last_telemetry = Instant::now();
     let mut frames = 0u64;
     let mut short_frames = 0u64;
+    // Decode buffer retained across a failed decode so a short/unsupported frame
+    // doesn't cost the pool a buffer; refilled from the pool on the next frame.
+    let mut spare_buf: Option<Vec<u16>> = None;
     let mut announced_resend = false;
     let mut warned_resend_silent = false;
     // GEV_TRACE=1: log once a second where the time goes.
@@ -1613,16 +1779,43 @@ fn capture_loop(
         }
 
         // 2. Heartbeat; re-punch the stream flow while we're at it (a camera
-        //    that reported GevSCSP=0 at start may know it now).
+        //    that reported GevSCSP=0 at start may know it now). A single failed
+        //    read (a dropped GVCP datagram) no longer tears the session down:
+        //    tolerate a few consecutive failures, resetting on any success.
         if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-            if dev.read_register(CCP_REGISTER).is_err() {
-                let _ = log_tx.try_send(LogEntry::error(format!("{cam_name}: camera disconnected")));
-                stop.store(true, Ordering::Relaxed);
-                if let Some(jh) = rx_join { let _ = jh.join(); }
-                return;
-            }
             last_heartbeat = Instant::now();
-            scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
+            match dev.read_register(CCP_REGISTER) {
+                Ok(ccp) if ccp & CCP_CONTROL_BIT != 0 => {
+                    heartbeat_failures = 0;
+                    scsp = punch_stream_port(&mut dev, punch_socket.as_ref(), cam_ip, scsp, &shared);
+                }
+                // The read succeeded but our control bit is clear: another
+                // application has taken the camera. Confirm across a couple of
+                // heartbeats (a lone quirky read must not tear a stream down),
+                // then give up.
+                Ok(_) => {
+                    heartbeat_failures += 1;
+                    if heartbeat_failures >= HEARTBEAT_FAILURE_TOLERANCE {
+                        let _ = log_tx.try_send(LogEntry::error(format!(
+                            "{cam_name}: control lost (another application took over the camera)"
+                        )));
+                        stop.store(true, Ordering::Relaxed);
+                        if let Some(jh) = rx_join { let _ = jh.join(); }
+                        return;
+                    }
+                }
+                Err(_) => {
+                    heartbeat_failures += 1;
+                    if heartbeat_failures >= HEARTBEAT_FAILURE_TOLERANCE {
+                        let _ = log_tx.try_send(LogEntry::error(format!(
+                            "{cam_name}: camera disconnected ({heartbeat_failures} consecutive heartbeat failures)"
+                        )));
+                        stop.store(true, Ordering::Relaxed);
+                        if let Some(jh) = rx_join { let _ = jh.join(); }
+                        return;
+                    }
+                }
+            }
         }
 
         // 2b. Telemetry: re-read non-writable feature values periodically so
@@ -1737,8 +1930,15 @@ fn capture_loop(
         }
         let t_decode = Instant::now();
         let npix = g.width as usize * g.height as usize;
-        match decode_payload(&payload, &g) {
-            Some((mono, w, h, bit_depth)) => {
+        // Pull a spare decode buffer: the one retained from a prior short frame,
+        // else one the UI returned to the pool, else a fresh allocation. Never
+        // blocks the capture thread.
+        let mut buf = spare_buf
+            .take()
+            .or_else(|| pool_rx.try_recv().ok())
+            .unwrap_or_default();
+        match decode_payload(&payload, &g, &mut buf) {
+            Some((w, h, bit_depth)) => {
                 if frames == 0 {
                     let _ = log_tx.try_send(LogEntry::info(format!(
                         "{cam_name}: streaming {w}x{h} pf={:#010x} ({} B/frame)",
@@ -1746,7 +1946,9 @@ fn capture_loop(
                     )));
                 }
                 frames += 1;
-                let frame = FrameData::new(mono, w, h, bit_depth);
+                // `buf` is moved into the frame and comes back via the pool once
+                // the UI replaces this frame and the Arc is uniquely owned again.
+                let frame = FrameData::new_u16(buf, w, h, bit_depth);
                 match frame_tx.try_send(frame) {
                     Ok(()) => {}
                     Err(_) if frame_tx.is_empty() => {
@@ -1762,6 +1964,9 @@ fn capture_loop(
                 }
             }
             None => {
+                // Decode failed (short/unsupported frame): keep the buffer so
+                // the next frame reuses it instead of costing the pool a buffer.
+                spare_buf = Some(buf);
                 short_frames += 1;
                 if short_frames == 1 {
                     let needed = frame_payload_bytes(g.pixel_format, npix);
@@ -1960,83 +2165,84 @@ fn frame_payload_bytes(pixel_format: u32, npix: usize) -> usize {
     }
 }
 
-/// Decode a reassembled mono payload into f32 pixels + bit depth.
-// TODO(perf): each call allocates a fresh `Vec<f32>` (~10-40 MB at 5 MP). A
-// recycling pool would need this buffer returned after the UI, solver, and
-// recorder are done with it — but `mono` is moved into `FrameData::mono`
-// (`Arc<Vec<f32>>`) and shared downstream, so reclaiming it requires a
-// return-channel from the UI thread back to this one (recycle a `Vec` once the
-// `Arc` is uniquely owned again on drop). That touches the frame lifecycle in
-// main.rs and is out of scope here; leaving the per-frame allocation in place.
-fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u32, u8)> {
+/// Decode a reassembled mono payload into native `u16` pixels, returning the
+/// geometry + bit depth on success. Every GigE mono format is integer, so the
+/// output is always `u16` — the widening to `f32` is deferred to the handful of
+/// consumers that need it (see `pixels::Pixels`).
+///
+/// The output buffer is supplied by the caller and reused frame-to-frame (a
+/// buffer pool, see `capture_loop`): it is cleared and refilled in place, so a
+/// warm pool decodes with zero per-frame allocation. On a length-check failure
+/// the caller keeps its buffer (partially filled) and can reuse it next frame.
+fn decode_payload(payload: &[u8], g: &FrameGeometry, out: &mut Vec<u16>) -> Option<(u32, u32, u8)> {
     let npix = g.width as usize * g.height as usize;
     if npix == 0 {
         return None;
     }
+    out.clear();
+    out.reserve(npix);
     match g.pixel_format {
         // Mono8
         0x01080001 => {
             if payload.len() < npix { return None; }
-            let mono = payload[..npix].iter().map(|&v| v as f32).collect();
-            Some((mono, g.width, g.height, 8))
+            out.extend(payload[..npix].iter().map(|&v| v as u16));
+            Some((g.width, g.height, 8))
         }
         // Mono10/12/14/16 unpacked little-endian 16-bit
         0x01100003 | 0x01100005 | 0x01100025 | 0x01100007 => {
             if payload.len() < npix * 2 { return None; }
-            let mono = payload[..npix * 2]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
-                .collect();
+            out.extend(
+                payload[..npix * 2]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]])),
+            );
             let bit_depth = match g.pixel_format {
                 0x01100003 => 10,
                 0x01100005 => 12,
                 0x01100025 => 14,
                 _ => 16,
             };
-            Some((mono, g.width, g.height, bit_depth))
+            Some((g.width, g.height, bit_depth))
         }
         // Mono12p packed: 2 pixels per 3 bytes (little-endian nibble order).
         0x010C0047 => {
             let needed = npix * 3 / 2;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x0F) as u16) << 8);
                 let p1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                out.push(p0);
+                out.push(p1);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 12))
+            out.truncate(npix);
+            Some((g.width, g.height, 12))
         }
         // Mono12Packed (GEV 1.x / FLIR): 2 pixels per 3 bytes, high byte first.
         0x010C0006 => {
             let needed = npix * 3 / 2;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = ((chunk[0] as u16) << 4) | ((chunk[1] & 0x0F) as u16);
                 let p1 = ((chunk[2] as u16) << 4) | ((chunk[1] >> 4) as u16);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                out.push(p0);
+                out.push(p1);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 12))
+            out.truncate(npix);
+            Some((g.width, g.height, 12))
         }
         // Mono10p packed: 4 pixels per 5 bytes.
         0x010A0046 => {
             let needed = npix * 5 / 4;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(5) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x03) as u16) << 8);
                 let p1 = ((chunk[1] >> 2) as u16) | (((chunk[2] & 0x0F) as u16) << 6);
                 let p2 = ((chunk[2] >> 4) as u16) | (((chunk[3] & 0x3F) as u16) << 4);
                 let p3 = ((chunk[3] >> 6) as u16) | ((chunk[4] as u16) << 2);
-                mono.extend_from_slice(&[p0 as f32, p1 as f32, p2 as f32, p3 as f32]);
+                out.extend_from_slice(&[p0, p1, p2, p3]);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 10))
+            out.truncate(npix);
+            Some((g.width, g.height, 10))
         }
         _ => None,
     }
@@ -2576,7 +2782,163 @@ mod tests {
         assert_eq!(got.as_deref(), Some(&image[..]));
         assert_eq!(stride, 1464);
     }
+
+    /// `decode_payload` fills a reused buffer in place and, once its capacity is
+    /// warm, reallocates nothing frame-to-frame — the pooling precondition.
+    #[test]
+    fn decode_reuses_buffer_without_realloc() {
+        let g = FrameGeometry { width: 64, height: 48, pixel_format: 0x0110_0005 }; // Mono12
+        let npix = (g.width * g.height) as usize;
+        let payload: Vec<u8> = (0..npix * 2).map(|i| (i * 37 % 256) as u8).collect();
+
+        let mut buf: Vec<u16> = Vec::new();
+        assert_eq!(decode_payload(&payload, &g, &mut buf), Some((64, 48, 12)));
+        assert_eq!(buf.len(), npix);
+        // Spot-check the little-endian unpack against a manual decode.
+        assert_eq!(buf[0], u16::from_le_bytes([payload[0], payload[1]]));
+
+        let cap = buf.capacity();
+        let ptr = buf.as_ptr();
+        for _ in 0..10 {
+            assert_eq!(decode_payload(&payload, &g, &mut buf), Some((64, 48, 12)));
+            assert_eq!(buf.len(), npix);
+        }
+        // Same allocation reused: no growth, no move.
+        assert_eq!(buf.capacity(), cap, "buffer capacity grew across frames");
+        assert_eq!(buf.as_ptr(), ptr, "buffer was reallocated across frames");
+    }
+
+    /// Model the capture↔UI buffer pool: the capture thread pulls a spare or
+    /// allocates on a miss; the UI reclaims the frame's `Vec` via
+    /// `Arc::into_inner` and returns it. With the pool warm, no frame past the
+    /// first few in flight allocates — proving the per-frame allocation is gone.
+    #[test]
+    fn warm_pool_stops_allocating() {
+        use std::sync::Arc;
+        let (return_tx, return_rx) = bounded::<Vec<u16>>(FRAME_POOL_CAPACITY);
+        let npix = 64 * 48;
+
+        let mut allocations = 0usize;
+        // One frame is "in flight" (held by the UI) at a time.
+        let mut in_flight: Option<Arc<Vec<u16>>> = None;
+        const N: usize = 1000;
+        for _ in 0..N {
+            // Capture side: pull a spare or allocate (a pool "miss").
+            let mut buf = return_rx.try_recv().unwrap_or_else(|_| {
+                allocations += 1;
+                Vec::new()
+            });
+            buf.clear();
+            buf.resize(npix, 7u16); // stand in for decode filling the buffer
+            let frame = Arc::new(buf);
+
+            // UI side: replace the displayed frame, returning the old one's Vec.
+            if let Some(old) = in_flight.replace(Arc::clone(&frame)) {
+                if let Some(v) = Arc::into_inner(old) {
+                    let _ = return_tx.try_send(v);
+                }
+            }
+            // Drop our extra Arc clone so the frame is uniquely owned by the UI.
+            drop(frame);
+        }
+
+        // Allocations equal the frames in flight (one being filled by the
+        // capture side, one held by the UI) — NOT N. Over 1000 frames only the
+        // two startup buffers are ever allocated; every later frame reuses one.
+        assert_eq!(allocations, 2, "warm pool should allocate only the in-flight depth, got {allocations} over {N} frames");
+    }
 }
 
 // Trait imports needed for the `*Kind` method calls above.
 use cameleon_genapi::interface::{IBoolean, ICommand, IEnumeration, IFloat, IInteger};
+
+#[cfg(test)]
+mod packet_probe_integration_tests {
+    //! Drive the packet-size probe against a fake GVCP camera over loopback:
+    //! the fire-test-packet write path, the exact-size drain, and the clean
+    //! fallback when the camera answers nothing.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A minimal fake GVCP camera. It acknowledges every WRITEREG, and when a
+    /// `GevSCPSPacketSize` write carries the fire-test bit (1 << 31) for a size
+    /// at or below `threshold`, it sends a datagram of `size - 28` bytes to
+    /// `host` — mimicking a path whose MTU is `threshold`. `threshold == 0`
+    /// answers no test packet (a camera that ignores fire-test).
+    fn spawn_fake_camera(
+        threshold: u32,
+        host: SocketAddr,
+        stop: Arc<AtomicBool>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let out = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let jh = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop.load(Ordering::Relaxed) {
+                let (n, from) = match sock.recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if n < 16 || buf[0] != 0x42 {
+                    continue;
+                }
+                let command = u16::from_be_bytes([buf[2], buf[3]]);
+                let request_id = u16::from_be_bytes([buf[6], buf[7]]);
+                if command != 0x0082 {
+                    continue; // WRITEREG only
+                }
+                let reg = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                let value = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+                if reg == 0x0d04 && value & (1 << 31) != 0 {
+                    let size = value & 0xffff;
+                    if threshold != 0 && (28..=threshold).contains(&size) {
+                        let _ = out.send_to(&vec![0u8; (size - 28) as usize], host);
+                    }
+                }
+                // WRITEREG_ACK: status(2)=0 | cmd(2)=0x0083 | len(2)=4 | id(2) | data(4).
+                let mut ack = Vec::with_capacity(12);
+                ack.extend_from_slice(&0u16.to_be_bytes());
+                ack.extend_from_slice(&0x0083u16.to_be_bytes());
+                ack.extend_from_slice(&4u16.to_be_bytes());
+                ack.extend_from_slice(&request_id.to_be_bytes());
+                ack.extend_from_slice(&0u32.to_be_bytes());
+                let _ = sock.send_to(&ack, from);
+            }
+        });
+        (addr, jh)
+    }
+
+    fn run_probe(threshold: u32, ceil: u32) -> u32 {
+        let host = GvspSocket::from_udp(UdpSocket::bind("127.0.0.1:0").unwrap());
+        host.set_read_timeout(Some(RX_POLL_TIMEOUT)).unwrap();
+        let host_addr = host.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (cam_addr, jh) = spawn_fake_camera(threshold, host_addr, Arc::clone(&stop));
+        let mut dev = Device::open(cam_addr).unwrap();
+        let (log_tx, _log_rx) = bounded::<LogEntry>(64);
+        let chosen = probe_packet_size(&mut dev, &host, STREAM_CHANNEL, ceil, Ipv4Addr::LOCALHOST, &log_tx);
+        stop.store(true, Ordering::Relaxed);
+        let _ = jh.join();
+        chosen
+    }
+
+    #[test]
+    fn probe_settles_on_the_path_mtu() {
+        // A path carrying up to 1000 bytes: the probe converges on 1000.
+        assert_eq!(run_probe(1000, 2000), 1000);
+    }
+
+    #[test]
+    fn probe_keeps_the_ceiling_when_the_whole_path_carries_it() {
+        // The current (ceiling) size already works — settled in one fire.
+        assert_eq!(run_probe(1500, 1500), 1500);
+    }
+
+    #[test]
+    fn probe_falls_back_when_the_camera_ignores_test_packets() {
+        // Nothing ever arrives: the probe leaves the MTU-derived ceiling in place.
+        assert_eq!(run_probe(0, 1500), 1500);
+    }
+}

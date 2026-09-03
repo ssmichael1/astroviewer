@@ -39,12 +39,36 @@ impl Histogram {
     }
 }
 
+/// A pixel type the histogram/stats routines can run over natively. Integer
+/// (`u16`) frames run without a widening `f32` copy; the conversions used here
+/// (`u16 as f32`, `u16 as f64`) are exact, so the `u16` path produces results
+/// bit-for-bit identical to first converting the whole buffer to `f32`.
+pub trait HistPixel: Copy {
+    fn to_f32(self) -> f32;
+    fn to_f64(self) -> f64;
+}
+
+impl HistPixel for f32 {
+    #[inline]
+    fn to_f32(self) -> f32 { self }
+    #[inline]
+    fn to_f64(self) -> f64 { self as f64 }
+}
+
+impl HistPixel for u16 {
+    #[inline]
+    fn to_f32(self) -> f32 { self as f32 }
+    #[inline]
+    fn to_f64(self) -> f64 { self as f64 }
+}
+
 /// Compute histogram over the given fixed range `[range_min, range_max]`.
 /// Values outside the range are clamped into the first/last bin.
-pub fn compute_histogram(data: &[f32], num_bins: usize, range_min: f32, range_max: f32) -> Histogram {
+pub fn compute_histogram<T: HistPixel>(data: &[T], num_bins: usize, range_min: f32, range_max: f32) -> Histogram {
     let mut data_min = f32::INFINITY;
     let mut data_max = f32::NEG_INFINITY;
-    for &v in data {
+    for &raw in data {
+        let v = raw.to_f32();
         if v < data_min { data_min = v; }
         if v > data_max { data_max = v; }
     }
@@ -60,7 +84,8 @@ pub fn compute_histogram(data: &[f32], num_bins: usize, range_min: f32, range_ma
     }
 
     let mut counts = vec![0u64; num_bins];
-    for &v in data {
+    for &raw in data {
+        let v = raw.to_f32();
         let idx = ((v - lo) / bin_width) as usize;
         let idx = idx.min(num_bins - 1);
         counts[idx] += 1;
@@ -69,13 +94,13 @@ pub fn compute_histogram(data: &[f32], num_bins: usize, range_min: f32, range_ma
     Histogram { edges, counts, data_min, data_max }
 }
 
-pub fn compute_stats(data: &[f32]) -> (f32, f32) {
+pub fn compute_stats<T: HistPixel>(data: &[T]) -> (f32, f32) {
     if data.is_empty() {
         return (0.0, 0.0);
     }
     let n = data.len() as f32;
-    let mean = data.iter().sum::<f32>() / n;
-    let var = data.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let mean = data.iter().map(|&v| v.to_f32()).sum::<f32>() / n;
+    let var = data.iter().map(|&raw| { let v = raw.to_f32(); (v - mean) * (v - mean) }).sum::<f32>() / n;
     (mean, var.sqrt())
 }
 
@@ -100,8 +125,8 @@ pub fn compute_stats(data: &[f32]) -> (f32, f32) {
 /// range would make the edges depend on the data (forcing a min/max pass first),
 /// so those fall back to the original functions to preserve their exact
 /// behavior.
-pub fn compute_histogram_and_stats(
-    data: &[f32],
+pub fn compute_histogram_and_stats<T: HistPixel>(
+    data: &[T],
     num_bins: usize,
     range_min: f32,
     range_max: f32,
@@ -131,7 +156,8 @@ pub fn compute_histogram_and_stats(
     let mut data_max = f32::NEG_INFINITY;
     let mut sum = 0.0f64;
     let mut sum_sq = 0.0f64;
-    for &v in data {
+    for &raw in data {
+        let v = raw.to_f32();
         if v < data_min {
             data_min = v;
         }
@@ -143,7 +169,7 @@ pub fn compute_histogram_and_stats(
         let idx = ((v - lo) / bin_width) as usize;
         let idx = idx.min(num_bins - 1);
         counts[idx] += 1;
-        let vd = v as f64;
+        let vd = raw.to_f64();
         sum += vd;
         sum_sq += vd * vd;
     }
@@ -225,5 +251,59 @@ mod tests {
         let data: Vec<f32> = (0..2000).map(|i| (i % 500) as f32).collect();
         assert_matches(&data, 256, 5.0, 5.0);
         assert_matches(&data, 256, 100.0, 10.0);
+    }
+
+    /// The native `u16` path must produce a Histogram and mean/stddev
+    /// bit-for-bit identical to widening the buffer to `f32` first — the whole
+    /// point of the dual-type frame is that integer sources skip that copy
+    /// without changing a single displayed or recorded number.
+    fn assert_u16_matches_f32(data_u16: &[u16], num_bins: usize, lo: f32, hi: f32) {
+        let data_f32: Vec<f32> = data_u16.iter().map(|&v| v as f32).collect();
+
+        // Fused path: u16 vs f32.
+        let (h_u, mean_u, std_u) = compute_histogram_and_stats(data_u16, num_bins, lo, hi);
+        let (h_f, mean_f, std_f) = compute_histogram_and_stats(&data_f32, num_bins, lo, hi);
+        assert_eq!(h_u.counts, h_f.counts, "fused bin counts differ");
+        assert_eq!(h_u.edges, h_f.edges, "fused edges differ");
+        assert_eq!(h_u.data_min, h_f.data_min, "fused data_min differs");
+        assert_eq!(h_u.data_max, h_f.data_max, "fused data_max differs");
+        assert_eq!(mean_u.to_bits(), mean_f.to_bits(), "fused mean differs");
+        assert_eq!(std_u.to_bits(), std_f.to_bits(), "fused stddev differs");
+
+        // Standalone histogram + stats over the same data.
+        let hh_u = compute_histogram(data_u16, num_bins, lo, hi);
+        let hh_f = compute_histogram(&data_f32, num_bins, lo, hi);
+        assert_eq!(hh_u.counts, hh_f.counts, "histogram bin counts differ");
+        assert_eq!(hh_u.edges, hh_f.edges, "histogram edges differ");
+        let (m_u, s_u) = compute_stats(data_u16);
+        let (m_f, s_f) = compute_stats(&data_f32);
+        assert_eq!(m_u.to_bits(), m_f.to_bits(), "stats mean differs");
+        assert_eq!(s_u.to_bits(), s_f.to_bits(), "stats stddev differs");
+    }
+
+    #[test]
+    fn u16_path_matches_f32_gradient() {
+        let data: Vec<u16> = (0..4096).map(|i| i as u16).collect();
+        assert_u16_matches_f32(&data, 256, 0.0, 4095.0);
+    }
+
+    #[test]
+    fn u16_path_matches_f32_16bit() {
+        let data: Vec<u16> = (0..20_000).map(|i| ((i * 6151) % 65536) as u16).collect();
+        assert_u16_matches_f32(&data, 256, 0.0, 65535.0);
+    }
+
+    #[test]
+    fn u16_path_matches_f32_constant() {
+        let data = vec![1234u16; 5000];
+        assert_u16_matches_f32(&data, 256, 0.0, 4095.0);
+    }
+
+    #[test]
+    fn u16_path_matches_f32_out_of_range() {
+        // Values above hi must clamp into the last bin, exactly as for f32.
+        let mut data: Vec<u16> = vec![0, 1, 2047, 4094, 4095, 9000, 65535];
+        data.extend((0..1000).map(|i| (i % 4096) as u16));
+        assert_u16_matches_f32(&data, 256, 0.0, 4095.0);
     }
 }

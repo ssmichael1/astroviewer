@@ -88,8 +88,71 @@ const STREAM_PACKET_DELAY: u64 = 0x08; // GevSCPD
 const STREAM_DEST_ADDRESS: u64 = 0x18; // GevSCDA
 
 /// Bits 0-15 of `GevSCPSPacketSize` hold the size; masking matters on read too
-/// (a device may leave the do-not-fragment bit set).
+/// (a device may leave the do-not-fragment bit set). Aravis
+/// `ARV_GVBS_STREAM_CHANNEL_0_PACKET_SIZE_MASK = 0x0000ffff`
+/// (`arvgvcpprivate.h`, line 129).
 const STREAM_PACKET_SIZE_MASK: u32 = 0xFFFF;
+/// `GevSCPSPacketSize` do-not-fragment flag: the device sets the IP
+/// Don't-Fragment bit on the packets of this channel. Aravis
+/// `ARV_GVBS_STREAM_CHANNEL_0_PACKET_DO_NOT_FRAGMENT = 1 << 30`
+/// (`arvgvcpprivate.h`, line 132).
+const SCPS_DO_NOT_FRAGMENT: u32 = 1 << 30;
+/// `GevSCPSPacketSize` fire-test-packet flag: writing the register with this
+/// bit set makes the device emit one test packet of the requested size (the
+/// bit is self-clearing / edge triggered). Aravis
+/// `ARV_GVBS_STREAM_CHANNEL_0_PACKET_SIZE_FIRE_TEST = 1 << 31`
+/// (`arvgvcpprivate.h`, line 133).
+const SCPS_FIRE_TEST_PACKET: u32 = 1 << 31;
+
+/// Encode a `GevSCPSPacketSize` register value: the 16-bit packet size in the
+/// low bits, optionally OR-ed with the do-not-fragment and fire-test-packet
+/// flag bits. Masks per aravis `arvgvcpprivate.h`.
+pub(crate) fn encode_stream_packet_size(size: u32, do_not_fragment: bool, fire_test: bool) -> u32 {
+    let mut v = size & STREAM_PACKET_SIZE_MASK;
+    if do_not_fragment {
+        v |= SCPS_DO_NOT_FRAGMENT;
+    }
+    if fire_test {
+        v |= SCPS_FIRE_TEST_PACKET;
+    }
+    v
+}
+
+/// Binary-search the largest packet size in `floor..=ceil` for which
+/// `arrives(size)` is true, assuming monotonicity: if a size is carried, every
+/// smaller one is too (the path MTU is a threshold). `ceil` is tried first (the
+/// common good path — a jumbo link whose current size already works — returns
+/// on the first probe), then `floor`; `None` means even `floor` did not arrive,
+/// so the caller can fall back cleanly (the camera ignores test packets, or the
+/// path is narrower than the floor). `arrives` is expected to be reliable — any
+/// per-candidate retrying belongs inside it.
+pub(crate) fn largest_carried_packet_size(
+    floor: u32,
+    ceil: u32,
+    mut arrives: impl FnMut(u32) -> bool,
+) -> Option<u32> {
+    if ceil < floor {
+        return None;
+    }
+    if arrives(ceil) {
+        return Some(ceil);
+    }
+    if !arrives(floor) {
+        return None;
+    }
+    // Invariant: `lo` is known to arrive, `hi` is known not to.
+    let mut lo = floor;
+    let mut hi = ceil;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if arrives(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
 
 // ── Transaction policy ──────────────────────────────────────────────────────
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -643,6 +706,25 @@ impl Device {
         let addr = Self::stream_reg(channel, STREAM_PACKET_SIZE) as u32;
         Ok(self.read_register(addr)? & STREAM_PACKET_SIZE_MASK)
     }
+
+    /// Overwrite `GevSCPSPacketSize` with a plain `size` (the do-not-fragment
+    /// and fire-test flag bits cleared). Used to settle on the probed size and
+    /// to restore a clean register after a probe.
+    pub fn set_stream_packet_size(&mut self, channel: u32, size: u32) -> Result<(), GvcpError> {
+        let addr = Self::stream_reg(channel, STREAM_PACKET_SIZE) as u32;
+        self.write_register(addr, encode_stream_packet_size(size, false, false))
+    }
+
+    /// Ask the device to emit one test packet of `size` bytes (the full IP
+    /// datagram) with the IP do-not-fragment flag set, by writing the
+    /// fire-test-packet and do-not-fragment bits into `GevSCPSPacketSize`. The
+    /// device sends it to the currently configured `GevSCDA`/`GevSCPHostPort`,
+    /// so those must be set (and control held) first. The fire bit is
+    /// self-clearing. Used by the auto packet-size probe.
+    pub fn fire_test_packet(&mut self, channel: u32, size: u32) -> Result<(), GvcpError> {
+        let addr = Self::stream_reg(channel, STREAM_PACKET_SIZE) as u32;
+        self.write_register(addr, encode_stream_packet_size(size, true, true))
+    }
 }
 
 /// Encode a PACKETRESEND payload. GigE Vision 1.x layout, 12 bytes:
@@ -1175,5 +1257,85 @@ mod resend_tests {
         assert_eq!(b[1], FLAG_EXTENDED_IDS);
         assert_ne!(r.request_id, r2.request_id);
         assert_ne!(r.request_id, 0);
+    }
+}
+
+#[cfg(test)]
+mod packet_probe_tests {
+    use super::*;
+
+    /// The SCPS register encoding against the aravis `arvgvcpprivate.h` masks:
+    /// size in the low 16 bits, do-not-fragment = `1 << 30`, fire-test = `1 << 31`.
+    #[test]
+    fn scps_encoding_matches_the_aravis_masks() {
+        // Plain size, no flags: exactly the 16-bit size.
+        assert_eq!(encode_stream_packet_size(9000, false, false), 9000);
+        assert_eq!(encode_stream_packet_size(1500, false, false), 1500);
+        // The size is masked to 16 bits; high junk never bleeds into the flags.
+        assert_eq!(encode_stream_packet_size(0x1_2345, false, false), 0x2345);
+        // Flag bits, verified as literal bit positions (not derived from consts).
+        assert_eq!(encode_stream_packet_size(0, true, false), 1 << 30);
+        assert_eq!(encode_stream_packet_size(0, false, true), 1 << 31);
+        // A fired do-not-fragment test packet of 9000: size | DNF | FIRE.
+        assert_eq!(
+            encode_stream_packet_size(9000, true, true),
+            9000 | (1 << 30) | (1 << 31)
+        );
+        // And the constants themselves are the aravis values.
+        assert_eq!(STREAM_PACKET_SIZE_MASK, 0x0000_ffff);
+        assert_eq!(SCPS_DO_NOT_FRAGMENT, 1 << 30);
+        assert_eq!(SCPS_FIRE_TEST_PACKET, 1 << 31);
+    }
+
+    /// A monotone predicate with a threshold: the largest carried size is the
+    /// threshold itself, found without ever probing above `ceil` or below
+    /// `floor`.
+    #[test]
+    fn search_finds_the_threshold() {
+        for threshold in [576u32, 1500, 4000, 8999, 9000] {
+            let mut probed = Vec::new();
+            let got = largest_carried_packet_size(576, 9000, |s| {
+                probed.push(s);
+                s <= threshold
+            });
+            assert_eq!(got, Some(threshold.min(9000)), "threshold {threshold}");
+            assert!(probed.iter().all(|&s| (576..=9000).contains(&s)), "stayed in range: {probed:?}");
+        }
+    }
+
+    /// The current (ceil) size working is the common case and costs one probe.
+    #[test]
+    fn search_returns_ceil_on_the_first_probe_when_it_works() {
+        let mut calls = 0usize;
+        let got = largest_carried_packet_size(576, 9000, |_| {
+            calls += 1;
+            true
+        });
+        assert_eq!(got, Some(9000));
+        assert_eq!(calls, 1, "no further probing once the ceiling carries");
+    }
+
+    /// A camera that answers no test packet at all yields `None` (fall back),
+    /// after at most the ceil-then-floor pair of probes.
+    #[test]
+    fn search_gives_up_when_nothing_arrives() {
+        let mut calls = 0usize;
+        let got = largest_carried_packet_size(576, 9000, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(got, None);
+        assert_eq!(calls, 2, "ceil then floor, then give up");
+    }
+
+    /// Only the floor carries: it is returned, and a degenerate range is safe.
+    #[test]
+    fn search_handles_floor_only_and_empty_ranges() {
+        assert_eq!(largest_carried_packet_size(576, 9000, |s| s <= 576), Some(576));
+        // floor == ceil: a single working size.
+        assert_eq!(largest_carried_packet_size(1500, 1500, |_| true), Some(1500));
+        assert_eq!(largest_carried_packet_size(1500, 1500, |_| false), None);
+        // ceil below floor: nothing to probe.
+        assert_eq!(largest_carried_packet_size(1500, 576, |_| true), None);
     }
 }

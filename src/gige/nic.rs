@@ -170,6 +170,21 @@ pub fn mtu(iface: &Iface) -> u32 {
     1500
 }
 
+/// The largest MTU the interface's driver allows, where the OS can say
+/// (macOS `SIOCGIFDEVMTU`): the difference between "jumbo frames are off"
+/// and "this adapter cannot do jumbo frames".
+pub fn max_mtu(iface: &Iface) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::interface_max_mtu(iface.name())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = iface;
+        None
+    }
+}
+
 /// GVSP packet size derived from the link MTU. `GevSCPSPacketSize` is the full
 /// transmitted IP datagram, so it tracks the MTU directly (aravis corroborates:
 /// its payload stride is `packet_size - (IP + UDP + GVSP)`). Clamped to the
@@ -781,5 +796,16 @@ mod recv_tests {
         assert_eq!(super::super::macos::interface_mtu("lo0"), Some(16384));
         assert_eq!(super::super::macos::interface_mtu("nosuch0"), None);
         assert_eq!(super::super::macos::interface_mtu(""), None);
+        // Not every driver answers the device-MTU query (loopback does not);
+        // one that does reports a ceiling no lower than the configured MTU.
+        for name in ["lo0", "en0"] {
+            if let (Some(mtu), Some(max)) =
+                (super::super::macos::interface_mtu(name), super::super::macos::interface_max_mtu(name))
+            {
+                println!("{name}: mtu {mtu}, driver max {max}");
+                assert!(max >= mtu, "{name}: {max} < {mtu}");
+            }
+        }
+        assert_eq!(super::super::macos::interface_max_mtu("nosuch0"), None);
     }
 }

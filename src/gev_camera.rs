@@ -389,12 +389,14 @@ pub(crate) fn start_camera_at(
     // the control list. All GVCP access here is a direct blocking transaction.
     let mut controls = Vec::new();
     if let Some(g) = genapi.as_mut() {
-        // A previous session may have left the camera acquiring (an unclean
-        // exit, or a control lease that lapsed mid-stream) with the transport
-        // locked; an AcquisitionStart in that state can be ignored outright.
-        // Put both back as a fresh session would find them before configuring.
-        execute_command(g, &mut dev, "AcquisitionStop", &log_tx);
-        set_int_feature(g, &mut dev, "TLParamsLocked", 0, &log_tx);
+        // `GEV_PRESTOP=1`: send AcquisitionStop and unlock the transport before
+        // configuring, for a camera a previous session left acquiring. Opt-in
+        // while its effect on the Hawk is being established.
+        if std::env::var("GEV_PRESTOP").is_ok_and(|v| v.trim() == "1") {
+            let _ = log_tx.try_send(LogEntry::info("GigE: GEV_PRESTOP=1: AcquisitionStop + TLParamsLocked=0 before configuring".into()));
+            execute_command(g, &mut dev, "AcquisitionStop", &log_tx);
+            set_int_feature(g, &mut dev, "TLParamsLocked", 0, &log_tx);
+        }
         // best-effort configuration; ignore individual feature failures.
         configure_acquisition(g, &mut dev, &log_tx);
         controls = build_controls(g, &mut dev, ip);
@@ -1692,10 +1694,14 @@ fn punch_stream_port(
     if let Some(p) = port {
         let _ = s.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
     }
-    // Until a packet has arrived the port is a guess — `GevSCSP` on the Hawk
-    // reads back the *host* port it was just given — so keep spraying the
-    // range cameras actually stream from; one packet through settles it.
-    if shared.packets.load(Ordering::Relaxed) == 0 {
+    // Until a packet has arrived the port is a guess (`GevSCSP` on the Hawk
+    // reads back the *host* port it was just given). Spray the range cameras
+    // actually stream from when the register says nothing, or on request
+    // (`GEV_PUNCH_SPRAY=1`): unsolicited datagrams at a camera's stream port
+    // are not free of risk on fragile firmware, so it is not the default.
+    if shared.packets.load(Ordering::Relaxed) == 0
+        && (port.is_none() || std::env::var("GEV_PUNCH_SPRAY").is_ok_and(|v| v.trim() == "1"))
+    {
         for p in PUNCH_SPRAY_PORTS {
             let _ = s.send_to(&[0u8], SocketAddr::new(IpAddr::V4(cam_ip), p));
         }

@@ -244,6 +244,13 @@ struct ViewerApp {
     frame_tx: Sender<FrameData>,
     frame_rx: Receiver<FrameData>,
     current_frame: Option<FrameData>,
+    /// Return path to the active GigE session's decode-buffer pool. When the UI
+    /// replaces `current_frame`, the outgoing frame's `u16` buffer is sent back
+    /// here for the capture thread to reuse (only if uniquely owned — a clone
+    /// still held by the solver or recorder is just dropped). `None` unless a
+    /// GigE session is streaming.
+    #[cfg(feature = "gev")]
+    frame_pool_return: Option<Sender<Vec<u16>>>,
 
     display_params: DisplayParams,
     colormap: Colormap,
@@ -578,6 +585,8 @@ impl ViewerApp {
         let mut app = Self {
             frame_tx, frame_rx,
             current_frame: None,
+            #[cfg(feature = "gev")]
+            frame_pool_return: None,
             display_params: DisplayParams { scale_min: 0.0, scale_max: 4095.0, ..Default::default() },
             colormap: Colormap::new(ColormapKind::Grayscale),
             scale_mode: ScaleMode::Auto,
@@ -1376,6 +1385,8 @@ impl ViewerApp {
             CaptureState::Stopped => {}
         }
         self.capture_running = false;
+        #[cfg(feature = "gev")]
+        { self.frame_pool_return = None; }
         self.frame_times.clear();
         self.fps = 0.0;
         self.pump_drops.store(0, Ordering::Relaxed);
@@ -1384,6 +1395,26 @@ impl ViewerApp {
         if self.recording {
             self.stop_recording();
         }
+    }
+
+    /// Install `frame` as the current frame, returning the outgoing frame's
+    /// `u16` buffer to the GigE decode pool when it is uniquely owned (a clone
+    /// still held by the solver or recorder is dropped instead). This is what
+    /// makes the pool recycle: the capture thread hands ownership forward, and
+    /// the UI hands the spent buffer back here.
+    fn replace_current_frame(&mut self, frame: FrameData) {
+        let old = self.current_frame.replace(frame);
+        #[cfg(feature = "gev")]
+        if let (Some(tx), Some(old)) = (&self.frame_pool_return, old) {
+            if let Pixels::U16(arc) = old.mono {
+                if let Some(buf) = Arc::into_inner(arc) {
+                    // Non-blocking: a full pool just drops the buffer.
+                    let _ = tx.try_send(buf);
+                }
+            }
+        }
+        #[cfg(not(feature = "gev"))]
+        drop(old);
     }
 
     fn start_fits(&mut self, path: std::path::PathBuf) {
@@ -1528,6 +1559,7 @@ impl ViewerApp {
         match gev_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
                 let controls = handle.controls.clone();
+                self.frame_pool_return = Some(handle.buffer_return.clone());
                 self.add_log(LogEntry::info(format!("GigE camera opened: {}", info.display_name())));
                 let id = info.id.clone();
                 self.capture_state = CaptureState::Gev { handle, controls };
@@ -1925,7 +1957,7 @@ impl ViewerApp {
                 self.record_frame(&frame);
             }
 
-            self.current_frame = Some(frame);
+            self.replace_current_frame(frame);
             self.frame_serial += 1;
         }
     }

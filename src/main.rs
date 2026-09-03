@@ -1204,6 +1204,35 @@ impl ViewerApp {
         }
     }
 
+    /// Toolbar Stop. For a GigE session, pause acquisition but keep the
+    /// session (control, socket, stream channel) so Play resumes without the
+    /// teardown-and-reconnect that wedges some cameras' stream engines. Every
+    /// other source stops fully.
+    fn pause_or_stop(&mut self) {
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { handle, .. } = &self.capture_state {
+            let _ = handle.cmd_tx.send(gev_camera::GevCmd::Pause);
+            self.capture_running = false;
+            self.frame_times.clear();
+            self.fps = 0.0;
+            return;
+        }
+        self.stop_capture();
+    }
+
+    /// Toolbar Play. Resume a paused GigE session in place; otherwise open the
+    /// selected source fresh.
+    fn play_or_resume(&mut self) {
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { handle, .. } = &self.capture_state {
+            let _ = handle.cmd_tx.send(gev_camera::GevCmd::Resume);
+            self.capture_running = true;
+            return;
+        }
+        let source = self.camera_source.clone();
+        self.open_source(source);
+    }
+
     fn stop_capture(&mut self) {
         match std::mem::replace(&mut self.capture_state, CaptureState::Stopped) {
             CaptureState::Fits { _stop_tx } => {}
@@ -4221,11 +4250,10 @@ impl eframe::App for ViewerApp {
                     ui.separator();
                     if self.capture_running {
                         if ui.button(egui::RichText::new("\u{23F9}  Stop").size(14.0)).clicked() {
-                            self.stop_capture();
+                            self.pause_or_stop();
                         }
                     } else if widgets::primary_button(ui, "\u{25B6}  Play", &pal) {
-                        let source = self.camera_source.clone();
-                        self.open_source(source);
+                        self.play_or_resume();
                     }
                     ui.separator();
                     // The record/stop control. Red record semantics (filled

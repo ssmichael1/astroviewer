@@ -16,6 +16,34 @@ const GVSP_EXTENDED_HEADER_SIZE: usize = 20;
 /// Bit 7 of the packet-format byte marks the extended-ID header.
 const EXTENDED_ID_FLAG: u8 = 0x80;
 
+/// GVSP packet status (header bytes 0-1). Success and `PACKET_RESEND`
+/// (0x0100, the 2.0 marker on a retransmitted packet) carry image data. The
+/// error statuses (bit 15 set) come back in reply to a PACKETRESEND for data
+/// the device cannot supply, and carry none: `PACKET_UNAVAILABLE` and the
+/// `..._REMOVED_FROM_MEMORY` codes are final, `NOT_YET_AVAILABLE` /
+/// `TEMPORARILY_UNAVAILABLE` invite a retry.
+pub const STATUS_PACKET_UNAVAILABLE: u16 = 0x800C;
+pub const STATUS_PACKET_NOT_YET_AVAILABLE: u16 = 0x8010;
+pub const STATUS_PACKET_TEMPORARILY_UNAVAILABLE: u16 = 0x8014;
+
+/// Whether a packet status is an error (the packet carries no image data).
+pub fn status_is_error(status: u16) -> bool {
+    status & 0x8000 != 0
+}
+
+/// Whether a packet status means the device will never supply that packet.
+pub fn status_is_permanent_loss(status: u16) -> bool {
+    status_is_error(status)
+        && status != STATUS_PACKET_NOT_YET_AVAILABLE
+        && status != STATUS_PACKET_TEMPORARILY_UNAVAILABLE
+}
+
+/// Whether a raw packet carries the extended-ID header, which decides the
+/// PACKETRESEND layout for its block.
+pub fn has_extended_ids(packet: &[u8]) -> bool {
+    packet.len() > 4 && packet[4] & EXTENDED_ID_FLAG != 0
+}
+
 /// GVSP leader payload type for image data (`0x4001` is the image + chunk
 /// variant real cameras use and must be treated as image too — viva-gige lost
 /// it to a truncating `as u8` cast).
@@ -37,6 +65,9 @@ pub enum GvspPacket<'a> {
     Payload {
         block_id: u64,
         packet_id: u32,
+        /// Header status; an error status means no image data (see
+        /// [`status_is_error`]).
+        status: u16,
         data: &'a [u8],
     },
     /// End-of-frame trailer.
@@ -61,6 +92,7 @@ pub fn parse_packet(payload: &[u8]) -> Result<GvspPacket<'_>, GvspError> {
     if payload.len() < GVSP_HEADER_SIZE {
         return Err(GvspError::Truncated);
     }
+    let status = u16::from_be_bytes([payload[0], payload[1]]);
     let format_byte = payload[4];
     let extended = (format_byte & EXTENDED_ID_FLAG) != 0;
     let format = format_byte & 0x0F;
@@ -86,6 +118,7 @@ pub fn parse_packet(payload: &[u8]) -> Result<GvspPacket<'_>, GvspError> {
         0x03 => Ok(GvspPacket::Payload {
             block_id,
             packet_id,
+            status,
             data: &payload[offset..],
         }),
         0x02 => Ok(GvspPacket::Trailer { block_id }),
@@ -148,6 +181,10 @@ impl PacketBitmap {
 
     fn is_complete(&self) -> bool {
         self.received == self.total
+    }
+
+    fn is_set(&self, id: usize) -> bool {
+        id < self.total && self.words[id / 64] & (1u64 << (id % 64)) != 0
     }
 
     /// Missing packet indices as inclusive `[start, end]` ranges, ascending.
@@ -213,6 +250,11 @@ impl FrameAssembly {
     /// Whether every expected packet has arrived.
     pub fn is_complete(&self) -> bool {
         self.bitmap.is_complete()
+    }
+
+    /// Whether packet `id` (0-based) has already been placed.
+    pub fn has(&self, id: usize) -> bool {
+        self.bitmap.is_set(id)
     }
 
     /// 0-based indices of packets not yet received, as inclusive ranges — the
@@ -336,6 +378,7 @@ mod tests {
                 block_id,
                 packet_id,
                 data,
+                ..
             } => {
                 assert_eq!(block_id, 7);
                 assert_eq!(packet_id, 5);
@@ -365,6 +408,7 @@ mod tests {
                 block_id,
                 packet_id,
                 data,
+                ..
             } => {
                 assert_eq!(block_id, 0x0000_0001_0000_0009);
                 assert_eq!(packet_id, 0x2A);
@@ -408,5 +452,31 @@ mod tests {
         a.ingest(0, &[1, 2, 3, 4]);
         a.ingest(0, &[1, 2, 3, 4]); // dup
         assert!(a.finish().is_none(), "only one of two packets present");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn error_status_replies_parse_with_their_status_and_no_data() {
+        // A PACKET_UNAVAILABLE reply: status 0x800C, payload format, id 5,
+        // nothing after the header.
+        let p = [0x80, 0x0C, 0, 7, 0x03, 0, 0, 5];
+        match parse_packet(&p).unwrap() {
+            GvspPacket::Payload { block_id, packet_id, status, data } => {
+                assert_eq!((block_id, packet_id, status), (7, 5, STATUS_PACKET_UNAVAILABLE));
+                assert!(data.is_empty());
+                assert!(status_is_error(status) && status_is_permanent_loss(status));
+            }
+            _ => panic!("payload expected"),
+        }
+        assert!(!status_is_permanent_loss(STATUS_PACKET_NOT_YET_AVAILABLE));
+        assert!(!status_is_permanent_loss(STATUS_PACKET_TEMPORARILY_UNAVAILABLE));
+        assert!(status_is_permanent_loss(0x8012));
+        assert!(!status_is_error(0x0100), "PACKET_RESEND marks a retransmission, not an error");
+        assert!(has_extended_ids(&[0, 0, 0, 0, 0x83, 0, 0, 0]));
+        assert!(!has_extended_ids(&p));
     }
 }

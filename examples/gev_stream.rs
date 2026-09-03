@@ -205,7 +205,7 @@ fn main() -> anyhow::Result<()> {
                 let expected = total.div_ceil(stride).max(1);
                 assembly = Some(FrameAssembly::new(block_id, expected, stride, Instant::now() + Duration::from_secs(2)));
             }
-            Ok(GvspPacket::Payload { block_id, packet_id, data }) => {
+            Ok(GvspPacket::Payload { block_id, packet_id, data, .. }) => {
                 payloads += 1;
                 if first_pkt_ids.len() < 6 { first_pkt_ids.push(packet_id); }
                 if let (Some(a), Some((w, h, pf))) = (assembly.as_ref(), geom) {

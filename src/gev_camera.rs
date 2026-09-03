@@ -1458,16 +1458,16 @@ fn capture_loop(
     // Teardown sequence, each step gated so we can find which one wedges a
     // camera's stream engine (the Hawk stalls until power-cycled after a full
     // teardown, though the GenICam Stop/Start commands alone are clean).
-    // Defaults reproduce the historical behavior; the aravis-style teardown is
-    //   GEV_STOP_UNLOCK=0 GEV_STOP_ZERO_HOSTPORT=1
-    // (never unlock the transport; stop the channel by zeroing GevSCPHostPort).
-    //   GEV_STOP_ACQSTOP   (default 1) send AcquisitionStop
-    //   GEV_STOP_UNLOCK    (default 1) set TLParamsLocked=0
-    //   GEV_STOP_ZERO_HOSTPORT (default 0) raw-write GevSCPHostPort=0 (aravis)
-    //   GEV_STOP_RELEASE   (default 1) release control privilege
+    // Aravis-style teardown by default: AcquisitionStop, stop the channel by
+    // zeroing GevSCPHostPort, release control. We do not unlock the transport
+    // because we no longer lock it (see the acquisition-start comment).
+    //   GEV_STOP_ACQSTOP       (default 1) send AcquisitionStop
+    //   GEV_STOP_UNLOCK        (default 0) set TLParamsLocked=0
+    //   GEV_STOP_ZERO_HOSTPORT (default 1) raw-write GevSCPHostPort=0 (aravis)
+    //   GEV_STOP_RELEASE       (default 1) release control privilege
     let stop_acqstop = env_on("GEV_STOP_ACQSTOP", true);
-    let stop_unlock = env_on("GEV_STOP_UNLOCK", true);
-    let stop_zero_hostport = env_on("GEV_STOP_ZERO_HOSTPORT", false);
+    let stop_unlock = env_on("GEV_STOP_UNLOCK", false);
+    let stop_zero_hostport = env_on("GEV_STOP_ZERO_HOSTPORT", true);
     let stop_release = env_on("GEV_STOP_RELEASE", true);
     let shutdown = |dev: &mut Device, genapi: &mut Option<GenApi>| {
         stop.store(true, Ordering::Relaxed);
@@ -1490,16 +1490,17 @@ fn capture_loop(
         }
     };
 
-    // Kick off acquisition now that everything is wired. TLParamsLocked=1 arms
-    // the stream transport — required by FLIR/Point Grey before frames flow,
-    // but aravis never touches TLParamsLocked and is a suspect for wedging the
-    // Hawk. GEV_TLLOCK=0 skips it (aravis-style) to test that.
-    let use_tllock = env_on("GEV_TLLOCK", true);
+    // Kick off acquisition now that everything is wired. We do NOT lock the
+    // transport (TLParamsLocked): aravis never does, and a bench trial proved
+    // that locking it is exactly what wedges the Photonic Science Hawk's
+    // stream engine across a stop/reconnect (lock on -> reconnect stalls;
+    // lock off -> reconnect streams; nothing else differed). GEV_TLLOCK=1
+    // restores the lock for a camera that genuinely needs it.
+    let use_tllock = env_on("GEV_TLLOCK", false);
     if let Some(g) = genapi.as_mut() {
         if use_tllock {
+            let _ = log_tx.try_send(LogEntry::info("GigE: GEV_TLLOCK=1: locking the transport (TLParamsLocked=1)".into()));
             set_int_feature(g, &mut dev, "TLParamsLocked", 1, &log_tx);
-        } else {
-            let _ = log_tx.try_send(LogEntry::info("GigE: GEV_TLLOCK=0: leaving TLParamsLocked untouched (aravis-style)".into()));
         }
         execute_command(g, &mut dev, "AcquisitionStart", &log_tx);
     }
@@ -2040,7 +2041,7 @@ fn apply_set(g: &mut GenApi, dev: &mut Device, cmd: GevCmd, log_tx: &Sender<LogE
         GevCmd::Pause | GevCmd::Resume | GevCmd::Stop => {}
     }
     if restart {
-        if env_on("GEV_TLLOCK", true) {
+        if env_on("GEV_TLLOCK", false) {
             set_int_feature(g, dev, "TLParamsLocked", 1, log_tx);
         }
         execute_command(g, dev, "AcquisitionStart", log_tx);

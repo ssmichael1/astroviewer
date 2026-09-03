@@ -34,12 +34,12 @@ use eframe::egui;
 #[cfg(any(feature = "svbony", feature = "toupcam"))]
 use image::DynamicImage;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
 use colormaps::{Colormap, ColormapKind};
-use histogram::{compute_histogram, compute_stats};
+use histogram::compute_histogram_and_stats;
 use imageview::{DisplayParams, ImageViewer};
 use sources::CameraSource;
 
@@ -72,8 +72,9 @@ impl FrameData {
     /// Build a frame from raw mono `f32` pixels, computing the histogram and stats.
     fn new(mono: Vec<f32>, width: u32, height: u32, bit_depth: u8) -> Self {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
-        let hist = compute_histogram(&mono, 256, 0.0, range_max);
-        let (mean, stddev) = compute_stats(&mono);
+        // Single fused pass over the pixels for histogram + mean + stddev; the
+        // range is fixed (0..bit-depth max), not data-derived.
+        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, 256, 0.0, range_max);
         FrameData { mono: Arc::new(mono), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
@@ -309,6 +310,21 @@ struct ViewerApp {
     frame_times: Vec<Instant>,
     fps: f64,
 
+    /// Frames dropped in the pump thread's forward to the UI channel (bumped by
+    /// the pump thread; shared so the UI can read it).
+    pump_drops: Arc<AtomicU64>,
+    /// Frames discarded by the UI's keep-latest drain (superseded before the
+    /// UI could use them). Only ever touched on the UI thread.
+    ui_drain_drops: u64,
+
+    /// Smoothed GigE receive rate (MB/s), recomputed on the UI thread from the
+    /// running byte counter over ~1 s windows; 0 for non-GigE sources.
+    #[cfg(feature = "gev")]
+    gev_rate_mbps: f64,
+    /// Byte-counter value and time at the last rate sample.
+    #[cfg(feature = "gev")]
+    gev_rate_prev: (u64, Instant),
+
     camera_source: CameraSource,
     capture_state: CaptureState,
     capture_running: bool,
@@ -482,11 +498,29 @@ impl ViewerApp {
         let (frame_tx, pump_rx) = bounded::<FrameData>(2);
         let (pump_tx, frame_rx) = bounded::<FrameData>(2);
         let pump_ctx = cc.egui_ctx.clone();
+        let pump_drops = Arc::new(AtomicU64::new(0));
+        let pump_drops_thread = Arc::clone(&pump_drops);
         thread::spawn(move || {
+            // Coalesce repaint requests to ~display rate: at 100+ fps a repaint
+            // per frame renders far more often than the screen refreshes and
+            // wastes CPU/GPU. We still repaint within one 16 ms window of a
+            // frame landing (the drain keeps only the latest), so the newest
+            // frame is on screen with imperceptible latency.
+            const REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+            let mut last_repaint = Instant::now() - REPAINT_INTERVAL;
             while let Ok(frame) = pump_rx.recv() {
                 // Same drop-when-full semantics producers had sending directly.
-                let _ = pump_tx.try_send(frame);
-                pump_ctx.request_repaint();
+                if pump_tx.try_send(frame).is_err() {
+                    pump_drops_thread.fetch_add(1, Ordering::Relaxed);
+                }
+                let since = last_repaint.elapsed();
+                if since >= REPAINT_INTERVAL {
+                    pump_ctx.request_repaint();
+                    last_repaint = Instant::now();
+                } else {
+                    // Guarantee a repaint by the end of the current window.
+                    pump_ctx.request_repaint_after(REPAINT_INTERVAL - since);
+                }
             }
         });
         let (log_tx, log_rx) = bounded(64);
@@ -585,6 +619,12 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             camera_model_path: None,
             frame_times: Vec::new(), fps: 0.0,
+            pump_drops,
+            ui_drain_drops: 0,
+            #[cfg(feature = "gev")]
+            gev_rate_mbps: 0.0,
+            #[cfg(feature = "gev")]
+            gev_rate_prev: (0, Instant::now()),
             camera_source, capture_state, capture_running,
             recording: false,
             rec_tx: None,
@@ -863,6 +903,43 @@ impl ViewerApp {
         self.ui_theme.palette()
     }
 
+    /// Total frames dropped in the app's own software pipeline since capture
+    /// started (independent of any network loss): producer→UI channel-full
+    /// drops plus the UI's keep-latest discards, and for the GigE backend the
+    /// receive→control handoff drops and the frames whose decode was skipped
+    /// because the UI channel was already full.
+    fn dropped_total(&self) -> u64 {
+        #[allow(unused_mut)]
+        let mut total = self.pump_drops.load(Ordering::Relaxed) + self.ui_drain_drops;
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { ref handle, .. } = self.capture_state {
+            let s = &handle.drop_stats;
+            total += s.rx_to_control.load(Ordering::Relaxed)
+                + s.control_to_ui.load(Ordering::Relaxed)
+                + s.decode_skipped.load(Ordering::Relaxed);
+        }
+        total
+    }
+
+    /// Recompute the smoothed GigE receive rate (MB/s) from the running byte
+    /// counter over ~1 s windows. Resets to 0 when no GigE camera is streaming.
+    #[cfg(feature = "gev")]
+    fn update_gev_rate(&mut self) {
+        if let CaptureState::Gev { ref handle, .. } = self.capture_state {
+            let bytes = handle.received_bytes.load(Ordering::Relaxed);
+            let (prev_bytes, prev_at) = self.gev_rate_prev;
+            let dt = prev_at.elapsed().as_secs_f64();
+            if dt >= 1.0 {
+                let delta = bytes.saturating_sub(prev_bytes) as f64;
+                self.gev_rate_mbps = delta / dt / 1.0e6;
+                self.gev_rate_prev = (bytes, Instant::now());
+            }
+        } else if self.gev_rate_mbps != 0.0 {
+            self.gev_rate_mbps = 0.0;
+            self.gev_rate_prev = (0, Instant::now());
+        }
+    }
+
     /// Human-readable label for the current image source.
     fn source_label(&self) -> String {
         match &self.camera_source {
@@ -1103,6 +1180,12 @@ impl ViewerApp {
         self.rec_filename = filename.clone();
         self.rec_frame_count = 0;
         self.recording = true;
+        // Tell the GEV capture thread to keep every frame (never skip decode)
+        // while recording.
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { ref handle, .. } = self.capture_state {
+            handle.recording.store(true, Ordering::Relaxed);
+        }
         self.add_log(LogEntry::info(format!("Recording started: {}", full_path)));
     }
 
@@ -1117,6 +1200,12 @@ impl ViewerApp {
             let _ = jh.join();
         }
         self.recording = false;
+        // Let the GEV capture thread resume skipping decode on frames the UI
+        // can't keep up with.
+        #[cfg(feature = "gev")]
+        if let CaptureState::Gev { ref handle, .. } = self.capture_state {
+            handle.recording.store(false, Ordering::Relaxed);
+        }
         self.add_log(LogEntry::info(format!(
             "Recording stopped: {} ({} frames)", self.rec_filename, self.rec_frame_count
         )));
@@ -1265,6 +1354,8 @@ impl ViewerApp {
         self.capture_running = false;
         self.frame_times.clear();
         self.fps = 0.0;
+        self.pump_drops.store(0, Ordering::Relaxed);
+        self.ui_drain_drops = 0;
         while self.frame_rx.try_recv().is_ok() {}
         if self.recording {
             self.stop_recording();
@@ -1653,7 +1744,11 @@ impl ViewerApp {
         let mut latest = None;
         loop {
             match self.frame_rx.try_recv() {
-                Ok(frame) => latest = Some(frame),
+                Ok(frame) => {
+                    // Keep only the newest frame; each superseded one is a drop.
+                    if latest.is_some() { self.ui_drain_drops += 1; }
+                    latest = Some(frame);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => { self.capture_running = false; break; }
             }
@@ -1676,8 +1771,8 @@ impl ViewerApp {
                             None => (dmin, dmax),
                         };
                         self.bg_hist_range = Some((rmin, rmax));
-                        frame.hist = compute_histogram(&frame.mono, 256, rmin, rmax);
-                        let (mean, stddev) = compute_stats(&frame.mono);
+                        let (hist, mean, stddev) = compute_histogram_and_stats(&frame.mono, 256, rmin, rmax);
+                        frame.hist = hist;
                         frame.mean = mean;
                         frame.stddev = stddev;
                     }
@@ -1976,6 +2071,11 @@ impl ViewerApp {
             let lw = 65.0;
             egui::Grid::new("stats_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
                 stat_row(ui, lw, "FPS", &format!("{:.1}", self.fps), &pal);
+                #[cfg(feature = "gev")]
+                if matches!(self.capture_state, CaptureState::Gev { .. }) {
+                    stat_row(ui, lw, "Rx rate", &format!("{:.1} MB/s", self.gev_rate_mbps), &pal);
+                }
+                stat_row(ui, lw, "Dropped", &format!("{}", self.dropped_total()), &pal);
                 if let Some(frame) = &self.current_frame {
                     stat_row(ui, lw, "Size", &format!("{} x {}", frame.width, frame.height), &pal);
                     stat_row(ui, lw, "Bit depth", &format!("{}", frame.bit_depth), &pal);
@@ -4031,6 +4131,8 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_frame();
         self.poll_log();
+        #[cfg(feature = "gev")]
+        self.update_gev_rate();
         self.poll_fits_load();
         self.poll_bg();
         #[cfg(feature = "starsolve")]

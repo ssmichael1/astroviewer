@@ -10,6 +10,7 @@ mod fits_source;
 mod histogram;
 mod imageview;
 mod overlays;
+mod pixels;
 mod sources;
 mod widgets;
 
@@ -41,6 +42,7 @@ use std::time::Instant;
 use colormaps::{Colormap, ColormapKind};
 use histogram::compute_histogram_and_stats;
 use imageview::{DisplayParams, ImageViewer};
+use pixels::Pixels;
 use sources::CameraSource;
 
 // ── Data types ──────────────────────────────────────────────────────────────
@@ -50,7 +52,7 @@ struct FrameData {
     /// without copying them — at full sensor resolution this buffer is ~100 MB.
     /// Mutate via `Arc::make_mut`, which is free while the frame is still
     /// uniquely owned (i.e. before it is handed to either).
-    mono: Arc<Vec<f32>>,
+    mono: Pixels,
     width: u32,
     height: u32,
     hist: histogram::Histogram,
@@ -69,13 +71,26 @@ struct FrameData {
 }
 
 impl FrameData {
-    /// Build a frame from raw mono `f32` pixels, computing the histogram and stats.
+    /// Build a frame from raw mono `f32` pixels, computing the histogram and
+    /// stats. Used by float sources (float FITS, computed luma) and by anything
+    /// that has been background-subtracted.
     fn new(mono: Vec<f32>, width: u32, height: u32, bit_depth: u8) -> Self {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         // Single fused pass over the pixels for histogram + mean + stddev; the
         // range is fixed (0..bit-depth max), not data-derived.
         let (hist, mean, stddev) = compute_histogram_and_stats(&mono, 256, 0.0, range_max);
-        FrameData { mono: Arc::new(mono), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
+        FrameData { mono: Pixels::F32(Arc::new(mono)), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
+    }
+
+    /// Build a frame from native `u16` pixels — integer camera sources (GigE /
+    /// INDI) stay `u16` through histogram, stats and colormap with no widening
+    /// copy. The stats run directly on the `u16` slice and are identical to the
+    /// f32 path (see `histogram::HistPixel`).
+    #[allow(dead_code)] // only feature-gated integer sources build u16 frames
+    fn new_u16(mono: Vec<u16>, width: u32, height: u32, bit_depth: u8) -> Self {
+        let range_max = ((1u64 << bit_depth) - 1) as f32;
+        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, 256, 0.0, range_max);
+        FrameData { mono: Pixels::U16(Arc::new(mono)), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
 
@@ -176,7 +191,9 @@ enum BottomTab {
 enum RecordMsg {
     Frame {
         /// Shared with the live frame rather than copied; see [`FrameData::mono`].
-        mono: Arc<Vec<f32>>,
+        /// Carries the frame's native type so an integer frame writes as
+        /// unsigned-16 with no f32 detour.
+        mono: Pixels,
         width: u32,
         height: u32,
         date_obs: String,
@@ -227,6 +244,13 @@ struct ViewerApp {
     frame_tx: Sender<FrameData>,
     frame_rx: Receiver<FrameData>,
     current_frame: Option<FrameData>,
+    /// Return path to the active GigE session's decode-buffer pool. When the UI
+    /// replaces `current_frame`, the outgoing frame's `u16` buffer is sent back
+    /// here for the capture thread to reuse (only if uniquely owned — a clone
+    /// still held by the solver or recorder is just dropped). `None` unless a
+    /// GigE session is streaming.
+    #[cfg(feature = "gev")]
+    frame_pool_return: Option<Sender<Vec<u16>>>,
 
     display_params: DisplayParams,
     colormap: Colormap,
@@ -561,6 +585,8 @@ impl ViewerApp {
         let mut app = Self {
             frame_tx, frame_rx,
             current_frame: None,
+            #[cfg(feature = "gev")]
+            frame_pool_return: None,
             display_params: DisplayParams { scale_min: 0.0, scale_max: 4095.0, ..Default::default() },
             colormap: Colormap::new(ColormapKind::Grayscale),
             scale_mode: ScaleMode::Auto,
@@ -1102,11 +1128,18 @@ impl ViewerApp {
                         if write_err.is_some() {
                             continue;
                         }
-                        // Convert f32 mono to i16 with BZERO=32768 for unsigned 16-bit
-                        let pixels_i16: Vec<i16> = mono.iter().map(|&v| {
-                            let clamped = v.clamp(0.0, 65535.0) as u16;
-                            (clamped as i32 - 32768) as i16
-                        }).collect();
+                        // Store as unsigned 16-bit via BZERO=32768. A U16 frame
+                        // converts straight from its native buffer (bit-for-bit
+                        // identical to the old f32 path for integer sources); an
+                        // F32 frame (float FITS / background-subtracted) keeps
+                        // the clamp(0,65535) semantics.
+                        let pixels_i16: Vec<i16> = match &mono {
+                            Pixels::U16(v) => v.iter().map(|&px| (px as i32 - 32768) as i16).collect(),
+                            Pixels::F32(v) => v.iter().map(|&val| {
+                                let clamped = val.clamp(0.0, 65535.0) as u16;
+                                (clamped as i32 - 32768) as i16
+                            }).collect(),
+                        };
 
                         let img = ImageData::new(
                             vec![width as usize, height as usize],
@@ -1352,6 +1385,8 @@ impl ViewerApp {
             CaptureState::Stopped => {}
         }
         self.capture_running = false;
+        #[cfg(feature = "gev")]
+        { self.frame_pool_return = None; }
         self.frame_times.clear();
         self.fps = 0.0;
         self.pump_drops.store(0, Ordering::Relaxed);
@@ -1360,6 +1395,26 @@ impl ViewerApp {
         if self.recording {
             self.stop_recording();
         }
+    }
+
+    /// Install `frame` as the current frame, returning the outgoing frame's
+    /// `u16` buffer to the GigE decode pool when it is uniquely owned (a clone
+    /// still held by the solver or recorder is dropped instead). This is what
+    /// makes the pool recycle: the capture thread hands ownership forward, and
+    /// the UI hands the spent buffer back here.
+    fn replace_current_frame(&mut self, frame: FrameData) {
+        let old = self.current_frame.replace(frame);
+        #[cfg(feature = "gev")]
+        if let (Some(tx), Some(old)) = (&self.frame_pool_return, old) {
+            if let Pixels::U16(arc) = old.mono {
+                if let Some(buf) = Arc::into_inner(arc) {
+                    // Non-blocking: a full pool just drops the buffer.
+                    let _ = tx.try_send(buf);
+                }
+            }
+        }
+        #[cfg(not(feature = "gev"))]
+        drop(old);
     }
 
     fn start_fits(&mut self, path: std::path::PathBuf) {
@@ -1504,6 +1559,7 @@ impl ViewerApp {
         match gev_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
                 let controls = handle.controls.clone();
+                self.frame_pool_return = Some(handle.buffer_return.clone());
                 self.add_log(LogEntry::info(format!("GigE camera opened: {}", info.display_name())));
                 let id = info.id.clone();
                 self.capture_state = CaptureState::Gev { handle, controls };
@@ -1758,20 +1814,24 @@ impl ViewerApp {
             if self.bg_subtract_enabled {
                 if let Some(bg) = &self.bg_image {
                     if bg.len() == frame.mono.len() {
-                        // Free: the frame is still uniquely owned here, ahead of
-                        // the solve-worker dispatch and the recorder.
-                        for (px, bg_val) in Arc::make_mut(&mut frame.mono).iter_mut().zip(bg.iter()) {
+                        // The subtracted result has negatives, so the frame
+                        // becomes the F32 variant. `make_f32_mut` widens a U16
+                        // buffer once; the frame is still uniquely owned here
+                        // (ahead of the solve-worker dispatch and the recorder),
+                        // so an already-F32 buffer edits in place for free.
+                        let mono = frame.mono.make_f32_mut();
+                        for (px, bg_val) in mono.iter_mut().zip(bg.iter()) {
                             *px -= bg_val;
                         }
                         // Recompute histogram and stats on subtracted data
                         // Use stable range that only expands across frames
-                        let (dmin, dmax) = frame.mono.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                        let (dmin, dmax) = mono.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
                         let (rmin, rmax) = match self.bg_hist_range {
                             Some((prev_min, prev_max)) => (prev_min.min(dmin), prev_max.max(dmax)),
                             None => (dmin, dmax),
                         };
                         self.bg_hist_range = Some((rmin, rmax));
-                        let (hist, mean, stddev) = compute_histogram_and_stats(&frame.mono, 256, rmin, rmax);
+                        let (hist, mean, stddev) = compute_histogram_and_stats(mono, 256, rmin, rmax);
                         frame.hist = hist;
                         frame.mean = mean;
                         frame.stddev = stddev;
@@ -1788,7 +1848,7 @@ impl ViewerApp {
                     }
                 }
                 ScaleMode::ZScale => {
-                    let mono_f64: Vec<f64> = frame.mono.iter().map(|&v| v as f64).collect();
+                    let mono_f64: Vec<f64> = frame.mono.as_f32().iter().map(|&v| v as f64).collect();
                     let (zmin, zmax) = zscale(&mono_f64);
                     self.display_params.scale_min = zmin as f32;
                     self.display_params.scale_max = zmax as f32;
@@ -1818,8 +1878,11 @@ impl ViewerApp {
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
             // Hand this frame to the worker (skipped while it is still busy).
+            // The solver needs owned `f32`; a U16 frame is widened here (solving
+            // is occasional) and keeps its own Arc, so it never pins the pooled
+            // u16 buffer.
             #[cfg(feature = "starsolve")]
-            self.maybe_dispatch_solve(frame.mono.clone(), frame.width, frame.height);
+            self.maybe_dispatch_solve(frame.mono.to_f32_arc(), frame.width, frame.height);
 
             // Rebuild overlays from the most recent completed extraction. These
             // may lag the displayed frame by a job; at these frame rates the
@@ -1894,7 +1957,7 @@ impl ViewerApp {
                 self.record_frame(&frame);
             }
 
-            self.current_frame = Some(frame);
+            self.replace_current_frame(frame);
             self.frame_serial += 1;
         }
     }
@@ -4858,7 +4921,7 @@ impl ViewerApp {
             for ry in 0..roi_h {
                 for rx in 0..roi_w {
                     let src_idx = ((y0 as usize + ry) * frame.width as usize) + (x0 as usize + rx);
-                    let val = if src_idx < frame.mono.len() { frame.mono[src_idx] } else { 0.0 };
+                    let val = frame.mono.value_at(src_idx).unwrap_or(0.0);
                     let mut t = ((val - self.display_params.scale_min) * inv_range).clamp(0.0, 1.0);
                     match self.display_params.transfer {
                         imageview::TransferFn::Linear => { if apply_gamma { t = t.powf(inv_gamma); } }
@@ -4954,7 +5017,7 @@ impl ViewerApp {
                         let py = (y0 as f32 + ry) as u32;
                         if px < img_w as u32 && py < img_h as u32 {
                             let idx = (py * img_w as u32 + px) as usize;
-                            if let Some(&val) = frame.mono.get(idx) {
+                            if let Some(val) = frame.mono.value_at(idx) {
                                 self.cursor_pixel = Some((px, py));
                                 self.cursor_value = Some(val);
                             }
@@ -4996,13 +5059,26 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
 fn process_image(img: DynamicImage, bit_depth: u8) -> FrameData {
     let width = img.width();
     let height = img.height();
-    let mono: Vec<f32> = match &img {
-        DynamicImage::ImageLuma8(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
-        DynamicImage::ImageLuma16(g) => g.as_raw().iter().map(|&v| v as f32).collect(),
-        DynamicImage::ImageRgb8(rgb) => rgb.pixels().map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect(),
-        _ => { let gray = img.to_luma8(); gray.as_raw().iter().map(|&v| v as f32).collect() }
-    };
-    FrameData::new(mono, width, height, bit_depth)
+    // Integer mono images stay `u16` (no widening copy); only the RGB→luma
+    // weighting, which is fractional, needs `f32`.
+    match &img {
+        DynamicImage::ImageLuma8(g) => {
+            let mono: Vec<u16> = g.as_raw().iter().map(|&v| v as u16).collect();
+            FrameData::new_u16(mono, width, height, bit_depth)
+        }
+        DynamicImage::ImageLuma16(g) => {
+            FrameData::new_u16(g.as_raw().clone(), width, height, bit_depth)
+        }
+        DynamicImage::ImageRgb8(rgb) => {
+            let mono: Vec<f32> = rgb.pixels().map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect();
+            FrameData::new(mono, width, height, bit_depth)
+        }
+        _ => {
+            let gray = img.to_luma8();
+            let mono: Vec<u16> = gray.as_raw().iter().map(|&v| v as u16).collect();
+            FrameData::new_u16(mono, width, height, bit_depth)
+        }
+    }
 }
 
 /// Menu item with checkmark prefix for toggles.

@@ -57,6 +57,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Stream channel index (single-channel cameras use 0).
 const STREAM_CHANNEL: u32 = 0;
+
+/// Spare decode buffers the frame pool holds. A handful covers the frames in
+/// flight (one displayed, one decoding, up to two queued in the frame channel);
+/// beyond that, returned buffers are simply dropped rather than growing the pool.
+const FRAME_POOL_CAPACITY: usize = 4;
 /// How long to wait for stream packets before returning to service commands.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 /// The receive socket's read timeout: how long the receive thread can sit in
@@ -256,6 +261,12 @@ pub struct GevHandle {
     /// Set by the UI while recording so the capture thread never skips a
     /// frame's decode (the recorder wants every frame it can get).
     pub recording: Arc<AtomicBool>,
+    /// Return path for spent `u16` decode buffers. The UI thread sends a frame's
+    /// inner `Vec<u16>` here once it replaces the frame and holds the only
+    /// reference; the capture thread reuses it, so a warm pipeline decodes with
+    /// no per-frame allocation. Bounded and non-blocking on both ends — a full
+    /// pool just drops the returned buffer.
+    pub buffer_return: Sender<Vec<u16>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -558,6 +569,11 @@ pub(crate) fn start_camera_at(
 
     let (cmd_tx, cmd_rx) = bounded::<GevCmd>(32);
     let (controls_tx, controls_rx) = bounded::<Vec<GevControl>>(4);
+    // Decode-buffer pool: the UI returns spent frame buffers here and the
+    // capture thread pulls from it. Bounded to a few buffers — that covers the
+    // frames in flight (one on screen, one decoding, a couple in the channel)
+    // without letting the pool grow unbounded.
+    let (buffer_return_tx, buffer_return_rx) = bounded::<Vec<u16>>(FRAME_POOL_CAPACITY);
 
     let snapshot = controls.clone();
     let drop_stats = Arc::new(GevDropStats::default());
@@ -571,7 +587,8 @@ pub(crate) fn start_camera_at(
         .spawn(move || {
             capture_loop(
                 dev, socket, genapi, packet_payload, &cam_name, frame_tx, cmd_rx, controls_tx,
-                snapshot, drop_stats_thread, recording_thread, received_bytes_thread, log_tx,
+                snapshot, drop_stats_thread, recording_thread, received_bytes_thread,
+                buffer_return_rx, log_tx,
             );
         })?;
 
@@ -582,6 +599,7 @@ pub(crate) fn start_camera_at(
         drop_stats,
         received_bytes,
         recording,
+        buffer_return: buffer_return_tx,
         join_handle: Some(join_handle),
     })
 }
@@ -1457,6 +1475,9 @@ fn capture_loop(
     drop_stats: Arc<GevDropStats>,
     recording: Arc<AtomicBool>,
     received_bytes: Arc<AtomicU64>,
+    // Spent `u16` decode buffers returned by the UI thread; pulled from here to
+    // decode into, allocating only when the pool is empty. Never blocks.
+    pool_rx: Receiver<Vec<u16>>,
     log_tx: Sender<LogEntry>,
 ) {
     let cam_ip = match dev.remote_addr().ip() {
@@ -1571,6 +1592,9 @@ fn capture_loop(
     let mut last_telemetry = Instant::now();
     let mut frames = 0u64;
     let mut short_frames = 0u64;
+    // Decode buffer retained across a failed decode so a short/unsupported frame
+    // doesn't cost the pool a buffer; refilled from the pool on the next frame.
+    let mut spare_buf: Option<Vec<u16>> = None;
     let mut announced_resend = false;
     let mut warned_resend_silent = false;
     // GEV_TRACE=1: log once a second where the time goes.
@@ -1744,8 +1768,15 @@ fn capture_loop(
         }
         let t_decode = Instant::now();
         let npix = g.width as usize * g.height as usize;
-        match decode_payload(&payload, &g) {
-            Some((mono, w, h, bit_depth)) => {
+        // Pull a spare decode buffer: the one retained from a prior short frame,
+        // else one the UI returned to the pool, else a fresh allocation. Never
+        // blocks the capture thread.
+        let mut buf = spare_buf
+            .take()
+            .or_else(|| pool_rx.try_recv().ok())
+            .unwrap_or_default();
+        match decode_payload(&payload, &g, &mut buf) {
+            Some((w, h, bit_depth)) => {
                 if frames == 0 {
                     let _ = log_tx.try_send(LogEntry::info(format!(
                         "{cam_name}: streaming {w}x{h} pf={:#010x} ({} B/frame)",
@@ -1753,7 +1784,9 @@ fn capture_loop(
                     )));
                 }
                 frames += 1;
-                let frame = FrameData::new(mono, w, h, bit_depth);
+                // `buf` is moved into the frame and comes back via the pool once
+                // the UI replaces this frame and the Arc is uniquely owned again.
+                let frame = FrameData::new_u16(buf, w, h, bit_depth);
                 match frame_tx.try_send(frame) {
                     Ok(()) => {}
                     Err(_) if frame_tx.is_empty() => {
@@ -1769,6 +1802,9 @@ fn capture_loop(
                 }
             }
             None => {
+                // Decode failed (short/unsupported frame): keep the buffer so
+                // the next frame reuses it instead of costing the pool a buffer.
+                spare_buf = Some(buf);
                 short_frames += 1;
                 if short_frames == 1 {
                     let needed = frame_payload_bytes(g.pixel_format, npix);
@@ -1967,83 +2003,84 @@ fn frame_payload_bytes(pixel_format: u32, npix: usize) -> usize {
     }
 }
 
-/// Decode a reassembled mono payload into f32 pixels + bit depth.
-// TODO(perf): each call allocates a fresh `Vec<f32>` (~10-40 MB at 5 MP). A
-// recycling pool would need this buffer returned after the UI, solver, and
-// recorder are done with it — but `mono` is moved into `FrameData::mono`
-// (`Arc<Vec<f32>>`) and shared downstream, so reclaiming it requires a
-// return-channel from the UI thread back to this one (recycle a `Vec` once the
-// `Arc` is uniquely owned again on drop). That touches the frame lifecycle in
-// main.rs and is out of scope here; leaving the per-frame allocation in place.
-fn decode_payload(payload: &[u8], g: &FrameGeometry) -> Option<(Vec<f32>, u32, u32, u8)> {
+/// Decode a reassembled mono payload into native `u16` pixels, returning the
+/// geometry + bit depth on success. Every GigE mono format is integer, so the
+/// output is always `u16` — the widening to `f32` is deferred to the handful of
+/// consumers that need it (see `pixels::Pixels`).
+///
+/// The output buffer is supplied by the caller and reused frame-to-frame (a
+/// buffer pool, see `capture_loop`): it is cleared and refilled in place, so a
+/// warm pool decodes with zero per-frame allocation. On a length-check failure
+/// the caller keeps its buffer (partially filled) and can reuse it next frame.
+fn decode_payload(payload: &[u8], g: &FrameGeometry, out: &mut Vec<u16>) -> Option<(u32, u32, u8)> {
     let npix = g.width as usize * g.height as usize;
     if npix == 0 {
         return None;
     }
+    out.clear();
+    out.reserve(npix);
     match g.pixel_format {
         // Mono8
         0x01080001 => {
             if payload.len() < npix { return None; }
-            let mono = payload[..npix].iter().map(|&v| v as f32).collect();
-            Some((mono, g.width, g.height, 8))
+            out.extend(payload[..npix].iter().map(|&v| v as u16));
+            Some((g.width, g.height, 8))
         }
         // Mono10/12/14/16 unpacked little-endian 16-bit
         0x01100003 | 0x01100005 | 0x01100025 | 0x01100007 => {
             if payload.len() < npix * 2 { return None; }
-            let mono = payload[..npix * 2]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
-                .collect();
+            out.extend(
+                payload[..npix * 2]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]])),
+            );
             let bit_depth = match g.pixel_format {
                 0x01100003 => 10,
                 0x01100005 => 12,
                 0x01100025 => 14,
                 _ => 16,
             };
-            Some((mono, g.width, g.height, bit_depth))
+            Some((g.width, g.height, bit_depth))
         }
         // Mono12p packed: 2 pixels per 3 bytes (little-endian nibble order).
         0x010C0047 => {
             let needed = npix * 3 / 2;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x0F) as u16) << 8);
                 let p1 = ((chunk[1] >> 4) as u16) | ((chunk[2] as u16) << 4);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                out.push(p0);
+                out.push(p1);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 12))
+            out.truncate(npix);
+            Some((g.width, g.height, 12))
         }
         // Mono12Packed (GEV 1.x / FLIR): 2 pixels per 3 bytes, high byte first.
         0x010C0006 => {
             let needed = npix * 3 / 2;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(3) {
                 let p0 = ((chunk[0] as u16) << 4) | ((chunk[1] & 0x0F) as u16);
                 let p1 = ((chunk[2] as u16) << 4) | ((chunk[1] >> 4) as u16);
-                mono.push(p0 as f32);
-                mono.push(p1 as f32);
+                out.push(p0);
+                out.push(p1);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 12))
+            out.truncate(npix);
+            Some((g.width, g.height, 12))
         }
         // Mono10p packed: 4 pixels per 5 bytes.
         0x010A0046 => {
             let needed = npix * 5 / 4;
             if payload.len() < needed { return None; }
-            let mut mono = Vec::with_capacity(npix);
             for chunk in payload[..needed].chunks_exact(5) {
                 let p0 = (chunk[0] as u16) | (((chunk[1] & 0x03) as u16) << 8);
                 let p1 = ((chunk[1] >> 2) as u16) | (((chunk[2] & 0x0F) as u16) << 6);
                 let p2 = ((chunk[2] >> 4) as u16) | (((chunk[3] & 0x3F) as u16) << 4);
                 let p3 = ((chunk[3] >> 6) as u16) | ((chunk[4] as u16) << 2);
-                mono.extend_from_slice(&[p0 as f32, p1 as f32, p2 as f32, p3 as f32]);
+                out.extend_from_slice(&[p0, p1, p2, p3]);
             }
-            mono.truncate(npix);
-            Some((mono, g.width, g.height, 10))
+            out.truncate(npix);
+            Some((g.width, g.height, 10))
         }
         _ => None,
     }
@@ -2582,6 +2619,71 @@ mod tests {
         let (image, got, stride) = round_trip(1464, 1000);
         assert_eq!(got.as_deref(), Some(&image[..]));
         assert_eq!(stride, 1464);
+    }
+
+    /// `decode_payload` fills a reused buffer in place and, once its capacity is
+    /// warm, reallocates nothing frame-to-frame — the pooling precondition.
+    #[test]
+    fn decode_reuses_buffer_without_realloc() {
+        let g = FrameGeometry { width: 64, height: 48, pixel_format: 0x0110_0005 }; // Mono12
+        let npix = (g.width * g.height) as usize;
+        let payload: Vec<u8> = (0..npix * 2).map(|i| (i * 37 % 256) as u8).collect();
+
+        let mut buf: Vec<u16> = Vec::new();
+        assert_eq!(decode_payload(&payload, &g, &mut buf), Some((64, 48, 12)));
+        assert_eq!(buf.len(), npix);
+        // Spot-check the little-endian unpack against a manual decode.
+        assert_eq!(buf[0], u16::from_le_bytes([payload[0], payload[1]]));
+
+        let cap = buf.capacity();
+        let ptr = buf.as_ptr();
+        for _ in 0..10 {
+            assert_eq!(decode_payload(&payload, &g, &mut buf), Some((64, 48, 12)));
+            assert_eq!(buf.len(), npix);
+        }
+        // Same allocation reused: no growth, no move.
+        assert_eq!(buf.capacity(), cap, "buffer capacity grew across frames");
+        assert_eq!(buf.as_ptr(), ptr, "buffer was reallocated across frames");
+    }
+
+    /// Model the capture↔UI buffer pool: the capture thread pulls a spare or
+    /// allocates on a miss; the UI reclaims the frame's `Vec` via
+    /// `Arc::into_inner` and returns it. With the pool warm, no frame past the
+    /// first few in flight allocates — proving the per-frame allocation is gone.
+    #[test]
+    fn warm_pool_stops_allocating() {
+        use std::sync::Arc;
+        let (return_tx, return_rx) = bounded::<Vec<u16>>(FRAME_POOL_CAPACITY);
+        let npix = 64 * 48;
+
+        let mut allocations = 0usize;
+        // One frame is "in flight" (held by the UI) at a time.
+        let mut in_flight: Option<Arc<Vec<u16>>> = None;
+        const N: usize = 1000;
+        for _ in 0..N {
+            // Capture side: pull a spare or allocate (a pool "miss").
+            let mut buf = return_rx.try_recv().unwrap_or_else(|_| {
+                allocations += 1;
+                Vec::new()
+            });
+            buf.clear();
+            buf.resize(npix, 7u16); // stand in for decode filling the buffer
+            let frame = Arc::new(buf);
+
+            // UI side: replace the displayed frame, returning the old one's Vec.
+            if let Some(old) = in_flight.replace(Arc::clone(&frame)) {
+                if let Some(v) = Arc::into_inner(old) {
+                    let _ = return_tx.try_send(v);
+                }
+            }
+            // Drop our extra Arc clone so the frame is uniquely owned by the UI.
+            drop(frame);
+        }
+
+        // Allocations equal the frames in flight (one being filled by the
+        // capture side, one held by the UI) — NOT N. Over 1000 frames only the
+        // two startup buffers are ever allocated; every later frame reuses one.
+        assert_eq!(allocations, 2, "warm pool should allocate only the in-flight depth, got {allocations} over {N} frames");
     }
 }
 

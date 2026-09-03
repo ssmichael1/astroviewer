@@ -193,6 +193,13 @@ pub enum GevCmd {
     SetBool(String, bool),
     /// Execute a command feature by node name.
     Execute(String),
+    /// Halt acquisition but keep the session — control, socket and stream
+    /// channel all stay up, exactly as the GenICam AcquisitionStop command
+    /// does. Resume with `Resume`. Avoids the full teardown that wedges some
+    /// cameras' stream engines (the Photonic Science Hawk among them).
+    Pause,
+    /// Resume acquisition on a paused session (GenICam AcquisitionStart).
+    Resume,
     Stop,
 }
 
@@ -1473,6 +1480,18 @@ fn capture_loop(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 GevCmd::Stop => { stop_req = true; break; }
+                GevCmd::Pause => {
+                    if let Some(g) = genapi.as_mut() {
+                        execute_command(g, &mut dev, "AcquisitionStop", &log_tx);
+                        let _ = log_tx.try_send(LogEntry::info(format!("{cam_name}: acquisition paused (session kept)")));
+                    }
+                }
+                GevCmd::Resume => {
+                    if let Some(g) = genapi.as_mut() {
+                        execute_command(g, &mut dev, "AcquisitionStart", &log_tx);
+                        let _ = log_tx.try_send(LogEntry::info(format!("{cam_name}: acquisition resumed")));
+                    }
+                }
                 other => {
                     if let Some(g) = genapi.as_mut() {
                         apply_set(g, &mut dev, other, &log_tx);
@@ -1968,7 +1987,8 @@ fn apply_set(g: &mut GenApi, dev: &mut Device, cmd: GevCmd, log_tx: &Sender<LogE
         GevCmd::SetEnum(n, s) => set_enum_feature(g, dev, &n, &s, log_tx),
         GevCmd::SetBool(n, v) => set_bool_feature(g, dev, &n, v, log_tx),
         GevCmd::Execute(n) => execute_command(g, dev, &n, log_tx),
-        GevCmd::Stop => {}
+        // Handled in the capture loop before apply_set is reached.
+        GevCmd::Pause | GevCmd::Resume | GevCmd::Stop => {}
     }
     if restart {
         set_int_feature(g, dev, "TLParamsLocked", 1, log_tx);

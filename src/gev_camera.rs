@@ -82,6 +82,10 @@ const SILENCE_GRACE: Duration = Duration::from_secs(3);
 const RECV_BUFFER_REQUEST: usize = 64 << 20;
 /// Stream channel 0 inter-packet delay register (`GevSCPD`), in timestamp ticks.
 const SCPD_REGISTER: u32 = 0x0d08;
+/// Stream channel 0 destination address register (`GevSCDA`). Read back in the
+/// silence diagnostic: if it still holds our host IP, the stream was
+/// configured and the silence is the camera's, not a lost configuration.
+const SCDA_REGISTER: u32 = 0x0d18;
 /// Packet resend, the policy eBUS applies: a gap is requested as soon as the
 /// packet after it arrives (after `RESEND_DELAY`, for a reordered packet to
 /// show up), re-requested every `RESEND_RETRY` until `RESEND_ATTEMPTS` are
@@ -1381,6 +1385,14 @@ fn capture_loop(
         IpAddr::V4(ip) => ip,
         _ => Ipv4Addr::UNSPECIFIED,
     };
+    // The host IP the camera was told to stream to (`GevSCDA`) is the address
+    // our receive socket is bound to; the silence diagnostic reads SCDA back
+    // and compares against this to tell a lost configuration from a camera
+    // that accepted it and still emits nothing.
+    let cam_stream_dest = match socket.local_addr() {
+        Ok(SocketAddr::V4(a)) => *a.ip(),
+        _ => Ipv4Addr::UNSPECIFIED,
+    };
 
     // Start the receive thread before acquisition so the first packets land
     // in a drained socket. The control thread keeps a clone for hole-punching.
@@ -1514,14 +1526,33 @@ fn capture_loop(
         if !warned_silence && frames == 0 && started.elapsed() >= SILENCE_GRACE {
             warned_silence = true;
             let msg = if packets == 0 {
-                format!(
-                    "{cam_name}: no GVSP packets received {}s after AcquisitionStart. Likely causes: a host \
-                     firewall/EDR drops inbound UDP to this app (allow it; the camera streams from UDP port {}), \
-                     the negotiated packet size exceeds what the link carries (try GEV_PACKET_SIZE=1500), \
-                     the camera is waiting for a trigger, or another application holds control.",
-                    SILENCE_GRACE.as_secs(),
-                    scsp.map_or("unknown".to_string(), |p| p.to_string()),
-                )
+                // Read the stream destination back. If it still holds our host
+                // IP the camera accepted the configuration, so the host side
+                // (firewall, packet size, destination) is not the problem and
+                // the camera is simply not emitting — its stream engine has
+                // stalled, which on some cameras (the Photonic Science Hawk
+                // among them) clears only with a power-cycle.
+                let dest_configured = dev
+                    .read_register(SCDA_REGISTER)
+                    .is_ok_and(|v| v == u32::from(cam_stream_dest));
+                if dest_configured {
+                    format!(
+                        "{cam_name}: AcquisitionStart was acknowledged and the stream registers read back \
+                         correctly, but the camera has emitted no packets in {}s — its stream engine appears \
+                         stalled. Power-cycle the camera. (This model has no soft-reset command; a stop can \
+                         leave it wedged until power is cycled.)",
+                        SILENCE_GRACE.as_secs(),
+                    )
+                } else {
+                    format!(
+                        "{cam_name}: no GVSP packets received {}s after AcquisitionStart. Likely causes: a host \
+                         firewall/EDR drops inbound UDP to this app (allow it; the camera streams from UDP port {}), \
+                         the negotiated packet size exceeds what the link carries (try GEV_PACKET_SIZE=1500), \
+                         the camera is waiting for a trigger, or another application holds control.",
+                        SILENCE_GRACE.as_secs(),
+                        scsp.map_or("unknown".to_string(), |p| p.to_string()),
+                    )
+                }
             } else {
                 format!(
                     "{cam_name}: {} GVSP packets received but no frame completed ({} incomplete frames dropped, \

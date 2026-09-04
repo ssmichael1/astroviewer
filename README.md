@@ -62,7 +62,8 @@ connection manager listing every backend compiled into the binary:
 - **⟳ Refresh** re-enumerates all backends.
 
 The Source menu also lists discovered cameras directly for quick switching,
-plus Play/Stop for the current source.
+plus Play/Stop for the current source. With no source selected, Play opens
+the Connect dialog instead of doing nothing.
 
 ### GigE Vision troubleshooting
 
@@ -104,7 +105,9 @@ is a headless version of the same pipeline with per-packet counters.
 - **Background subtraction:** percentile-based temporal background for
   multi-frame FITS.
 - **Zoom:** right-click-drag a rectangle on the image to open a zoom window
-  (close with Esc or X; left-click the image to clear the ROI).
+  (close with Esc or X, or draw a new rectangle; a stray left click leaves
+  it alone).
+- **Manual scale:** sliders plus exact numeric entry for the min and max.
 - **Overlays:** colorbar, pixel axes, hover pixel readout.
 
 Camera controls (exposure, gain, cooling, filter wheel, resolution, trigger
@@ -157,8 +160,21 @@ or after a size change the solve has not caught up with, are written without it.
 ## Odds and ends
 
 - **Themes:** Dark, Light, and Night (deep-red night vision) via the Theme menu.
-- **Keyboard:** `S` toggles the side panel; `Esc` closes the zoom window or
-  Connect dialog.
+- **Keyboard:** `S` toggles the side panel, `B` the bottom panel; `Esc`
+  closes the zoom window or Connect dialog.
+- **Remembered between runs:** theme, colormap, scale mode, transfer, gamma,
+  the axes and colorbar toggles, panel visibility and sizes, the active
+  bottom tab, and the window size and position (`ui.json` in the config
+  directory, next to `config.json`).
+- **Warnings and errors** show as a count badge on the Log tab and, with the
+  latest message, at the right of the status bar; clicking there opens the
+  Log. Both clear once the Log tab has been viewed.
+- **Ctrl-C** in the terminal (or SIGTERM) closes the window normally: the
+  recording is flushed, the camera stopped and released, and settings saved.
+  A second Ctrl-C exits immediately.
+- Bit depth of a FITS file comes from its `BITDEPTH` keyword when present
+  (this app's recordings write it) or else from `BITPIX`; only float data
+  falls back to inferring it from the pixel values.
 - The UI repaints when a frame actually arrives rather than on a fixed timer,
   so idle and low-frame-rate CPU usage stays low.
 - If the app ever crashes, the panic message and backtrace are written to

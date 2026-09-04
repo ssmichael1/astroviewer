@@ -39,6 +39,16 @@ impl Palette {
             plot_line: egui::Color32::from_rgb(79, 70, 229),
             plot_bg: egui::Color32::from_rgb(249, 250, 251),
 
+            status_ok: egui::Color32::from_rgb(34, 197, 94),
+            status_warn: egui::Color32::from_rgb(217, 119, 6),
+            status_err: egui::Color32::from_rgb(220, 38, 38),
+            overlay_dim: egui::Color32::from_rgb(0, 200, 255),
+            overlay_bright: egui::Color32::from_rgb(255, 255, 0),
+            overlay_matched: egui::Color32::from_rgb(50, 255, 50),
+            overlay_catalog: egui::Color32::from_rgb(50, 205, 50),
+            overlay_label: egui::Color32::from_rgb(255, 255, 0),
+            roi_outline: egui::Color32::from_rgba_unmultiplied(255, 255, 0, 128),
+
             image_bg: egui::Color32::from_rgb(240, 240, 240),
 
             check_mark: egui::Color32::WHITE,

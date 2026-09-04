@@ -76,7 +76,7 @@ impl WcsKeys {
 
     /// Sky position of a 1-based FITS pixel through these keywords, degrees.
     /// The reader's side of the contract; used to check the writer.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "starsolve"))]
     pub fn pixel_to_world(&self, p1: f64, p2: f64) -> (f64, f64) {
         let dx = p1 - self.crpix[0];
         let dy = p2 - self.crpix[1];

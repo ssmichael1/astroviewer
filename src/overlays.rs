@@ -100,6 +100,31 @@ pub fn cov_to_ellipse(cov: tetra3::Matrix2) -> (f32, f32, f32) {
     (semi_major.max(1.5), semi_minor.max(1.5), angle)
 }
 
+/// Colors for the overlay layer, taken from the active theme so the Night
+/// palette is not broken by green and yellow marks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayColors {
+    /// Centroid ellipse for the faintest star …
+    pub dim: Color32,
+    /// … and for the brightest; intermediate masses interpolate.
+    pub bright: Color32,
+    pub matched: Color32,
+    pub catalog: Color32,
+    pub label: Color32,
+}
+
+impl Default for OverlayColors {
+    fn default() -> Self {
+        OverlayColors {
+            dim: Color32::from_rgb(0, 200, 255),
+            bright: Color32::from_rgb(255, 255, 0),
+            matched: Color32::from_rgb(50, 255, 50),
+            catalog: Color32::from_rgb(50, 205, 50),
+            label: Color32::from_rgb(255, 255, 0),
+        }
+    }
+}
+
 /// Draw overlay items onto the image area.
 /// `to_screen` converts pixel coords (image-center origin) to screen coords.
 pub fn draw_overlays(
@@ -109,6 +134,7 @@ pub fn draw_overlays(
     pixels_to_screen_scale: f32,
     max_mass: f32,
     stroke_scale: f32,
+    colors: &OverlayColors,
 ) {
     for item in items {
         match item {
@@ -121,7 +147,7 @@ pub fn draw_overlays(
                 } else {
                     0.5
                 };
-                let color = brightness_color(t);
+                let color = lerp_color(colors.dim, colors.bright, t);
 
                 // Scale ellipse axes from image pixels to screen pixels
                 let smaj = *semi_major * pixels_to_screen_scale;
@@ -132,14 +158,14 @@ pub fn draw_overlays(
             OverlayItem::CatalogStar { x, y, name, mag } => {
                 let center = to_screen(*x, *y);
                 let radius = (6.0 - mag).clamp(2.0, 8.0);
-                painter.circle_stroke(center, radius, Stroke::new(1.5, Color32::from_rgb(50, 205, 50)));
+                painter.circle_stroke(center, radius, Stroke::new(1.5, colors.catalog));
                 if let Some(name) = name {
                     painter.text(
                         Pos2::new(center.x + radius + 3.0, center.y),
                         egui::Align2::LEFT_CENTER,
                         name,
                         egui::FontId::proportional(10.0),
-                        Color32::from_rgb(50, 205, 50),
+                        colors.catalog,
                     );
                 }
             }
@@ -148,7 +174,7 @@ pub fn draw_overlays(
                 match kind {
                     MarkerKind::Crosshair => {
                         let s = 4.5 * stroke_scale;
-                        let stroke = Stroke::new(1.0 * stroke_scale, Color32::from_rgb(50, 255, 50));
+                        let stroke = Stroke::new(1.0 * stroke_scale, colors.matched);
                         painter.line_segment([Pos2::new(center.x - s, center.y), Pos2::new(center.x + s, center.y)], stroke);
                         painter.line_segment([Pos2::new(center.x, center.y - s), Pos2::new(center.x, center.y + s)], stroke);
                     }
@@ -161,7 +187,7 @@ pub fn draw_overlays(
                         let r1 = r0 + 4.0 * stroke_scale;
                         let stroke = Stroke::new(
                             1.0 * stroke_scale,
-                            Color32::from_rgba_unmultiplied(50, 255, 50, 140),
+                            colors.matched.gamma_multiply(0.55),
                         );
                         for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
                             painter.line_segment(
@@ -174,11 +200,11 @@ pub fn draw_overlays(
                         }
                     }
                     MarkerKind::Circle(r) => {
-                        painter.circle_stroke(center, *r, Stroke::new(1.0, Color32::from_rgb(255, 255, 0)));
+                        painter.circle_stroke(center, *r, Stroke::new(1.0, colors.label));
                     }
                     MarkerKind::Diamond(s) => {
                         let s = *s;
-                        let stroke = Stroke::new(1.0, Color32::from_rgb(255, 255, 0));
+                        let stroke = Stroke::new(1.0, colors.label);
                         let pts = [
                             Pos2::new(center.x, center.y - s),
                             Pos2::new(center.x + s, center.y),
@@ -208,7 +234,7 @@ pub fn draw_overlays(
                         align,
                         label,
                         egui::FontId::proportional(10.0),
-                        Color32::from_rgb(255, 255, 0),
+                        colors.label,
                     );
                 }
             }
@@ -217,11 +243,10 @@ pub fn draw_overlays(
 }
 
 /// Map brightness fraction [0,1] to a color: dim cyan → bright yellow
-fn brightness_color(t: f32) -> Color32 {
-    let r = (t * 255.0) as u8;
-    let g = (200.0 + t * 55.0) as u8;
-    let b = ((1.0 - t) * 255.0) as u8;
-    Color32::from_rgb(r, g, b)
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_unmultiplied(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()), ch(a.a(), b.a()))
 }
 
 /// Draw an axis-aligned ellipse rotated by `angle` radians.

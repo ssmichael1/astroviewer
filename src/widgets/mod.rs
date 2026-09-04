@@ -91,6 +91,21 @@ pub struct Palette {
     pub plot_line: egui::Color32,
     pub plot_bg: egui::Color32,
 
+    // Status colors: good / attention / failure. Themed so Night stays red.
+    pub status_ok: egui::Color32,
+    pub status_warn: egui::Color32,
+    pub status_err: egui::Color32,
+
+    // Image overlays: centroid ellipses run dim → bright with star mass;
+    // matched-star crosshairs, catalog circles, text labels, and the ROI
+    // drag outline each have their own.
+    pub overlay_dim: egui::Color32,
+    pub overlay_bright: egui::Color32,
+    pub overlay_matched: egui::Color32,
+    pub overlay_catalog: egui::Color32,
+    pub overlay_label: egui::Color32,
+    pub roi_outline: egui::Color32,
+
     // Central panel background (behind image)
     pub image_bg: egui::Color32,
 

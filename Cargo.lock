@@ -3952,9 +3952,9 @@ dependencies = [
 
 [[package]]
 name = "tetra3"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d45b726f52e095e3a130571d9c4583c3fdf0d73601ee5fa6dca37e87d6bb38a"
+checksum = "cd65494e2f3d7c1068013e482a14558b89d94b94eda9ad20c4f739b0d0f51954"
 dependencies = [
  "image",
  "numeris",

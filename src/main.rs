@@ -7,11 +7,14 @@ mod bayer;
 mod bright_stars;
 mod colormaps;
 mod fits_source;
+#[cfg(feature = "focus")]
+mod focus;
 mod histogram;
 mod imageview;
 mod overlays;
 mod pixels;
 mod sources;
+mod wcs;
 mod widgets;
 
 #[cfg(feature = "svbony")]
@@ -208,12 +211,22 @@ struct SavedConfig {
 #[cfg(feature = "starsolve")]
 fn default_true() -> bool { true }
 
+/// Which figure the Focus tab's trend plot shows.
+#[cfg(feature = "focus")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusPlot {
+    Hfr,
+    Sharpness,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     Histogram,
     Controls,
     #[cfg(feature = "starsolve")]
     PlateSolve,
+    #[cfg(feature = "focus")]
+    Focus,
     Log,
 }
 
@@ -237,6 +250,8 @@ enum RecordMsg {
         offset: Option<f64>,
         /// Sensor temperature, °C.
         ccd_temp: Option<f64>,
+        /// Sky mapping from the last plate solve, when one is locked.
+        wcs: Option<wcs::WcsKeys>,
         /// Cooler setpoint, °C (only when the cooler is on).
         set_temp: Option<f64>,
     },
@@ -367,6 +382,21 @@ struct ViewerApp {
     camera_model: Option<tetra3::CameraModel>,
     #[cfg(feature = "starsolve")]
     camera_model_path: Option<std::path::PathBuf>,
+
+    /// Focus trend: one point per completed worker frame, plus best-so-far.
+    #[cfg(feature = "focus")]
+    focus_history: focus::FocusHistory,
+    /// Per-star results from the worker's last frame, for the overlay labels.
+    #[cfg(feature = "focus")]
+    focus_last: Option<focus::FocusSample>,
+    /// Measure only stars inside the zoom ROI (when one is drawn).
+    #[cfg(feature = "focus")]
+    focus_use_roi: bool,
+    /// Draw each measured star's HFR next to it on the image.
+    #[cfg(feature = "focus")]
+    focus_show_labels: bool,
+    #[cfg(feature = "focus")]
+    focus_plot: FocusPlot,
 
     frame_times: Vec<Instant>,
     fps: f64,
@@ -687,6 +717,16 @@ impl ViewerApp {
             last_centroids: Vec::new(),
             #[cfg(feature = "starsolve")]
             last_solve: None,
+            #[cfg(feature = "focus")]
+            focus_history: focus::FocusHistory::new(400),
+            #[cfg(feature = "focus")]
+            focus_last: None,
+            #[cfg(feature = "focus")]
+            focus_use_roi: false,
+            #[cfg(feature = "focus")]
+            focus_show_labels: false,
+            #[cfg(feature = "focus")]
+            focus_plot: FocusPlot::Hfr,
             #[cfg(feature = "starsolve")]
             camera_model: None,
             #[cfg(feature = "starsolve")]
@@ -1175,7 +1215,7 @@ impl ViewerApp {
 
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp } => {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp, wcs } => {
                         if write_err.is_some() {
                             continue;
                         }
@@ -1220,6 +1260,9 @@ impl ViewerApp {
                         }
                         if let Some(t) = set_temp {
                             hdu.header.set("SET-TEMP", HeaderValue::Float(t), Some("cooler setpoint (C)"));
+                        }
+                        if let Some(w) = wcs {
+                            w.write(&mut hdu.header);
                         }
                         match hdu.write_to(&mut writer) {
                             Ok(()) => frame_count += 1,
@@ -1353,6 +1396,16 @@ impl ViewerApp {
             let mid = chrono::Utc::now() - chrono::Duration::microseconds((exposure_us / 2.0) as i64);
             let date_obs = mid.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
 
+            // WCS from the most recent lock. It may trail the frame by a
+            // solve job; at live frame rates that is the same pointing.
+            #[cfg(feature = "starsolve")]
+            let wcs = self
+                .last_solve
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|sol| wcs::WcsKeys::from_solution(sol, frame.width, frame.height));
+            #[cfg(not(feature = "starsolve"))]
+            let wcs = None;
             let msg = RecordMsg::Frame {
                 mono: frame.mono.clone(),
                 width: frame.width,
@@ -1364,6 +1417,7 @@ impl ViewerApp {
                 offset,
                 ccd_temp,
                 set_temp,
+                wcs,
             };
             if tx.try_send(msg).is_ok() {
                 self.rec_frame_count += 1;
@@ -1849,15 +1903,32 @@ impl ViewerApp {
         #[cfg(feature = "starsolve")]
         if let Ok(out) = self.solve_rx.try_recv() {
             self.solve_busy = false;
-            self.centroid_time_ms = out.extract_ms;
-            self.centroid_count = out.centroids.len();
-            self.last_centroids = out.centroids;
-            if let Some(result) = out.solve {
-                // Update FOV estimate from successful solve
-                if let Ok(ref sol) = result {
-                    self.fov_estimate_deg = sol.fov_rad.to_degrees();
+            // A job dispatched before Solve was switched off lands here after
+            // the switch cleared everything; keeping it would bring the
+            // centroid and star overlays back on the next frame. Only the
+            // busy flag is taken from it.
+            if self.solve_enabled {
+                self.centroid_time_ms = out.extract_ms;
+                self.centroid_count = out.centroids.len();
+                self.last_centroids = out.centroids;
+                #[cfg(feature = "focus")]
+                if let Some(sample) = out.focus {
+                    #[allow(unused_mut)]
+                    let mut focuser_pos: Option<i32> = None;
+                    #[cfg(feature = "toupcam")]
+                    if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
+                        focuser_pos = controls.focuser.as_ref().map(|f| f.position);
+                    }
+                    self.focus_history.push(&sample, focuser_pos);
+                    self.focus_last = Some(sample);
                 }
-                self.last_solve = Some(result);
+                if let Some(result) = out.solve {
+                    // Update FOV estimate from successful solve
+                    if let Ok(ref sol) = result {
+                        self.fov_estimate_deg = sol.fov_rad.to_degrees();
+                    }
+                    self.last_solve = Some(result);
+                }
             }
         }
 
@@ -1945,7 +2016,7 @@ impl ViewerApp {
             // the worker to do. The overlays were cleared when it was switched off.
             #[cfg(feature = "starsolve")]
             if self.solve_enabled {
-                self.maybe_dispatch_solve(&frame.mono, frame.width, frame.height);
+                self.maybe_dispatch_solve(&frame.mono, frame.width, frame.height, frame.bit_depth);
             }
 
             // Rebuild overlays from the most recent completed extraction. These
@@ -1958,7 +2029,7 @@ impl ViewerApp {
             // draw only the first (brightest; tetra3 sorts by mass) few
             // thousand. Extraction and solving still see the full list.
             #[cfg(feature = "starsolve")]
-            if self.show_centroids {
+            if self.solve_enabled && self.show_centroids {
                 const MAX_CENTROID_OVERLAYS: usize = 4000;
                 self.overlay_items = self
                     .last_centroids
@@ -1989,6 +2060,22 @@ impl ViewerApp {
                                 });
                             }
                         }
+                    }
+                }
+            }
+
+            // Per-star HFR labels from the last focus measurement, so tilt and
+            // field curvature show as a gradient of numbers across the frame.
+            #[cfg(feature = "focus")]
+            if self.focus_show_labels {
+                if let Some(sample) = &self.focus_last {
+                    for s in &sample.stars {
+                        self.overlay_items.push(overlays::OverlayItem::Marker {
+                            x: s.x,
+                            y: s.y,
+                            kind: overlays::MarkerKind::Label,
+                            label: Some(format!("{:.2}", s.hfr)),
+                        });
                     }
                 }
             }
@@ -2184,18 +2271,6 @@ impl ViewerApp {
             widgets::tip(ui, "Colormap strip labeled with the current display range", |ui| {
                 widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar", &pal);
             });
-            #[cfg(feature = "starsolve")]
-            {
-                widgets::tip(ui, "Ellipses at extracted star centroids, cyan (faint) to yellow (bright)", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
-                });
-                widgets::tip(ui, "Cross-hairs on centroids the plate solve matched to catalog stars", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
-                });
-                widgets::tip(ui, "Labels for named bright stars in the solved field (needs Centroids and Matched Stars)", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
-                });
-            }
         });
 
         ui.add_space(4.0);
@@ -2286,6 +2361,8 @@ impl ViewerApp {
                 ];
                 #[cfg(feature = "starsolve")]
                 tabs.push((BottomTab::PlateSolve, "Plate Solve"));
+                #[cfg(feature = "focus")]
+                tabs.push((BottomTab::Focus, "Focus"));
                 tabs.push((BottomTab::Log, "Log"));
 
                 for (tab, label) in tabs {
@@ -3667,7 +3744,21 @@ impl ViewerApp {
                 self.last_centroids.clear();
                 self.centroid_count = 0;
                 self.overlay_items.clear();
+                #[cfg(feature = "focus")]
+                {
+                    self.focus_last = None;
+                }
             }
+            // Overlay switches live beside the pipeline that produces them.
+            widgets::tip(ui, "Ellipses at extracted star centroids, cyan (faint) to yellow (bright)", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_centroids, "Centroids", &pal);
+            });
+            widgets::tip(ui, "Cross-hairs on centroids the plate solve matched to catalog stars", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Matched", &pal);
+            });
+            widgets::tip(ui, "Labels for named bright stars in the solved field (needs Centroids and Matched)", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_star_names, "Names", &pal);
+            });
             ui.separator();
 
             // Database
@@ -4005,6 +4096,149 @@ impl ViewerApp {
                 }
             }
         }
+    }
+
+    /// The Focus tab: the current HFR in digits large enough to read from the
+    /// telescope, the best value since the last reset, and a trend of the
+    /// last few hundred frames. Focusing is watching a number move as the
+    /// knob turns, so the history and the best-so-far matter as much as the
+    /// current value.
+    #[cfg(feature = "focus")]
+    fn focus_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let dim = pal.text_secondary;
+        let good = egui::Color32::from_rgb(34, 197, 94);
+        let warn = egui::Color32::from_rgb(217, 119, 6);
+
+        // ── Top bar ─────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            if widgets::tip(ui, "Forget the trend and the best-so-far. Do this after a large focuser move or a filter change.", |ui| {
+                widgets::styled_button(ui, "Reset", &pal)
+            }) {
+                self.focus_history.reset();
+            }
+            ui.separator();
+            widgets::tip(ui, "Measure only stars inside the zoom ROI (draw one by dragging on the image). Off, or with no ROI drawn: the brightest stars anywhere in the frame.", |ui| {
+                widgets::styled_checkbox(ui, &mut self.focus_use_roi, "ROI only", &pal);
+            });
+            widgets::tip(ui, "Write each measured star's HFR next to it on the image. A gradient of values across the frame shows tilt or field curvature.", |ui| {
+                widgets::styled_checkbox(ui, &mut self.focus_show_labels, "Label stars", &pal);
+            });
+            ui.separator();
+            widgets::tip(ui, "HFR: half flux radius of the brightest stars, smaller is better. Sharpness: whole-frame contrast, larger is better; useful far from focus when no stars are detected.", |ui| {
+                widgets::combo_box(ui, "focus_plot", "Plot", &mut self.focus_plot,
+                    &[(FocusPlot::Hfr, "HFR"), (FocusPlot::Sharpness, "Sharpness")], &pal);
+            });
+            ui.separator();
+            // Pipeline state, so a silent readout explains itself.
+            let (text, color) = if !self.solve_enabled {
+                ("Solve is off: enable it in the Plate Solve tab", warn)
+            } else if self.focus_use_roi && self.image_viewer.roi_rect.is_none() {
+                ("ROI only: drag a region on the image", warn)
+            } else if self.focus_last.as_ref().is_some_and(|s| s.hfr_px.is_none()) {
+                ("No measurable stars: too faint, saturated, or elongated", dim)
+            } else {
+                ("", dim)
+            };
+            if !text.is_empty() {
+                ui.label(egui::RichText::new(text).color(color));
+            }
+        });
+        ui.add_space(4.0);
+
+        let latest = self.focus_history.latest().copied();
+        let best = self.focus_history.best().copied();
+        // Arcseconds per pixel from the last solve, when locked.
+        let arcsec_per_px: Option<f64> = self.last_solve.as_ref().and_then(|s| s.as_ref().ok()).map(|sol| {
+            sol.fov_rad.to_degrees() as f64 / sol.camera_model.image_width.max(1) as f64 * 3600.0
+        });
+
+        ui.horizontal_top(|ui| {
+            // ── Readout column ──────────────────────────────────────────────
+            ui.vertical(|ui| {
+                ui.set_width(210.0);
+                let big = egui::FontId::monospace(44.0);
+                let mid = egui::FontId::monospace(20.0);
+                let small = egui::FontId::proportional(12.0);
+
+                ui.label(egui::RichText::new("HFR").color(dim).font(small.clone()));
+                let hfr = latest.and_then(|p| p.hfr_px);
+                let hfr_txt = hfr.map_or("--.--".to_string(), |h| format!("{:.2}", h));
+                let hfr_color = match (hfr, best.and_then(|b| b.hfr_px)) {
+                    (Some(h), Some(b)) if h <= b * 1.02 => good,
+                    (Some(_), _) => pal.text_primary,
+                    (None, _) => dim,
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(hfr_txt).font(big).color(hfr_color));
+                    ui.vertical(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("px").color(dim).font(small.clone()));
+                        if let (Some(h), Some(spp)) = (hfr, arcsec_per_px) {
+                            ui.label(egui::RichText::new(format!("{:.2}\"", h as f64 * spp)).color(dim).font(small.clone()));
+                        }
+                    });
+                });
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Best").color(dim).font(small.clone()));
+                    let best_txt = best.and_then(|b| b.hfr_px).map_or("--.--".to_string(), |h| format!("{:.2}", h));
+                    ui.label(egui::RichText::new(best_txt).font(mid).color(good));
+                    if let Some(p) = best.and_then(|b| b.focuser_pos) {
+                        ui.label(egui::RichText::new(format!("@ {}", p)).color(dim).font(small.clone()));
+                    }
+                });
+
+                ui.add_space(6.0);
+                let stat = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(k).color(dim).font(small.clone()));
+                        ui.label(egui::RichText::new(v).font(egui::FontId::monospace(12.0)));
+                    });
+                };
+                let (n, cand) = self.focus_last.as_ref().map_or((0, 0), |s| (s.stars.len(), s.candidates));
+                stat(ui, "Stars", format!("{} of {}", n, cand));
+                stat(ui, "Sharpness", latest.map_or("--".to_string(), |p| format!("{:.2}", p.sharpness)));
+                if let Some(p) = latest.and_then(|p| p.focuser_pos) {
+                    stat(ui, "Focuser", format!("{}", p));
+                }
+            });
+
+            ui.separator();
+
+            // ── Trend plot ──────────────────────────────────────────────────
+            let (points, best_line, y_label): (Vec<[f64; 2]>, Option<f64>, &str) = match self.focus_plot {
+                FocusPlot::Hfr => (
+                    self.focus_history.iter().filter_map(|p| p.hfr_px.map(|h| [p.t, h as f64])).collect(),
+                    best.and_then(|b| b.hfr_px).map(|h| h as f64),
+                    "HFR (px)",
+                ),
+                FocusPlot::Sharpness => (
+                    self.focus_history.iter().map(|p| [p.t, p.sharpness as f64]).collect(),
+                    None,
+                    "Sharpness",
+                ),
+            };
+            let plot_height = ui.available_height().max(60.0);
+            egui_plot::Plot::new("focus_trend")
+                .height(plot_height)
+                .y_axis_label(y_label)
+                .x_axis_label("Time (s)")
+                .show_axes([true, true])
+                .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
+                .show_grid([false, true])
+                .include_y(0.0)
+                .set_margin_fraction(egui::vec2(0.02, 0.1))
+                .show(ui, |plot_ui| {
+                    if let Some(b) = best_line {
+                        plot_ui.hline(egui_plot::HLine::new("best", b).color(good).width(1.0).style(egui_plot::LineStyle::dashed_dense()));
+                    }
+                    if !points.is_empty() {
+                        plot_ui.line(egui_plot::Line::new(y_label, egui_plot::PlotPoints::from(points)).color(pal.plot_line).width(1.5));
+                    }
+                });
+        });
     }
 
     fn log_content(&mut self, ui: &mut egui::Ui) {
@@ -4769,6 +5003,8 @@ impl eframe::App for ViewerApp {
                             }
                             #[cfg(feature = "starsolve")]
                             BottomTab::PlateSolve => self.plate_solve_content(ui),
+                            #[cfg(feature = "focus")]
+                            BottomTab::Focus => self.focus_content(ui),
                             BottomTab::Log => self.log_content(ui),
                         }
                     });
@@ -4852,6 +5088,9 @@ struct SolveJob {
     /// `None` when no database is loaded — the worker still extracts, so the
     /// centroid overlay and star count keep working without a solver.
     solve: Option<SolveParams>,
+    /// Focus measurement to run on this frame's centroids.
+    #[cfg(feature = "focus")]
+    focus: Option<focus::FocusConfig>,
 }
 
 /// Solver inputs, snapshotted on the UI thread at dispatch time.
@@ -4871,6 +5110,8 @@ struct SolveOutput {
     centroids: Vec<tetra3::Centroid>,
     extract_ms: f32,
     solve: Option<tetra3::SolveResult>,
+    #[cfg(feature = "focus")]
+    focus: Option<focus::FocusSample>,
 }
 
 /// Long-lived worker running extraction and solving off the UI thread. One
@@ -4911,6 +5152,28 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
             .unwrap_or_default();
             let extract_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
+            // Focus figures ride on the same frame and centroids. A few
+            // thousand pixels of arithmetic; nothing next to extraction.
+            #[cfg(feature = "focus")]
+            let focus = job.focus.as_ref().map(|cfg| {
+                let stars: Vec<focus::Star> = centroids
+                    .iter()
+                    .map(|c| focus::Star {
+                        x: c.x,
+                        y: c.y,
+                        mass: c.mass.unwrap_or(0.0),
+                        // The overlay ellipse axes are 3σ; undo that for the
+                        // window size. The ratio is scale-free.
+                        sigma: c.cov.map(|cov| overlays::cov_to_ellipse(cov).0 / 3.0),
+                        elongation: c.cov.map(|cov| {
+                            let (a, b, _) = overlays::cov_to_ellipse(cov);
+                            if b > 0.0 { a / b } else { f32::INFINITY }
+                        }),
+                    })
+                    .collect();
+                focus::measure(&job.mono, job.width, job.height, &stars, cfg)
+            });
+
             let solve = job.solve.map(|p| {
                 let mut cfg = tetra3::SolveConfig::new(p.fov_rad, job.width, job.height);
                 cfg.fov_max_error_rad = p.fov_max_error;
@@ -4930,7 +5193,14 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
                 p.db.solve_from_centroids(&centroids, &cfg)
             });
 
-            if out_tx.send(SolveOutput { centroids, extract_ms, solve }).is_err() {
+            let out = SolveOutput {
+                centroids,
+                extract_ms,
+                solve,
+                #[cfg(feature = "focus")]
+                focus,
+            };
+            if out_tx.send(out).is_err() {
                 break;
             }
         }
@@ -4943,7 +5213,7 @@ impl ViewerApp {
     /// previous one — in which case this frame is skipped rather than queued, so
     /// the pipeline always works on recent data instead of falling behind.
     #[cfg(feature = "starsolve")]
-    fn maybe_dispatch_solve(&mut self, mono: &Pixels, w: u32, h: u32) {
+    fn maybe_dispatch_solve(&mut self, mono: &Pixels, w: u32, h: u32, bit_depth: u8) {
         if self.solve_busy {
             return;
         }
@@ -4971,7 +5241,29 @@ impl ViewerApp {
             }
         });
 
-        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), tracking: self.tracking_mode, solve };
+        // Focus: stars whose peak reaches ~95% of full scale are treated as
+        // clipped. Judged on the frame the worker sees, so a background-
+        // subtracted frame is slightly lenient; the cores it lets through
+        // are already flat and drop out on the elongation cut or read wide.
+        #[cfg(feature = "focus")]
+        let focus_cfg = focus::FocusConfig {
+            saturation: Some(0.95 * ((1u64 << bit_depth) - 1) as f32),
+            roi: if self.focus_use_roi { self.image_viewer.roi_rect } else { None },
+            ..Default::default()
+        };
+        #[cfg(not(feature = "focus"))]
+        let _ = bit_depth;
+
+        let job = SolveJob {
+            mono,
+            width: w,
+            height: h,
+            centroid_config: self.centroid_config.clone(),
+            tracking: self.tracking_mode,
+            solve,
+            #[cfg(feature = "focus")]
+            focus: Some(focus_cfg),
+        };
         if self.solve_tx.try_send(job).is_ok() {
             self.solve_busy = true;
         }

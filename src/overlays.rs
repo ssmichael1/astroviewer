@@ -69,7 +69,7 @@ pub fn centroid_to_overlay(c: &tetra3::Centroid) -> OverlayItem {
 /// Extract ellipse parameters from a 2x2 covariance matrix.
 /// Returns (semi_major, semi_minor, angle_radians).
 #[cfg(feature = "starsolve")]
-fn cov_to_ellipse(cov: tetra3::Matrix2) -> (f32, f32, f32) {
+pub fn cov_to_ellipse(cov: tetra3::Matrix2) -> (f32, f32, f32) {
     // Eigenvalues of 2x2 symmetric matrix [[a, b], [b, c]]:
     // λ = ((a+c) ± sqrt((a-c)² + 4b²)) / 2
     let a = cov[(0, 0)];

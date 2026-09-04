@@ -22,7 +22,7 @@ rfd = "0.17.2"
 svbony = { version = "0.1", features = ["image"], optional = true }
 # ToupTek (toupcam) USB/GigE cameras and rebrands (Altair, Omegon, RisingCam, …).
 toupcam = { version = "0.1.0", features = ["image"], optional = true }
-tetra3 = { version = "0.12.0", features = [
+tetra3 = { version = "0.13.0", features = [
     "image",
     "parallel",
 ], optional = true }
@@ -45,9 +45,12 @@ default = []
 svbony = ["dep:svbony"]
 toupcam = ["dep:toupcam"]
 starsolve = ["dep:tetra3"]
+# Focus assist: HFR + sharpness readout with a trend plot. Rides on the
+# starsolve extraction worker for its star positions.
+focus = ["starsolve"]
 gev = ["dep:cameleon-genapi", "dep:zip", "dep:socket2", "dep:if-addrs", "dep:windows-sys", "dep:libc"]
 indi = ["dep:quick-xml", "dep:base64"]
-all = ["svbony", "toupcam", "starsolve", "gev", "indi"]
+all = ["svbony", "toupcam", "starsolve", "gev", "indi", "focus"]
 
 [[example]]
 name = "extract_bench"

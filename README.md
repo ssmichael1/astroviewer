@@ -16,6 +16,7 @@ Backends are selected at build time with Cargo features:
 | `gev` | Any GigE Vision camera (pure-Rust transport + GenICam) | discovery or IP address |
 | `indi` | INDI / INDIGO server | host\[:port\] address |
 | `starsolve` | Centroid extraction + lost-in-space plate solving (tetra3) | — |
+| `focus` | Focus assist: HFR readout and trend (implies `starsolve`) | — |
 | `all` | Everything above | — |
 
 FITS file playback is always built in.
@@ -122,12 +123,36 @@ and persist across runs.
 For very busy frames, only the brightest few thousand centroids are drawn;
 extraction and solving always use the full set.
 
+## Focus assist (`focus`)
+
+The Focus tab shows the median half flux radius (HFR) of the brightest 30
+unsaturated, round stars in each frame, in large digits, with the best value
+since the last reset and a trend plot of recent frames. HFR is measured from
+the raw pixels around each centroid after local background subtraction, so it
+does not shift with the detection threshold; smaller is better. Once a plate
+solve has locked, the readout also gives HFR in arcseconds.
+
+A whole-frame **sharpness** figure (gradient energy over variance, larger is
+better) covers the far-out-of-focus regime where stars are donuts the
+extractor no longer detects; switch the plot to it for coarse focusing, then
+back to HFR. **ROI only** restricts measurement to stars inside the zoom
+region, and **Label stars** writes each star's HFR on the image, which makes
+tilt and field curvature visible. With a ToupTek focuser attached, samples
+carry the focuser position and the best value shows where it was reached.
+
+Focus measurement rides on the plate-solve worker, so it needs **Solve**
+enabled in the Plate Solve tab; a star database is not required.
+
 ## Recording
 
 **File ▸ Start Recording** (or the ● button in the toolbar) streams incoming
 frames to `~/Documents/AstroViewer/astroviewer-YYYYMMDD-HHMMSS.fits`. RAW
 color frames record the `BAYERPAT` keyword so calibration software can
-demosaic them later.
+demosaic them later. With `starsolve` built in and a solve locked, each frame
+also carries a standard TAN WCS (`CTYPE`, `CRPIX`, `CRVAL`, `CD` matrix,
+`RADESYS`) derived from the latest solve, so the file opens on the sky in
+astropy, DS9, PixInsight and the like. Frames recorded before the first lock,
+or after a size change the solve has not caught up with, are written without it.
 
 ## Odds and ends
 

@@ -1,3 +1,8 @@
+/// Bin count for every frame histogram. Fine enough that the histogram tab
+/// can zoom to the data or the display range and still resolve structure
+/// (16 ADU per bin for 16-bit data); the plot re-bins to the visible width.
+pub const NUM_BINS: usize = 4096;
+
 /// Histogram computation for mono image data.
 pub struct Histogram {
     pub edges: Vec<f32>,
@@ -10,13 +15,6 @@ impl Histogram {
     #[allow(dead_code)]
     pub fn num_bins(&self) -> usize {
         self.counts.len()
-    }
-
-    pub fn centers(&self) -> Vec<f32> {
-        self.edges
-            .windows(2)
-            .map(|w| (w[0] + w[1]) * 0.5)
-            .collect()
     }
 
     /// Value at cumulative fraction `frac` in [0,1] (0.5 = median),

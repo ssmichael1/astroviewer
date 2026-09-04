@@ -62,7 +62,8 @@ impl CfaPattern {
 }
 
 /// Per-channel (R, G, B) histograms of a raw CFA frame, binned identically to
-/// the frame's main histogram (256 bins over the full bit-depth range) so the
+/// the frame's main histogram (`histogram::NUM_BINS` bins over the full
+/// bit-depth range) so the
 /// curves overlay directly. Returns `None` for non-mono-layout images.
 ///
 /// Counts are raw pixel counts: the G curve sits ~2× higher than R/B because
@@ -72,7 +73,7 @@ pub fn compute_cfa_histograms(
     pattern: CfaPattern,
     bit_depth: u8,
 ) -> Option<[Histogram; 3]> {
-    const NUM_BINS: usize = 256;
+    const NUM_BINS: usize = crate::histogram::NUM_BINS;
     let (width, height) = (img.width(), img.height());
     let hi = ((1u64 << bit_depth) - 1) as f32;
     let bin_width = hi.max(1.0) / NUM_BINS as f32;
@@ -229,8 +230,9 @@ mod tests {
         assert_eq!((r.data_min, r.data_max), (10.0, 10.0));
         assert_eq!((g.data_min, g.data_max), (100.0, 100.0));
         assert_eq!((b.data_min, b.data_max), (1000.0, 1000.0));
-        // Binning matches the main histogram: 256 bins over [0, 65535].
-        assert_eq!(r.counts.len(), 256);
-        assert_eq!(b.counts[(1000.0 / (65535.0 / 256.0)) as usize], 4);
+        // Binning matches the main histogram: NUM_BINS bins over [0, 65535].
+        let nb = crate::histogram::NUM_BINS;
+        assert_eq!(r.counts.len(), nb);
+        assert_eq!(b.counts[(1000.0 / (65535.0 / nb as f32)) as usize], 4);
     }
 }

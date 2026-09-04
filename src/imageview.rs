@@ -1,4 +1,7 @@
-use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
+use std::sync::Arc;
+
+use egui::{self, Color32, ColorImage, Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2};
+use rayon::prelude::*;
 
 use crate::colormaps::{Colormap, ColormapKind};
 use crate::overlays::{self, OverlayItem};
@@ -54,7 +57,7 @@ pub struct ImageViewResponse {
     pub hovered_value: Option<f32>,
 }
 
-/// Everything `rgba_buf` is derived from. A repaint whose key equals the
+/// Everything the recolored `image` is derived from. A repaint whose key equals the
 /// cached one skips the O(pixels) rebuild and the GPU texture upload — the
 /// egui repaint rate (mouse moves, 60 Hz during capture) is otherwise far
 /// higher than the rate at which frames or display settings actually change.
@@ -65,24 +68,78 @@ pub struct RgbaKey {
     pub frame_serial: u64,
     pub width: u32,
     pub height: u32,
-    pub scale_min: f32,
-    pub scale_max: f32,
-    pub gamma: f32,
-    pub transfer: TransferFn,
-    pub colormap: ColormapKind,
+    pub shading: Shading,
 }
 
 impl RgbaKey {
     pub fn new(frame_serial: u64, width: u32, height: u32, params: &DisplayParams, colormap: &Colormap) -> Self {
+        Self { frame_serial, width, height, shading: Shading::new(params, colormap) }
+    }
+}
+
+/// Everything that maps a pixel value to a color: display range, transfer
+/// function (with its gamma/alpha and asinh pivot) and colormap. A pure
+/// function of the value, so for integer frames it is evaluated once per
+/// possible value into a table instead of once per pixel.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Shading {
+    scale_min: f32,
+    scale_max: f32,
+    gamma: f32,
+    asinh_offset: f32,
+    transfer: TransferFn,
+    colormap: ColormapKind,
+}
+
+impl Shading {
+    fn new(params: &DisplayParams, colormap: &Colormap) -> Self {
         Self {
-            frame_serial,
-            width,
-            height,
             scale_min: params.scale_min,
             scale_max: params.scale_max,
             gamma: params.gamma,
+            asinh_offset: params.asinh_offset,
             transfer: params.transfer,
             colormap: colormap.kind,
+        }
+    }
+
+    /// The per-value shader with all range/transfer constants precomputed.
+    /// `colormap` must be the one this shading was built from.
+    fn shader<'a>(&self, colormap: &'a Colormap) -> impl Fn(f32) -> Color32 + Sync + 'a {
+        let scale_min = self.scale_min;
+        let range = self.scale_max - self.scale_min;
+        let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
+        let inv_gamma = if self.gamma != 0.0 { 1.0 / self.gamma } else { 1.0 };
+        let apply_gamma = (self.gamma - 1.0).abs() > 1e-4;
+        let transfer = self.transfer;
+
+        // Asinh with a pivot: s(t) = (asinh(α(t−o)) − asinh(−αo)) / (asinh(α(1−o)) − asinh(−αo))
+        // where o is the offset normalized into the display range. asinh is odd,
+        // so pixels below the pivot stay visible (compressed toward black) rather
+        // than clipping; o = 0 reduces to the plain asinh(αt)/asinh(α) stretch.
+        let asinh_alpha = self.gamma;
+        let (asinh_o, asinh_lo, asinh_norm) = if matches!(transfer, TransferFn::Asinh) {
+            let o = ((self.asinh_offset - self.scale_min) * inv_range).clamp(0.0, 1.0);
+            let lo = (-asinh_alpha * o).asinh();
+            let hi = (asinh_alpha * (1.0 - o)).asinh();
+            let norm = if hi > lo { 1.0 / (hi - lo) } else { 1.0 };
+            (o, lo, norm)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+
+        move |val: f32| {
+            let mut t = ((val - scale_min) * inv_range).clamp(0.0, 1.0);
+            match transfer {
+                TransferFn::Linear => {
+                    if apply_gamma { t = t.powf(inv_gamma); }
+                }
+                TransferFn::Asinh => {
+                    t = (((asinh_alpha * (t - asinh_o)).asinh() - asinh_lo) * asinh_norm).clamp(0.0, 1.0);
+                }
+            }
+            let rgb = colormap.lookup(t);
+            Color32::from_rgb(rgb[0], rgb[1], rgb[2])
         }
     }
 }
@@ -90,9 +147,20 @@ impl RgbaKey {
 /// Holds the texture and cached rendering state.
 pub struct ImageViewer {
     texture: Option<TextureHandle>,
-    rgba_buf: Vec<u8>,
-    /// Key the current `rgba_buf`/texture were computed from.
+    /// The recolored frame. Shared with the texture manager rather than
+    /// copied into it: uploading is a refcount bump, and by the next repaint
+    /// the manager has consumed and dropped its handle, so `Arc::make_mut`
+    /// writes the next frame in place. At 26 Mpix the copy this avoids was
+    /// ~7 ms per frame.
+    image: Arc<ColorImage>,
+    /// Key the current `image`/texture were computed from.
     rgba_key: Option<RgbaKey>,
+    /// Value → color table for `u16` frames (one entry per possible sample),
+    /// and the shading it was built for. Rebuilt only when a display
+    /// parameter changes (~1 ms); recoloring a frame is then a table lookup
+    /// per pixel with no transcendental math.
+    lut: Vec<Color32>,
+    lut_shading: Option<Shading>,
     /// ROI drag state
     roi_start: Option<Pos2>,
     pub roi_rect: Option<[u32; 4]>,
@@ -102,8 +170,10 @@ impl ImageViewer {
     pub fn new() -> Self {
         Self {
             texture: None,
-            rgba_buf: Vec::new(),
+            image: Arc::new(ColorImage::filled([1, 1], Color32::BLACK)),
             rgba_key: None,
+            lut: Vec::new(),
+            lut_shading: None,
             roi_start: None,
             roi_rect: None,
         }
@@ -137,16 +207,12 @@ impl ImageViewer {
         if self.rgba_key != Some(key) || self.texture.is_none() {
             self.rgba_key = Some(key);
             self.update_rgba(mono_data, width, height, params, colormap);
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [width as usize, height as usize],
-                &self.rgba_buf,
-            );
             match &mut self.texture {
-                Some(tex) => tex.set(color_image, TextureOptions::NEAREST),
+                Some(tex) => tex.set(self.image.clone(), TextureOptions::NEAREST),
                 None => {
                     self.texture = Some(ui.ctx().load_texture(
                         "camera_image",
-                        color_image,
+                        self.image.clone(),
                         TextureOptions::NEAREST,
                     ));
                 }
@@ -302,6 +368,14 @@ impl ImageViewer {
         response
     }
 
+    /// Recolor the frame into `self.image`.
+    ///
+    /// `u16` frames go through the per-value table; `f32` frames (float FITS,
+    /// background-subtracted data) evaluate the shader per pixel, since their
+    /// values are not indexable. Both paths use the same shader, so a `u16`
+    /// frame and its `f32` widening produce byte-identical pixels. Rows are
+    /// distributed across the rayon pool: this runs on the UI thread and at
+    /// full sensor resolution is the single largest cost per frame.
     fn update_rgba(
         &mut self,
         mono_data: &Pixels,
@@ -310,65 +384,44 @@ impl ImageViewer {
         params: &DisplayParams,
         colormap: &Colormap,
     ) {
-        // Recolor from the frame's native pixel type: `u16` frames feed the loop
-        // widened per-pixel (`x as f32`, exact) rather than via a whole-buffer
-        // f32 copy. The normalize + transfer + LUT math below is identical for
-        // both, so the produced RGBA bytes are identical.
+        let (w, h) = (width as usize, height as usize);
+        let npix = w * h;
+        let shading = Shading::new(params, colormap);
+        let shade = shading.shader(colormap);
+
+        let img = Arc::make_mut(&mut self.image);
+        if img.size != [w, h] || img.pixels.len() != npix {
+            img.size = [w, h];
+            img.source_size = Vec2::new(w as f32, h as f32);
+            img.pixels.resize(npix, Color32::BLACK);
+        }
+
         match mono_data {
-            Pixels::F32(v) => self.recolor(v.iter().copied(), width, height, params, colormap),
-            Pixels::U16(v) => self.recolor(v.iter().map(|&x| x as f32), width, height, params, colormap),
-        }
-    }
-
-    fn recolor<I: Iterator<Item = f32>>(
-        &mut self,
-        vals: I,
-        width: u32,
-        height: u32,
-        params: &DisplayParams,
-        colormap: &Colormap,
-    ) {
-        let npix = (width * height) as usize;
-        if self.rgba_buf.len() != npix * 4 {
-            self.rgba_buf.resize(npix * 4, 255);
-        }
-
-        let range = params.scale_max - params.scale_min;
-        let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
-        let inv_gamma = if params.gamma != 0.0 { 1.0 / params.gamma } else { 1.0 };
-        let apply_gamma = (params.gamma - 1.0).abs() > 1e-4;
-
-        // Asinh with a pivot: s(t) = (asinh(α(t−o)) − asinh(−αo)) / (asinh(α(1−o)) − asinh(−αo))
-        // where o is the offset normalized into the display range. asinh is odd,
-        // so pixels below the pivot stay visible (compressed toward black) rather
-        // than clipping; o = 0 reduces to the plain asinh(αt)/asinh(α) stretch.
-        let asinh_alpha = params.gamma;
-        let (asinh_o, asinh_lo, asinh_norm) = if matches!(params.transfer, TransferFn::Asinh) {
-            let o = ((params.asinh_offset - params.scale_min) * inv_range).clamp(0.0, 1.0);
-            let lo = (-asinh_alpha * o).asinh();
-            let hi = (asinh_alpha * (1.0 - o)).asinh();
-            let norm = if hi > lo { 1.0 / (hi - lo) } else { 1.0 };
-            (o, lo, norm)
-        } else {
-            (0.0, 0.0, 1.0)
-        };
-
-        for (i, val) in vals.take(npix).enumerate() {
-            let mut t = ((val - params.scale_min) * inv_range).clamp(0.0, 1.0);
-            match params.transfer {
-                TransferFn::Linear => {
-                    if apply_gamma { t = t.powf(inv_gamma); }
+            Pixels::U16(v) => {
+                if self.lut_shading != Some(shading) || self.lut.len() != 1 << 16 {
+                    self.lut = (0..=u16::MAX).map(|x| shade(x as f32)).collect();
+                    self.lut_shading = Some(shading);
                 }
-                TransferFn::Asinh => {
-                    t = (((asinh_alpha * (t - asinh_o)).asinh() - asinh_lo) * asinh_norm).clamp(0.0, 1.0);
-                }
+                let lut = &self.lut;
+                img.pixels
+                    .par_chunks_mut(w)
+                    .zip(v.as_slice().par_chunks(w))
+                    .for_each(|(dst, src)| {
+                        for (d, &s) in dst.iter_mut().zip(src) {
+                            *d = lut[s as usize];
+                        }
+                    });
             }
-            let rgb = colormap.lookup(t);
-            let off = i * 4;
-            self.rgba_buf[off] = rgb[0];
-            self.rgba_buf[off + 1] = rgb[1];
-            self.rgba_buf[off + 2] = rgb[2];
-            self.rgba_buf[off + 3] = 255;
+            Pixels::F32(v) => {
+                img.pixels
+                    .par_chunks_mut(w)
+                    .zip(v.as_slice().par_chunks(w))
+                    .for_each(|(dst, src)| {
+                        for (d, &s) in dst.iter_mut().zip(src) {
+                            *d = shade(s);
+                        }
+                    });
+            }
         }
     }
 
@@ -493,12 +546,44 @@ mod tests {
 
         let mut vu = ImageViewer::new();
         vu.update_rgba(&u, w, h, params, &cmap);
-        let bytes_u = vu.rgba_buf.clone();
+        let px_u = vu.image.pixels.clone();
 
         let mut vf = ImageViewer::new();
         vf.update_rgba(&f, w, h, params, &cmap);
 
-        assert_eq!(bytes_u, vf.rgba_buf, "u16 vs f32 RGBA differ for {kind:?}");
+        assert_eq!(px_u, vf.image.pixels, "u16 vs f32 pixels differ for {kind:?}");
+        assert_eq!(vu.image.size, [w as usize, h as usize]);
+    }
+
+    /// Timing of the recolor paths at a 26 Mpix (SC571CC) frame. Ignored by
+    /// default; run with
+    /// `cargo test --release recolor_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn recolor_bench_26mpix() {
+        let (w, h) = (6224u32, 4168u32);
+        let n = (w * h) as usize;
+        let raw: Vec<u16> = (0..n).map(|i| ((i.wrapping_mul(2654435761) >> 7) & 0x0fff) as u16).collect();
+        let u = Pixels::U16(Arc::new(raw.clone()));
+        let f = Pixels::F32(Arc::new(raw.iter().map(|&x| x as f32).collect()));
+        let cmap = Colormap::new(ColormapKind::Viridis);
+        let cases = [
+            ("linear g=1", DisplayParams { scale_min: 10.0, scale_max: 3000.0, ..Default::default() }),
+            ("gamma 2.2", DisplayParams { scale_min: 10.0, scale_max: 3000.0, gamma: 2.2, ..Default::default() }),
+            ("asinh a=100", DisplayParams { scale_min: 10.0, scale_max: 3000.0, gamma: 100.0, asinh_offset: 300.0, transfer: TransferFn::Asinh, ..Default::default() }),
+        ];
+        let mut v = ImageViewer::new();
+        for (name, p) in &cases {
+            for (label, px) in [("u16", &u), ("f32", &f)] {
+                // First call includes the LUT build / buffer allocation; the
+                // second is the steady state.
+                v.update_rgba(px, w, h, p, &cmap);
+                let t = std::time::Instant::now();
+                v.rgba_key = None;
+                v.update_rgba(px, w, h, p, &cmap);
+                println!("{name:12} {label}: {:6.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
     }
 
     #[test]

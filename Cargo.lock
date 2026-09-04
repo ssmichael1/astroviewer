@@ -1385,9 +1385,9 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "fitskit"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "550f1e7d2e405504fe0c66cde45d2cdae7cb68450c03916ee6d013f9cd529043"
+checksum = "ff3394dc1670991ccdc77536c5d98f1fab108256652c529f3290a54c1c5bf039"
 
 [[package]]
 name = "flate2"
@@ -4347,6 +4347,7 @@ dependencies = [
  "image",
  "libc",
  "quick-xml 0.42.0",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

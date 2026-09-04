@@ -139,3 +139,15 @@ pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(79, 70, 229);
 pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(107, 114, 128);
 #[allow(dead_code)]
 pub const BG_SURFACE: egui::Color32 = egui::Color32::from_rgb(249, 250, 251);
+
+/// Attach a hover tooltip to whatever `add_contents` draws.
+///
+/// The styled widgets return `bool` rather than a `Response`, so the tooltip
+/// hangs off the enclosing scope instead: egui hit-tests the scope's rect as
+/// containing the pointer whenever one of its children does, and a child with
+/// its own tooltip still wins (first tooltip per layer is kept).
+pub fn tip<R>(ui: &mut eframe::egui::Ui, text: &str, add_contents: impl FnOnce(&mut eframe::egui::Ui) -> R) -> R {
+    let inner = ui.scope(add_contents);
+    inner.response.on_hover_text(text);
+    inner.inner
+}

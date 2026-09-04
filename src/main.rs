@@ -74,11 +74,12 @@ impl FrameData {
     /// Build a frame from raw mono `f32` pixels, computing the histogram and
     /// stats. Used by float sources (float FITS, computed luma) and by anything
     /// that has been background-subtracted.
+    #[cfg(any(feature = "svbony", feature = "toupcam"))] // RGB→luma frames from the USB SDKs
     fn new(mono: Vec<f32>, width: u32, height: u32, bit_depth: u8) -> Self {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
         // Single fused pass over the pixels for histogram + mean + stddev; the
         // range is fixed (0..bit-depth max), not data-derived.
-        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, 256, 0.0, range_max);
+        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, histogram::NUM_BINS, 0.0, range_max);
         FrameData { mono: Pixels::F32(Arc::new(mono)), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 
@@ -89,8 +90,19 @@ impl FrameData {
     #[allow(dead_code)] // only feature-gated integer sources build u16 frames
     fn new_u16(mono: Vec<u16>, width: u32, height: u32, bit_depth: u8) -> Self {
         let range_max = ((1u64 << bit_depth) - 1) as f32;
-        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, 256, 0.0, range_max);
+        let (hist, mean, stddev) = compute_histogram_and_stats(&mono, histogram::NUM_BINS, 0.0, range_max);
         FrameData { mono: Pixels::U16(Arc::new(mono)), width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
+    }
+
+    /// Build a frame around an already-shared pixel buffer. FITS playback hands
+    /// out the same `Arc` every loop, so a frame costs one stats pass and no copy.
+    fn from_pixels(mono: Pixels, width: u32, height: u32, bit_depth: u8) -> Self {
+        let range_max = ((1u64 << bit_depth) - 1) as f32;
+        let (hist, mean, stddev) = match &mono {
+            Pixels::U16(v) => compute_histogram_and_stats(v.as_slice(), histogram::NUM_BINS, 0.0, range_max),
+            Pixels::F32(v) => compute_histogram_and_stats(v.as_slice(), histogram::NUM_BINS, 0.0, range_max),
+        };
+        FrameData { mono, width, height, hist, channel_hists: None, cfa: None, mean, stddev, bit_depth }
     }
 }
 
@@ -108,6 +120,19 @@ impl ScaleMode {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistDrag { Min, Max }
+
+/// Which x-range the histogram plot shows. The stored histogram always spans
+/// the full range; the plot re-bins whichever window is selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistXRange { Full, Data, Display }
+
+impl HistXRange {
+    const ALL: &'static [(HistXRange, &'static str)] = &[
+        (HistXRange::Full, "Full range"),
+        (HistXRange::Data, "Fit data"),
+        (HistXRange::Display, "Display range"),
+    ];
+}
 
 /// Everything the zoom window's texture derives from; an unchanged key skips
 /// the per-repaint ROI recolor + upload while the window is open.
@@ -175,7 +200,13 @@ struct SavedConfig {
     /// Use the single-pass fast extraction path (tracking mode).
     #[serde(default)]
     tracking_mode: bool,
+    /// Run the plate-solve pipeline (centroid extraction + solving) on live frames.
+    #[serde(default = "default_true")]
+    solve_enabled: bool,
 }
+
+#[cfg(feature = "starsolve")]
+fn default_true() -> bool { true }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
@@ -238,7 +269,7 @@ impl LogEntry {
 // ── App ─────────────────────────────────────────────────────────────────────
 
 /// Result of an async FITS load: the path, the loaded source, and an optional precomputed background.
-type FitsLoadResult = Result<(std::path::PathBuf, fits_source::FitsSource, Option<Vec<f32>>), String>;
+type FitsLoadResult = Result<(std::path::PathBuf, fits_source::FitsSource), String>;
 
 struct ViewerApp {
     frame_tx: Sender<FrameData>,
@@ -275,6 +306,7 @@ struct ViewerApp {
     hist_log_y: bool,
     /// Overlay per-channel R/G/B histograms when the frame carries them.
     hist_rgb: bool,
+    hist_x_range: HistXRange,
 
     // Overlay system
     overlay_items: Vec<overlays::OverlayItem>,
@@ -291,6 +323,11 @@ struct ViewerApp {
     /// Trades faint-star sensitivity for speed; right for live tracking.
     #[cfg(feature = "starsolve")]
     tracking_mode: bool,
+    /// Master switch for the whole plate-solve pipeline. Off: frames are not
+    /// sent to the worker at all — no centroid extraction, no solving, no
+    /// overlays — so the per-frame CPU cost disappears entirely.
+    #[cfg(feature = "starsolve")]
+    solve_enabled: bool,
     #[cfg(feature = "starsolve")]
     centroid_count: usize,
     #[cfg(feature = "starsolve")]
@@ -374,8 +411,15 @@ struct ViewerApp {
     bg_subtract_enabled: bool,
     bg_percentile: f32,
     bg_image: Option<Vec<f32>>,
+    /// Percentile `bg_image` was computed at; a mismatch with `bg_percentile`
+    /// means a recompute is owed.
+    bg_computed_pct: Option<f32>,
     bg_hist_range: Option<(f32, f32)>,
-    pending_bg: Option<Receiver<Vec<f32>>>,
+    /// In-flight background estimate: (percentile, image, elapsed).
+    pending_bg: Option<Receiver<(f32, Vec<f32>, std::time::Duration)>>,
+    /// The loaded FITS file's frames, shared with the playback thread, so the
+    /// background can be (re)computed without re-reading the file.
+    fits_frames: Option<Arc<fits_source::FitsFrames>>,
 
     // Async file dialog result
     pending_fits_path: Option<Receiver<Option<std::path::PathBuf>>>,
@@ -601,6 +645,7 @@ impl ViewerApp {
             hist_drag: None,
             hist_log_y: false,
             hist_rgb: true,
+            hist_x_range: HistXRange::Full,
             overlay_items: Vec::new(),
             #[cfg(feature = "starsolve")]
             show_centroids: false,
@@ -612,6 +657,8 @@ impl ViewerApp {
             centroid_config: tetra3::CentroidExtractionConfig::default(),
             #[cfg(feature = "starsolve")]
             tracking_mode: false,
+            #[cfg(feature = "starsolve")]
+            solve_enabled: true,
             #[cfg(feature = "starsolve")]
             centroid_count: 0,
             #[cfg(feature = "starsolve")]
@@ -664,8 +711,10 @@ impl ViewerApp {
             bg_subtract_enabled: false,
             bg_percentile: 0.35,
             bg_image: None,
+            bg_computed_pct: None,
             bg_hist_range: None,
             pending_bg: None,
+            fits_frames: None,
             pending_fits_path: None,
             pending_fits_load: None,
             discovered,
@@ -726,6 +775,7 @@ impl ViewerApp {
             camera_model_path: self.camera_model_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             matched_filter_sigma: self.centroid_config.matched_filter_sigma,
             tracking_mode: self.tracking_mode,
+            solve_enabled: self.solve_enabled,
         };
         if let Ok(json) = serde_json::to_string_pretty(&cfg) {
             let _ = std::fs::write(Self::config_path(), json);
@@ -772,6 +822,7 @@ impl ViewerApp {
                 self.centroid_config.max_elongation = cfg.max_elongation;
                 self.centroid_config.matched_filter_sigma = cfg.matched_filter_sigma;
                 self.tracking_mode = cfg.tracking_mode;
+                self.solve_enabled = cfg.solve_enabled;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
                     self.load_solver_db(std::path::Path::new(&cfg.solver_db_path));
@@ -1387,6 +1438,9 @@ impl ViewerApp {
         self.capture_running = false;
         #[cfg(feature = "gev")]
         { self.frame_pool_return = None; }
+        // Reopening a file reloads it, so nothing keeps these alive but us.
+        self.fits_frames = None;
+        self.pending_bg = None;
         self.frame_times.clear();
         self.fps = 0.0;
         self.pump_drops.store(0, Ordering::Relaxed);
@@ -1425,21 +1479,15 @@ impl ViewerApp {
         )));
         self.camera_source = CameraSource::FitsFile(path.clone());
 
-        // Load in background thread to avoid freezing the UI
+        // Load in a background thread to keep the UI live. The temporal
+        // background is not computed here: it is only needed once the user
+        // turns subtraction on, and on a long cube it costs as much as the load.
         let (tx, rx) = bounded(1);
-        let percentile = self.bg_percentile;
         self.pending_fits_load = Some(rx);
         std::thread::spawn(move || {
             let path_str = path.to_str().unwrap_or("").to_string();
             match fits_source::FitsSource::from_file(&path_str) {
-                Ok(source) => {
-                    let bg = if source.num_frames() > 1 {
-                        Some(source.compute_background(percentile))
-                    } else {
-                        None
-                    };
-                    let _ = tx.send(Ok((path, source, bg)));
-                }
+                Ok(source) => { let _ = tx.send(Ok((path, source))); }
                 Err(e) => { let _ = tx.send(Err(format!("{}", e))); }
             }
         });
@@ -1450,12 +1498,21 @@ impl ViewerApp {
             if let Ok(result) = rx.try_recv() {
                 self.pending_fits_load = None;
                 match result {
-                    Ok((path, source, bg)) => {
+                    Ok((path, source)) => {
                         let nframes = source.num_frames();
                         let w = source.width;
                         let h = source.height;
                         let bd = source.bit_depth;
-                        self.bg_image = bg;
+                        self.fits_frames = Some(source.frames());
+                        self.bg_image = None;
+                        self.bg_computed_pct = None;
+                        self.bg_hist_range = None;
+                        if nframes < 2 {
+                            self.bg_subtract_enabled = false;
+                        } else if self.bg_subtract_enabled {
+                            // Subtraction was left on from the previous file.
+                            self.recompute_background();
+                        }
                         let (stop_tx, stop_rx) = bounded(1);
                         start_fits_capture(self.frame_tx.clone(), stop_rx, source, self.fits_fps.clone());
                         self.capture_state = CaptureState::Fits { _stop_tx: stop_tx };
@@ -1474,32 +1531,39 @@ impl ViewerApp {
         }
     }
 
+    /// Estimate the temporal background from the loaded frames on a worker
+    /// thread. One job at a time: if the percentile moves while a job runs,
+    /// `poll_bg` notices the mismatch when it lands and starts another.
     fn recompute_background(&mut self) {
-        let path = match &self.camera_source {
-            CameraSource::FitsFile(p) => p.clone(),
-            _ => return,
-        };
+        let Some(frames) = self.fits_frames.clone() else { return };
+        if frames.num_frames() < 2 || self.pending_bg.is_some() {
+            return;
+        }
         let percentile = self.bg_percentile;
         let (tx, rx) = bounded(1);
         self.pending_bg = Some(rx);
-        self.add_log(LogEntry::info(format!("Recomputing background at {:.0}%...", percentile * 100.0)));
         std::thread::spawn(move || {
-            let path_str = path.to_str().unwrap_or("").to_string();
-            if let Ok(source) = fits_source::FitsSource::from_file(&path_str) {
-                if source.num_frames() > 1 {
-                    let _ = tx.send(source.compute_background(percentile));
-                }
-            }
+            let t0 = Instant::now();
+            let bg = frames.compute_background(percentile);
+            let _ = tx.send((percentile, bg, t0.elapsed()));
         });
     }
 
     fn poll_bg(&mut self) {
         if let Some(rx) = &self.pending_bg {
-            if let Ok(bg) = rx.try_recv() {
+            if let Ok((pct, bg, elapsed)) = rx.try_recv() {
                 self.pending_bg = None;
                 self.bg_image = Some(bg);
+                self.bg_computed_pct = Some(pct);
                 self.bg_hist_range = None;
-                self.add_log(LogEntry::info("Background recomputed".into()));
+                let nframes = self.fits_frames.as_ref().map_or(0, |f| f.num_frames());
+                self.add_log(LogEntry::info(format!(
+                    "Background: {:.0}th percentile of {} frames in {:.0} ms",
+                    pct * 100.0, nframes, elapsed.as_secs_f64() * 1e3
+                )));
+                if self.bg_percentile != pct {
+                    self.recompute_background();
+                }
             }
         }
     }
@@ -1831,7 +1895,7 @@ impl ViewerApp {
                             None => (dmin, dmax),
                         };
                         self.bg_hist_range = Some((rmin, rmax));
-                        let (hist, mean, stddev) = compute_histogram_and_stats(mono, 256, rmin, rmax);
+                        let (hist, mean, stddev) = compute_histogram_and_stats(mono, histogram::NUM_BINS, rmin, rmax);
                         frame.hist = hist;
                         frame.mean = mean;
                         frame.stddev = stddev;
@@ -1878,11 +1942,12 @@ impl ViewerApp {
                 self.fps = (self.frame_times.len() - 1) as f64 / dt.as_secs_f64();
             }
             // Hand this frame to the worker (skipped while it is still busy).
-            // The solver needs owned `f32`; a U16 frame is widened here (solving
-            // is occasional) and keeps its own Arc, so it never pins the pooled
-            // u16 buffer.
+            // Off means off: no extraction job, no widening copy, nothing for
+            // the worker to do. The overlays were cleared when it was switched off.
             #[cfg(feature = "starsolve")]
-            self.maybe_dispatch_solve(frame.mono.to_f32_arc(), frame.width, frame.height);
+            if self.solve_enabled {
+                self.maybe_dispatch_solve(&frame.mono, frame.width, frame.height);
+            }
 
             // Rebuild overlays from the most recent completed extraction. These
             // may lag the displayed frame by a job; at these frame rates the
@@ -1989,7 +2054,10 @@ impl ViewerApp {
             if let CameraSource::FitsFile(_) = &self.camera_source {
                 ui.add_space(4.0);
                 let mut fps = self.fits_fps.load(Ordering::Relaxed);
-                if widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal) {
+                let changed = widgets::tip(ui, "Rate at which frames of the FITS file are replayed (loops)", |ui| {
+                    widgets::styled_slider_u32(ui, &mut fps, 1..=60, "Playback FPS", &pal)
+                });
+                if changed {
                     self.fits_fps.store(fps, Ordering::Relaxed);
                 }
             }
@@ -1997,7 +2065,8 @@ impl ViewerApp {
             // Everything about choosing a source — device lists, manual
             // addresses, FITS files — lives in the Connect dialog.
             ui.add_space(6.0);
-            if widgets::styled_button(ui, "Connect\u{2026}", &pal) {
+            let tip = format!("Choose a camera, INDI server, or FITS file ({})", ui.ctx().format_shortcut(&SC_CONNECT));
+            if widgets::tip(ui, &tip, |ui| widgets::styled_button(ui, "Connect\u{2026}", &pal)) {
                 self.connect_dialog_open = true;
             }
         });
@@ -2009,17 +2078,24 @@ impl ViewerApp {
             let label_w = 65.0;
             egui::Grid::new("display_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Colormap"); });
-                if widgets::combo_box(ui, "colormap", "", &mut self.colormap.kind, &cmap_options, &pal) {
+                let changed = widgets::tip(ui, "False-color palette applied to the scaled pixel values", |ui| {
+                    widgets::combo_box(ui, "colormap", "", &mut self.colormap.kind, &cmap_options, &pal)
+                });
+                if changed {
                     self.colormap = Colormap::new(self.colormap.kind);
                 }
                 ui.end_row();
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Scale"); });
-                widgets::combo_box(ui, "scale_mode", "", &mut self.scale_mode, ScaleMode::ALL, &pal);
+                widgets::tip(ui, "How the display min/max are chosen.\nFull Range: the sensor bit depth.\nAuto: this frame's min and max.\nZScale: robust range that ignores outliers (DS9-style).\nManual: set below, or drag the lines on the histogram.", |ui| {
+                    widgets::combo_box(ui, "scale_mode", "", &mut self.scale_mode, ScaleMode::ALL, &pal);
+                });
                 ui.end_row();
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Transfer"); });
-                widgets::combo_box(ui, "transfer_fn", "", &mut self.display_params.transfer, imageview::TransferFn::ALL, &pal);
+                widgets::tip(ui, "Linear (with gamma), or asinh to compress a high dynamic range so faint detail and bright cores both stay visible", |ui| {
+                    widgets::combo_box(ui, "transfer_fn", "", &mut self.display_params.transfer, imageview::TransferFn::ALL, &pal);
+                });
                 ui.end_row();
 
                 let gamma_label = match self.display_params.transfer {
@@ -2035,8 +2111,14 @@ impl ViewerApp {
                         imageview::TransferFn::Asinh => 3.0,
                     };
                     let mut log_gamma = self.display_params.gamma.log10().min(log_max);
-                    ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
-                        widgets::styled_slider_bare(ui, &mut log_gamma, -1.0..=log_max, &pal);
+                    let gamma_tip = match self.display_params.transfer {
+                        imageview::TransferFn::Linear => "Gamma: below 1 brightens faint detail, above 1 darkens it (log-spaced slider)",
+                        imageview::TransferFn::Asinh => "Asinh softening: larger values boost the faint end more strongly (log-spaced slider)",
+                    };
+                    widgets::tip(ui, gamma_tip, |ui| {
+                        ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                            widgets::styled_slider_bare(ui, &mut log_gamma, -1.0..=log_max, &pal);
+                        });
                     });
                     self.display_params.gamma = 10.0_f32.powf(log_gamma);
                     ui.label(egui::RichText::new(format!("{:.2}", self.display_params.gamma)).monospace().size(12.0));
@@ -2047,7 +2129,9 @@ impl ViewerApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Offset"); });
                     ui.horizontal(|ui| {
                         let was_auto = self.asinh_auto_offset;
-                        widgets::styled_checkbox(ui, &mut self.asinh_auto_offset, "Auto", &pal);
+                        widgets::tip(ui, "Asinh pivot: the stretch is linear below this level and logarithmic above it.\nAuto tracks the frame median, a robust sky-background estimate.", |ui| {
+                            widgets::styled_checkbox(ui, &mut self.asinh_auto_offset, "Auto", &pal);
+                        });
                         if self.asinh_auto_offset {
                             // Refresh immediately on toggle rather than waiting
                             // for the next frame (matters for paused sources).
@@ -2073,7 +2157,9 @@ impl ViewerApp {
                     imageview::TransferFn::Linear => "Reset Gamma",
                     imageview::TransferFn::Asinh => "Reset Alpha",
                 };
-                if widgets::styled_button(ui, reset_label, &pal) { self.display_params.gamma = 1.0; }
+                if widgets::tip(ui, "Back to 1.0 (no stretch)", |ui| widgets::styled_button(ui, reset_label, &pal)) {
+                    self.display_params.gamma = 1.0;
+                }
             });
             if self.scale_mode == ScaleMode::Manual {
                 ui.add_space(4.0);
@@ -2083,37 +2169,61 @@ impl ViewerApp {
                     let max = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f32).unwrap_or(65535.0);
                     (0.0, max)
                 };
-                widgets::styled_slider(ui, &mut self.display_params.scale_min, range_lo..=range_hi, "Min", &pal);
-                widgets::styled_slider(ui, &mut self.display_params.scale_max, range_lo..=range_hi, "Max", &pal);
+                widgets::tip(ui, "Pixel value mapped to the bottom of the colormap. Drag the red line on the histogram for finer control.", |ui| {
+                    widgets::styled_slider(ui, &mut self.display_params.scale_min, range_lo..=range_hi, "Min", &pal);
+                });
+                widgets::tip(ui, "Pixel value mapped to the top of the colormap. Drag the blue line on the histogram for finer control.", |ui| {
+                    widgets::styled_slider(ui, &mut self.display_params.scale_max, range_lo..=range_hi, "Max", &pal);
+                });
             } else {
                 ui.label(format!("Range: {:.0} – {:.0}", self.display_params.scale_min, self.display_params.scale_max));
             }
             ui.add_space(6.0);
-            widgets::styled_checkbox(ui, &mut self.display_params.show_axes, "Show Axes", &pal);
-            widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar", &pal);
+            widgets::tip(ui, "Pixel-coordinate ticks along the image edges", |ui| {
+                widgets::styled_checkbox(ui, &mut self.display_params.show_axes, "Show Axes", &pal);
+            });
+            widgets::tip(ui, "Colormap strip labeled with the current display range", |ui| {
+                widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar", &pal);
+            });
             #[cfg(feature = "starsolve")]
             {
-                widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
-                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
-                widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
+                widgets::tip(ui, "Ellipses at extracted star centroids, cyan (faint) to yellow (bright)", |ui| {
+                    widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
+                });
+                widgets::tip(ui, "Cross-hairs on centroids the plate solve matched to catalog stars", |ui| {
+                    widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
+                });
+                widgets::tip(ui, "Labels for named bright stars in the solved field (needs Centroids and Matched Stars)", |ui| {
+                    widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
+                });
             }
         });
 
         ui.add_space(4.0);
 
         section(ui, "Background", &pal, |ui| {
-            let has_bg = self.bg_image.is_some();
+            let can_bg = self.fits_frames.as_ref().is_some_and(|f| f.num_frames() > 1);
             let was_enabled = self.bg_subtract_enabled;
-            if has_bg {
-                widgets::styled_checkbox(ui, &mut self.bg_subtract_enabled, "Subtract Background", &pal);
+            if can_bg {
+                widgets::tip(ui, "Subtract a per-pixel temporal percentile taken across every frame of the FITS file (computed on first use)", |ui| {
+                    widgets::styled_checkbox(ui, &mut self.bg_subtract_enabled, "Subtract Background", &pal);
+                });
             } else {
                 ui.add_enabled(false, egui::Checkbox::new(&mut self.bg_subtract_enabled, "Subtract Background"));
                 ui.label(egui::RichText::new("Load a multi-frame FITS to enable").weak().small());
             }
-            if has_bg && self.bg_subtract_enabled {
+            if can_bg && self.bg_subtract_enabled {
+                if self.pending_bg.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        ui.label(egui::RichText::new("Computing background…").small().color(pal.text_secondary));
+                    });
+                }
                 let old_pct = self.bg_percentile;
                 let mut pct_int = (self.bg_percentile * 100.0).round() as u32;
-                widgets::styled_slider_u32(ui, &mut pct_int, 10..=50, "Percentile", &pal);
+                widgets::tip(ui, "Percentile across frames taken as each pixel's background; lower rejects more of the moving stars", |ui| {
+                    widgets::styled_slider_u32(ui, &mut pct_int, 10..=50, "Percentile", &pal);
+                });
                 self.bg_percentile = pct_int as f32 / 100.0;
                 if self.bg_percentile != old_pct {
                     self.recompute_background();
@@ -2122,6 +2232,9 @@ impl ViewerApp {
             if !was_enabled && self.bg_subtract_enabled {
                 self.scale_mode = ScaleMode::Auto;
                 self.bg_hist_range = None;
+                if self.bg_computed_pct != Some(self.bg_percentile) {
+                    self.recompute_background();
+                }
             }
             if was_enabled && !self.bg_subtract_enabled {
                 self.bg_hist_range = None;
@@ -2225,179 +2338,191 @@ impl ViewerApp {
 
     fn histogram_content(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
-        if let Some(frame) = &self.current_frame {
-            let hist = &frame.hist;
-            let centers = hist.centers();
-            let bin_width = if centers.len() > 1 { centers[1] - centers[0] } else { 1.0 };
+        if self.current_frame.is_none() { return; }
+        let has_rgb = self.current_frame.as_ref().is_some_and(|f| f.channel_hists.is_some()) && !self.bg_subtract_enabled;
 
-            let mut line_vec: Vec<[f64; 2]> = Vec::with_capacity(centers.len() * 2);
-            for (&cx, &cy) in centers.iter().zip(hist.counts.iter()) {
-                let y = if self.hist_log_y {
-                    (cy as f64 + 1.0).log10()
-                } else {
-                    cy as f64
-                };
-                line_vec.push([(cx - bin_width * 0.5) as f64, y]);
-                line_vec.push([(cx + bin_width * 0.5) as f64, y]);
-            }
-
-            // Per-channel R/G/B overlays (raw CFA subsampling from color
-            // sensors), same step-line shape as the main curve. G sits ~2×
-            // higher than R/B: green covers half the mosaic. Hidden while
-            // background subtraction is on — its histogram is re-ranged and
-            // the CFA curves would no longer share the axis.
-            let log_y = self.hist_log_y;
-            let step_line = |h: &histogram::Histogram| -> Vec<[f64; 2]> {
-                let centers = h.centers();
-                let bw = if centers.len() > 1 { centers[1] - centers[0] } else { 1.0 };
-                let mut pts = Vec::with_capacity(centers.len() * 2);
-                for (&cx, &cy) in centers.iter().zip(h.counts.iter()) {
-                    let y = if log_y { (cy as f64 + 1.0).log10() } else { cy as f64 };
-                    pts.push([(cx - bw * 0.5) as f64, y]);
-                    pts.push([(cx + bw * 0.5) as f64, y]);
-                }
-                pts
-            };
-            let has_rgb = frame.channel_hists.is_some() && !self.bg_subtract_enabled;
-            let rgb_lines: Vec<(&'static str, egui::Color32, Vec<[f64; 2]>)> =
-                if has_rgb && self.hist_rgb {
-                    frame.channel_hists.as_ref().map_or(Vec::new(), |chs| {
-                        vec![
-                            ("R", egui::Color32::from_rgb(235, 87, 87), step_line(&chs[0])),
-                            ("G", egui::Color32::from_rgb(76, 187, 106), step_line(&chs[1])),
-                            ("B", egui::Color32::from_rgb(96, 165, 250), step_line(&chs[2])),
-                        ]
-                    })
-                } else {
-                    Vec::new()
-                };
-
-            // Log Y / RGB overlay toggles
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+        // ── Toolbar: Log Y, RGB, x-range ────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            widgets::tip(ui, "Plot log₁₀(count + 1) so faint tails stay visible beside the sky peak", |ui| {
                 widgets::styled_checkbox(ui, &mut self.hist_log_y, "Log Y", &pal);
-                if has_rgb {
-                    ui.add_space(8.0);
+            });
+            if has_rgb {
+                ui.add_space(8.0);
+                widgets::tip(ui, "Overlay per-channel R/G/B histograms of the raw Bayer mosaic (G sits ~2× higher: it covers half the sensor)", |ui| {
                     widgets::styled_checkbox(ui, &mut self.hist_rgb, "RGB", &pal);
+                });
+            }
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("X axis").color(pal.text_secondary));
+            widgets::tip(ui, "Full range: the sensor bit depth.\nFit data: the span of pixel values in this frame.\nDisplay range: the current scale min–max.", |ui| {
+                widgets::combo_box(ui, "hist_x_range", "", &mut self.hist_x_range, HistXRange::ALL, &pal);
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new("drag the red / blue lines to set a manual display range")
+                        .size(11.0)
+                        .color(pal.text_secondary),
+                );
+            });
+        });
+
+        // ── Curves for the selected window ──────────────────────────────────
+        // Everything derived from the frame is pulled into locals here so the
+        // borrow ends before the drag handler below mutates display state.
+        let Some(frame) = &self.current_frame else { return };
+        let hist = &frame.hist;
+        let full_lo = hist.edges.first().copied().unwrap_or(0.0) as f64;
+        let full_hi = hist.edges.last().copied().unwrap_or(65535.0) as f64;
+        let bit_max = ((1u64 << frame.bit_depth) - 1) as f64;
+        let smin = self.display_params.scale_min as f64;
+        let smax = self.display_params.scale_max as f64;
+        let manual = self.scale_mode == ScaleMode::Manual;
+
+        let pad = |lo: f64, hi: f64| {
+            let w = (hi - lo).max(1.0);
+            (lo - w * 0.03, hi + w * 0.03)
+        };
+        let (lo, hi) = match self.hist_x_range {
+            HistXRange::Full => (full_lo, full_hi),
+            HistXRange::Data => {
+                let (mut lo, mut hi) = pad(hist.data_min as f64, hist.data_max as f64);
+                // Keep user-placed lines reachable while fitted to the data.
+                if manual { lo = lo.min(smin); hi = hi.max(smax); }
+                (lo, hi)
+            }
+            HistXRange::Display => pad(smin, smax),
+        };
+        let (lo, hi) = (lo.max(full_lo), hi.min(full_hi));
+        let (lo, hi) = if hi <= lo { (full_lo, full_hi) } else { (lo, hi) };
+
+        let log_y = self.hist_log_y;
+        let main_line = hist_step_line(hist, lo, hi, log_y);
+        let rgb_lines: Vec<(&'static str, egui::Color32, Vec<[f64; 2]>)> = if has_rgb && self.hist_rgb {
+            frame.channel_hists.as_ref().map_or(Vec::new(), |chs| {
+                vec![
+                    ("R", egui::Color32::from_rgb(235, 87, 87), hist_step_line(&chs[0], lo, hi, log_y)),
+                    ("G", egui::Color32::from_rgb(76, 187, 106), hist_step_line(&chs[1], lo, hi, log_y)),
+                    ("B", egui::Color32::from_rgb(96, 165, 250), hist_step_line(&chs[2], lo, hi, log_y)),
+                ]
+            })
+        } else {
+            Vec::new()
+        };
+
+        let plot_height = ui.available_height().max(80.0);
+        let y_label = if log_y { "log₁₀(count+1)" } else { "" };
+
+        // A single coarse "nice" step (~4-5 lines) across whatever window is
+        // shown keeps the histogram surgical instead of graph-papery.
+        let grid_step = {
+            let raw = ((hi - lo) / 4.0).max(1e-6);
+            let mag = 10f64.powf(raw.log10().floor());
+            let norm = raw / mag;
+            let nice = if norm < 1.5 { 1.0 } else if norm < 3.0 { 2.0 } else if norm < 7.0 { 5.0 } else { 10.0 };
+            nice * mag
+        };
+
+        // One grab zone, in screen pixels, shared by the hover highlight, the
+        // drag start, and the resize cursor, so the three always agree and the
+        // target stays the same size at any panel width or x-range.
+        const GRAB_PX: f64 = 12.0;
+        let mut near_line = false;
+        let plot_resp = egui_plot::Plot::new("histogram")
+            .height(plot_height)
+            .y_axis_label(y_label)
+            .show_axes([true, false])
+            .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
+            .show_grid([true, false])
+            .x_grid_spacer(egui_plot::uniform_grid_spacer(move |_| [grid_step, grid_step * 5.0, grid_step * 10.0]))
+            .x_axis_label("Pixel Value")
+            .include_x(lo)
+            .include_x(hi)
+            .include_y(0.0)
+            .set_margin_fraction(egui::vec2(0.01, 0.0))
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    egui_plot::Line::new("histogram", egui_plot::PlotPoints::from(main_line))
+                        .color(pal.plot_line)
+                        .width(1.5)
+                        .fill(0.0)
+                        .fill_alpha(0.35),
+                );
+                for (name, color, pts) in rgb_lines {
+                    plot_ui.line(
+                        egui_plot::Line::new(name, egui_plot::PlotPoints::from(pts))
+                            .color(color)
+                            .width(1.0),
+                    );
                 }
+
+                // Display-range lines, in every scale mode: dimmed when the
+                // mode sets them automatically, solid once they are manual.
+                // Dragging either one switches to Manual, so showing them is
+                // what makes that discoverable.
+                let grab_radius_data = GRAB_PX * plot_ui.transform().dvalue_dpos()[0].abs();
+                let dragging_min = matches!(self.hist_drag, Some(HistDrag::Min));
+                let dragging_max = matches!(self.hist_drag, Some(HistDrag::Max));
+                let mut near_min = dragging_min;
+                let mut near_max = dragging_max;
+                if !dragging_min && !dragging_max {
+                    if let Some(ptr) = plot_ui.pointer_coordinate() {
+                        let dist_min = (ptr.x - smin).abs();
+                        let dist_max = (ptr.x - smax).abs();
+                        if dist_min < grab_radius_data && dist_min <= dist_max { near_min = true; }
+                        else if dist_max < grab_radius_data { near_max = true; }
+                    }
+                }
+                near_line = near_min || near_max;
+                let line_style = |near: bool, bright: egui::Color32, base: (u8, u8, u8)| -> (egui::Color32, f32) {
+                    if near {
+                        (bright, 4.0)
+                    } else if manual {
+                        (egui::Color32::from_rgba_unmultiplied(base.0, base.1, base.2, 200), 3.0)
+                    } else {
+                        (egui::Color32::from_rgba_unmultiplied(base.0, base.1, base.2, 110), 2.0)
+                    }
+                };
+                let (min_c, min_w) = line_style(near_min, egui::Color32::from_rgb(252, 85, 85), (220, 50, 50));
+                plot_ui.vline(egui_plot::VLine::new("scale_min", smin).color(min_c).width(min_w).style(egui_plot::LineStyle::Solid));
+                let (max_c, max_w) = line_style(near_max, egui::Color32::from_rgb(96, 165, 250), (59, 130, 246));
+                plot_ui.vline(egui_plot::VLine::new("scale_max", smax).color(max_c).width(max_w).style(egui_plot::LineStyle::Solid));
             });
 
-            let plot_height = ui.available_height().max(80.0);
-            let y_label = if self.hist_log_y { "log₁₀(count+1)" } else { "" };
-
-            let x_max = self.current_frame.as_ref()
-                .map(|f| ((1u64 << f.bit_depth) - 1) as f64)
-                .unwrap_or(65535.0);
-
-            // A single coarse "nice" step (~4-5 lines) keeps the histogram
-            // surgical instead of graph-papery.
-            let grid_step = {
-                let raw = (x_max / 4.0).max(1.0);
-                let mag = 10f64.powf(raw.log10().floor());
-                let norm = raw / mag;
-                let nice = if norm < 1.5 { 1.0 } else if norm < 3.0 { 2.0 } else if norm < 7.0 { 5.0 } else { 10.0 };
-                nice * mag
-            };
-
-            let plot_resp = egui_plot::Plot::new("histogram")
-                .height(plot_height)
-                .y_axis_label(y_label)
-                .show_axes([true, false])
-                .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
-                .show_grid([true, false])
-                .x_grid_spacer(egui_plot::uniform_grid_spacer(move |_| [grid_step, grid_step * 5.0, grid_step * 10.0]))
-                .x_axis_label("Pixel Value")
-                .include_x(0.0)
-                .include_x(x_max)
-                .include_y(0.0)
-                .set_margin_fraction(egui::vec2(0.01, 0.0))
-                .show(ui, |plot_ui| {
-                    let line_points: egui_plot::PlotPoints = line_vec.into();
-                    plot_ui.line(
-                        egui_plot::Line::new("histogram", line_points)
-                            .color(pal.plot_line)
-                            .width(1.5)
-                            .fill(0.0)
-                            .fill_alpha(0.35),
-                    );
-                    for (name, color, pts) in rgb_lines {
-                        plot_ui.line(
-                            egui_plot::Line::new(name, egui_plot::PlotPoints::from(pts))
-                                .color(color)
-                                .width(1.0),
-                        );
+        // ── Drag handling ───────────────────────────────────────────────────
+        if near_line || self.hist_drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if plot_resp.response.dragged_by(egui::PointerButton::Primary) {
+            if let Some(ptr) = plot_resp.response.hover_pos() {
+                let transform = plot_resp.transform;
+                let plot_x = transform.value_from_position(ptr).x;
+                let grab_radius_data = GRAB_PX * transform.dvalue_dpos()[0].abs();
+                if plot_resp.response.drag_started() {
+                    let dist_min = (plot_x - smin).abs();
+                    let dist_max = (plot_x - smax).abs();
+                    if dist_min < grab_radius_data && dist_min <= dist_max { self.hist_drag = Some(HistDrag::Min); }
+                    else if dist_max < grab_radius_data { self.hist_drag = Some(HistDrag::Max); }
+                }
+                let (drag_lo, drag_hi) = if self.bg_subtract_enabled {
+                    self.bg_hist_range.map(|(lo, hi)| (lo as f64, hi as f64)).unwrap_or((-1000.0, 1000.0))
+                } else {
+                    (0.0, bit_max)
+                };
+                match self.hist_drag {
+                    Some(HistDrag::Min) => {
+                        self.scale_mode = ScaleMode::Manual;
+                        self.display_params.scale_min = plot_x.max(drag_lo).min(self.display_params.scale_max as f64 - 1.0) as f32;
                     }
-                    if self.scale_mode == ScaleMode::Manual {
-                        let smin = self.display_params.scale_min as f64;
-                        let smax = self.display_params.scale_max as f64;
-                        let grab_radius_data = {
-                            let bounds = plot_ui.plot_bounds();
-                            (bounds.max()[0] - bounds.min()[0]) * 0.015
-                        };
-                        let dragging_min = matches!(self.hist_drag, Some(HistDrag::Min));
-                        let dragging_max = matches!(self.hist_drag, Some(HistDrag::Max));
-                        let mut near_min = dragging_min;
-                        let mut near_max = dragging_max;
-                        if !dragging_min && !dragging_max {
-                            if let Some(ptr) = plot_ui.pointer_coordinate() {
-                                let dist_min = (ptr.x - smin).abs();
-                                let dist_max = (ptr.x - smax).abs();
-                                if dist_min < grab_radius_data && dist_min <= dist_max { near_min = true; }
-                                else if dist_max < grab_radius_data { near_max = true; }
-                            }
-                        }
-                        let (min_c, min_w) = if near_min {
-                            (egui::Color32::from_rgb(252, 85, 85), 4.0)
-                        } else {
-                            (egui::Color32::from_rgba_unmultiplied(220, 50, 50, 200), 3.0)
-                        };
-                        plot_ui.vline(egui_plot::VLine::new("scale_min", smin).color(min_c).width(min_w).style(egui_plot::LineStyle::Solid));
-
-                        let (max_c, max_w) = if near_max {
-                            (egui::Color32::from_rgb(96, 165, 250), 4.0)
-                        } else {
-                            (egui::Color32::from_rgba_unmultiplied(59, 130, 246, 200), 3.0)
-                        };
-                        plot_ui.vline(egui_plot::VLine::new("scale_max", smax).color(max_c).width(max_w).style(egui_plot::LineStyle::Solid));
+                    Some(HistDrag::Max) => {
+                        self.scale_mode = ScaleMode::Manual;
+                        self.display_params.scale_max = plot_x.max(self.display_params.scale_min as f64 + 1.0).min(drag_hi) as f32;
                     }
-                });
-
-            // Drag handling
-            if plot_resp.response.dragged_by(egui::PointerButton::Primary) {
-                if let Some(ptr) = plot_resp.response.hover_pos() {
-                    let transform = plot_resp.transform;
-                    let plot_x = transform.value_from_position(ptr).x;
-                    let grab_radius_data = {
-                        let bounds = transform.bounds();
-                        (bounds.max()[0] - bounds.min()[0]) * 0.02
-                    };
-                    if plot_resp.response.drag_started() {
-                        let dist_min = (plot_x - self.display_params.scale_min as f64).abs();
-                        let dist_max = (plot_x - self.display_params.scale_max as f64).abs();
-                        if dist_min < grab_radius_data && dist_min <= dist_max { self.hist_drag = Some(HistDrag::Min); }
-                        else if dist_max < grab_radius_data { self.hist_drag = Some(HistDrag::Max); }
-                    }
-                    let (drag_lo, drag_hi) = if self.bg_subtract_enabled {
-                        self.bg_hist_range.map(|(lo, hi)| (lo as f64, hi as f64)).unwrap_or((-1000.0, 1000.0))
-                    } else {
-                        let bit_max = self.current_frame.as_ref().map(|f| ((1u64 << f.bit_depth) - 1) as f64).unwrap_or(65535.0);
-                        (0.0, bit_max)
-                    };
-                    match self.hist_drag {
-                        Some(HistDrag::Min) => {
-                            self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_min = plot_x.max(drag_lo).min(self.display_params.scale_max as f64 - 1.0) as f32;
-                        }
-                        Some(HistDrag::Max) => {
-                            self.scale_mode = ScaleMode::Manual;
-                            self.display_params.scale_max = plot_x.max(self.display_params.scale_min as f64 + 1.0).min(drag_hi) as f32;
-                        }
-                        None => {}
-                    }
+                    None => {}
                 }
             }
-            if plot_resp.response.drag_stopped() { self.hist_drag = None; }
         }
+        if plot_resp.response.drag_stopped() { self.hist_drag = None; }
     }
 
     #[cfg(any(feature = "svbony", feature = "gev", feature = "toupcam", feature = "indi"))]
@@ -3528,8 +3653,24 @@ impl ViewerApp {
     #[cfg(feature = "starsolve")]
     fn plate_solve_content(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
-        // ── Top bar: database + FOV + status + reset ────────────────────────
+        // ── Top bar: solve toggle + database + FOV + status + reset ─────────
         ui.horizontal(|ui| {
+            // Master switch for the whole pipeline: extraction and solving.
+            let was_enabled = self.solve_enabled;
+            widgets::tip(ui, "Run centroid extraction and plate solving on live frames.\nOff: frames skip the solver thread entirely, freeing the CPU; centroid and star overlays clear.", |ui| {
+                widgets::styled_checkbox(ui, &mut self.solve_enabled, "Solve", &pal);
+            });
+            if was_enabled && !self.solve_enabled {
+                // Nothing produced while off should linger: stale centroids
+                // would otherwise keep being drawn over every new frame, and a
+                // stale lock would keep seeding FOV/attitude hints.
+                self.last_solve = None;
+                self.last_centroids.clear();
+                self.centroid_count = 0;
+                self.overlay_items.clear();
+            }
+            ui.separator();
+
             // Database
             if self.gen_rx.is_some() {
                 ui.add(egui::Spinner::new().size(14.0));
@@ -3537,7 +3678,7 @@ impl ViewerApp {
                 ui.label(egui::RichText::new(format!("Building star database… {:.0}s", secs))
                     .color(egui::Color32::from_rgb(217, 119, 6)));
             } else if self.solver_db.is_none() {
-                if widgets::styled_button(ui, "Load Database...", &pal) {
+                if widgets::tip(ui, "Load a tetra3 pattern database (.bin)", |ui| widgets::styled_button(ui, "Load Database...", &pal)) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Database", &["bin"])
                         .pick_file()
@@ -3559,7 +3700,9 @@ impl ViewerApp {
                 }
                 // Offer to build the default database from the bundled catalog.
                 if self.solver_catalog_path.is_some()
-                    && widgets::styled_button(ui, "Build default DB", &pal)
+                    && widgets::tip(ui, "Generate the default 5–50° database from the bundled Gaia catalog (one time, cached)", |ui| {
+                        widgets::styled_button(ui, "Build default DB", &pal)
+                    })
                 {
                     self.start_solver_generation();
                 }
@@ -3575,7 +3718,7 @@ impl ViewerApp {
 
             // Camera model
             if self.camera_model.is_none() {
-                if widgets::styled_button(ui, "Load Calib...", &pal) {
+                if widgets::tip(ui, "Load a camera model (.bin): focal length and distortion from a prior calibration", |ui| widgets::styled_button(ui, "Load Calib...", &pal)) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Camera Model", &["bin"])
                         .pick_file()
@@ -3607,14 +3750,17 @@ impl ViewerApp {
             // FOV
             ui.label("FOV:");
             ui.add(egui::DragValue::new(&mut self.fov_estimate_deg)
-                .range(1.0..=60.0).speed(0.5).suffix("°").fixed_decimals(1));
+                .range(1.0..=60.0).speed(0.5).suffix("°").fixed_decimals(1))
+                .on_hover_text("Estimated horizontal field of view. Bounds the pattern search until the first solve locks, then tracks the solved value.");
 
             ui.separator();
 
             // Solve status
             if self.solver_db.is_some() {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(75.0, 18.0), egui::Sense::hover());
-                let (text, color) = if self.solve_busy {
+                let (text, color) = if !self.solve_enabled {
+                    ("Off", pal.text_secondary)
+                } else if self.solve_busy {
                     ("Solving...", egui::Color32::from_rgb(217, 119, 6))
                 } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                     ("Locked", egui::Color32::from_rgb(34, 197, 94))
@@ -3633,7 +3779,7 @@ impl ViewerApp {
 
             // Reset defaults (far right)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::styled_button(ui, "Reset", &pal) {
+                if widgets::tip(ui, "Restore the default extraction parameters", |ui| widgets::styled_button(ui, "Reset", &pal)) {
                     self.centroid_config = tetra3::CentroidExtractionConfig::default();
                 }
             });
@@ -3718,22 +3864,28 @@ impl ViewerApp {
 
         // Row 1
         ui.horizontal(|ui| {
-            param_label(ui, "Pix σ", &format!("{:.1}", self.centroid_config.sigma_threshold));
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0, &pal);
+            widgets::tip(ui, "Detection threshold in units of the local noise σ; higher keeps only brighter stars", |ui| {
+                param_label(ui, "Pix σ", &format!("{:.1}", self.centroid_config.sigma_threshold));
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut self.centroid_config.sigma_threshold, 1.0..=20.0, &pal);
+                });
             });
 
             let mut v = self.centroid_config.min_pixels as f32;
-            param_label(ui, "Min px", &format!("{}", self.centroid_config.min_pixels));
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0, &pal);
+            widgets::tip(ui, "Smallest blob (in pixels) accepted as a star; rejects hot pixels", |ui| {
+                param_label(ui, "Min px", &format!("{}", self.centroid_config.min_pixels));
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut v, 1.0..=50.0, &pal);
+                });
             });
             self.centroid_config.min_pixels = v.round() as usize;
 
             let mut v = self.centroid_config.max_pixels as f32;
-            param_label(ui, "Max px", &format!("{}", self.centroid_config.max_pixels));
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0, &pal);
+            widgets::tip(ui, "Largest blob accepted; rejects saturated stars, planets and glare (log-spaced slider)", |ui| {
+                param_label(ui, "Max px", &format!("{}", self.centroid_config.max_pixels));
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_log_bare(ui, &mut v, 10.0..=100000.0, &pal);
+                });
             });
             self.centroid_config.max_pixels = v as usize;
         });
@@ -3742,25 +3894,31 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             let mut v = self.centroid_config.max_centroids.unwrap_or(0) as f32;
             let val = if self.centroid_config.max_centroids.is_none() { "all".into() } else { format!("{}", v.round() as usize) };
-            param_label(ui, "Stars", &val);
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0, &pal);
+            widgets::tip(ui, "Keep only the N brightest centroids for solving; 0 = all", |ui| {
+                param_label(ui, "Stars", &val);
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut v, 0.0..=500.0, &pal);
+                });
             });
             self.centroid_config.max_centroids = if (v as usize) == 0 { None } else { Some(v.round() as usize) };
 
             let mut v = self.centroid_config.local_bg_block_size.unwrap_or(0) as f32;
             let val = if self.centroid_config.local_bg_block_size.is_none() { "global".into() } else { format!("{} px", v.round() as u32) };
-            param_label(ui, "BG", &val);
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0, &pal);
+            widgets::tip(ui, "Local background grid cell size in pixels; 0 = one global background level", |ui| {
+                param_label(ui, "BG", &val);
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut v, 0.0..=256.0, &pal);
+                });
             });
             self.centroid_config.local_bg_block_size = if (v as u32) == 0 { None } else { Some(v.round() as u32) };
 
             let mut v = self.centroid_config.max_elongation.unwrap_or(0.0);
             let val = if self.centroid_config.max_elongation.is_none() { "off".into() } else { format!("{:.1}", v) };
-            param_label(ui, "Elong", &val);
-            ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0, &pal);
+            widgets::tip(ui, "Reject blobs whose major/minor axis ratio exceeds this (trails, close doubles); below 0.5 = off", |ui| {
+                param_label(ui, "Elong", &val);
+                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                    widgets::styled_slider_bare(ui, &mut v, 0.0..=10.0, &pal);
+                });
             });
             self.centroid_config.max_elongation = if v < 0.5 { None } else { Some(v) };
         });
@@ -3769,12 +3927,14 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             let mut v = self.centroid_config.matched_filter_sigma.unwrap_or(0.0);
             let val = if self.centroid_config.matched_filter_sigma.is_none() { "off".into() } else { format!("{:.1}", v) };
-            param_label(ui, "Blur σ", &val);
-            // The fast path has no matched filter — disable rather than hide,
-            // so the setting visibly survives round-trips through tracking mode.
-            ui.add_enabled_ui(!self.tracking_mode, |ui| {
-                ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
-                    widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
+            widgets::tip(ui, "Matched-filter Gaussian σ (pixels) applied before detection; 0 = off. Not used in tracking mode.", |ui| {
+                param_label(ui, "Blur σ", &val);
+                // The fast path has no matched filter — disable rather than hide,
+                // so the setting visibly survives round-trips through tracking mode.
+                ui.add_enabled_ui(!self.tracking_mode, |ui| {
+                    ui.allocate_ui(egui::vec2(slider_w, 20.0), |ui| {
+                        widgets::styled_slider_bare(ui, &mut v, 0.0..=5.0, &pal);
+                    });
                 });
             });
             if !self.tracking_mode {
@@ -3782,7 +3942,9 @@ impl ViewerApp {
             }
 
             ui.add_space(12.0);
-            widgets::styled_checkbox(ui, &mut self.tracking_mode, "Tracking mode", &pal);
+            widgets::tip(ui, "Single-pass fast extractor for frame-to-frame tracking: much faster, slightly less precise, no matched filter", |ui| {
+                widgets::styled_checkbox(ui, &mut self.tracking_mode, "Tracking mode", &pal);
+            });
             ui.label(
                 egui::RichText::new("single-pass fast extraction")
                     .size(11.0)
@@ -4176,6 +4338,18 @@ fn stat_row(ui: &mut egui::Ui, label_width: f32, label: &str, value: &str, pal: 
     ui.end_row();
 }
 
+// ── Keyboard shortcuts ──────────────────────────────────────────────────────
+// One definition each, shared by the handler in `ui()` and the menu hints, so
+// the two can never disagree. `format_shortcut` renders COMMAND as ⌘ on macOS
+// and Ctrl elsewhere.
+
+const SC_OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+const SC_CONNECT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+const SC_QUIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
+const SC_PLAY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space);
+const SC_RECORD: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::R);
+const SC_SIDE_PANEL: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::S);
+
 // ── Main update loop ────────────────────────────────────────────────────────
 
 impl eframe::App for ViewerApp {
@@ -4241,12 +4415,31 @@ impl eframe::App for ViewerApp {
             if later { self.show_build_prompt = false; }
         }
 
-        // Keyboard shortcuts
-        if ctx.input(|i| i.key_pressed(egui::Key::S) && !i.modifiers.command && !i.modifiers.ctrl) {
-            // Only toggle if no text edit is focused
-            if !ctx.egui_wants_keyboard_input() {
-                self.side_panel_open = !self.side_panel_open;
+        // Keyboard shortcuts. Consumed here, ahead of the widgets; the bare-key
+        // ones stay quiet while any widget has keyboard focus (text fields,
+        // drag values) so typing never trips them.
+        let typing = ctx.egui_wants_keyboard_input();
+        let (sc_open, sc_connect, sc_quit, sc_side, sc_play, sc_record) = ctx.input_mut(|i| (
+            i.consume_shortcut(&SC_OPEN),
+            i.consume_shortcut(&SC_CONNECT),
+            i.consume_shortcut(&SC_QUIT),
+            !typing && i.consume_shortcut(&SC_SIDE_PANEL),
+            !typing && i.consume_shortcut(&SC_PLAY),
+            !typing && i.consume_shortcut(&SC_RECORD),
+        ));
+        if sc_side { self.side_panel_open = !self.side_panel_open; }
+        if sc_open && self.pending_fits_path.is_none() { self.open_fits_dialog(); }
+        if sc_connect { self.connect_dialog_open = true; }
+        if sc_quit { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+        if sc_play {
+            if self.capture_running {
+                self.pause_or_stop();
+            } else if !matches!(self.camera_source, CameraSource::None) {
+                self.play_or_resume();
             }
+        }
+        if sc_record {
+            if self.recording { self.stop_recording(); } else { self.start_recording(); }
         }
 
         // Menu bar
@@ -4261,24 +4454,24 @@ impl eframe::App for ViewerApp {
                     // ── File ────────────────────────────────────────────
                     ui.menu_button("File", |ui| {
                         let dialog_pending = self.pending_fits_path.is_some();
-                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
+                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...").shortcut_text(ctx.format_shortcut(&SC_OPEN))).clicked() {
                             self.open_fits_dialog();
                             ui.close();
                         }
                         ui.separator();
                         if self.recording {
-                            if ui.button("Stop Recording").clicked() {
+                            if ui.add(egui::Button::new("Stop Recording").shortcut_text(ctx.format_shortcut(&SC_RECORD))).clicked() {
                                 self.stop_recording();
                                 ui.close();
                             }
                         } else {
-                            if ui.button("Start Recording").clicked() {
+                            if ui.add(egui::Button::new("Start Recording").shortcut_text(ctx.format_shortcut(&SC_RECORD))).clicked() {
                                 self.start_recording();
                                 ui.close();
                             }
                         }
                         ui.separator();
-                        if ui.button("Quit").clicked() {
+                        if ui.add(egui::Button::new("Quit").shortcut_text(ctx.format_shortcut(&SC_QUIT))).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -4310,7 +4503,7 @@ impl eframe::App for ViewerApp {
                             }
                         });
                         ui.separator();
-                        if menu_check(ui, self.side_panel_open, "Side Panel") {
+                        if menu_check_sc(ui, self.side_panel_open, "Side Panel", ctx.format_shortcut(&SC_SIDE_PANEL)) {
                             self.side_panel_open = !self.side_panel_open;
                         }
                         ui.separator();
@@ -4340,20 +4533,21 @@ impl eframe::App for ViewerApp {
                     // non-enumerable sources (FITS, GigE-by-IP) have their own
                     // entries. Everything opens through open_source().
                     ui.menu_button("Source", |ui| {
+                        let play_sc = ctx.format_shortcut(&SC_PLAY);
                         if self.capture_running {
-                            if ui.button("Stop").clicked() {
+                            if ui.add(egui::Button::new("Stop").shortcut_text(play_sc)).clicked() {
                                 self.stop_capture();
                                 ui.close();
                             }
                         } else {
-                            if ui.button("Play").clicked() {
+                            if ui.add(egui::Button::new("Play").shortcut_text(play_sc)).clicked() {
                                 let source = self.camera_source.clone();
                                 self.open_source(source);
                                 ui.close();
                             }
                         }
                         ui.separator();
-                        if ui.button("Connect\u{2026}").clicked() {
+                        if ui.add(egui::Button::new("Connect\u{2026}").shortcut_text(ctx.format_shortcut(&SC_CONNECT))).clicked() {
                             self.connect_dialog_open = true;
                             ui.close();
                         }
@@ -4374,7 +4568,7 @@ impl eframe::App for ViewerApp {
                         }
                         ui.separator();
                         let dialog_pending = self.pending_fits_path.is_some();
-                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...")).clicked() {
+                        if ui.add_enabled(!dialog_pending, egui::Button::new("Open FITS...").shortcut_text(ctx.format_shortcut(&SC_OPEN))).clicked() {
                             self.open_fits_dialog();
                             ui.close();
                         }
@@ -4411,13 +4605,19 @@ impl eframe::App for ViewerApp {
                     if sidebar_btn.clicked() {
                         self.side_panel_open = !self.side_panel_open;
                     }
-                    sidebar_btn.on_hover_text("Toggle side panel (S)");
+                    sidebar_btn.on_hover_text(format!("Toggle side panel ({})", ctx.format_shortcut(&SC_SIDE_PANEL)));
                     ui.separator();
+                    let play_sc = ctx.format_shortcut(&SC_PLAY);
                     if self.capture_running {
-                        if ui.button(egui::RichText::new("\u{23F9}  Stop").size(14.0)).clicked() {
+                        if ui.button(egui::RichText::new("\u{23F9}  Stop").size(14.0))
+                            .on_hover_text(format!("Stop capture ({play_sc})"))
+                            .clicked()
+                        {
                             self.pause_or_stop();
                         }
-                    } else if widgets::primary_button(ui, "\u{25B6}  Play", &pal) {
+                    } else if widgets::tip(ui, &format!("Start capture from the selected source ({play_sc})"), |ui| {
+                        widgets::primary_button(ui, "\u{25B6}  Play", &pal)
+                    }) {
                         self.play_or_resume();
                     }
                     ui.separator();
@@ -4442,18 +4642,27 @@ impl eframe::App for ViewerApp {
                             4.0,
                             egui::Color32::from_rgba_unmultiplied(220, 40, 40, alpha),
                         );
-                        if widgets::icon_button(ui, "\u{25A0}", rec_red, "Stop", &pal) {
+                        let tip = format!("Stop recording ({})", ctx.format_shortcut(&SC_RECORD));
+                        if widgets::tip(ui, &tip, |ui| widgets::icon_button(ui, "\u{25A0}", rec_red, "Stop", &pal)) {
                             self.stop_recording();
                         }
-                    } else if widgets::icon_button(ui, "\u{25CF}", rec_red, "Record", &pal) {
-                        self.start_recording();
+                    } else {
+                        let tip = format!(
+                            "Record incoming frames to a FITS file in {} ({})",
+                            Self::recordings_dir().display(),
+                            ctx.format_shortcut(&SC_RECORD),
+                        );
+                        if widgets::tip(ui, &tip, |ui| widgets::icon_button(ui, "\u{25CF}", rec_red, "Record", &pal)) {
+                            self.start_recording();
+                        }
                     }
                     // Display settings (colormap, scale, theme) live in the
                     // DISPLAY panel + View/Theme menus; the toolbar stays a
                     // transport bar. fps reads on the right.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 12.0;
-                        ui.label(egui::RichText::new(format!("{:.1} fps", self.fps)).monospace().size(13.0).color(pal.accent));
+                        ui.label(egui::RichText::new(format!("{:.1} fps", self.fps)).monospace().size(13.0).color(pal.accent))
+                            .on_hover_text("Frames per second reaching the display");
                     });
                 });
             });
@@ -4499,7 +4708,9 @@ impl eframe::App for ViewerApp {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         #[cfg(feature = "starsolve")]
                         {
-                            if self.solve_busy {
+                            // solve_busy also covers extraction-only jobs; only
+                            // call it solving when the solver is actually on.
+                            if self.solve_enabled && self.solve_busy {
                                 ui.label(egui::RichText::new("Solving…").size(small).monospace()
                                     .color(egui::Color32::from_rgb(217, 119, 6)));
                             } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
@@ -4733,10 +4944,14 @@ impl ViewerApp {
     /// previous one — in which case this frame is skipped rather than queued, so
     /// the pipeline always works on recent data instead of falling behind.
     #[cfg(feature = "starsolve")]
-    fn maybe_dispatch_solve(&mut self, mono: Arc<Vec<f32>>, w: u32, h: u32) {
+    fn maybe_dispatch_solve(&mut self, mono: &Pixels, w: u32, h: u32) {
         if self.solve_busy {
             return;
         }
+        // The worker needs owned `f32`. A U16 frame is widened here, after the
+        // busy check so a skipped frame costs nothing, and gets its own Arc so
+        // it never pins the pooled u16 buffer.
+        let mono = mono.to_f32_arc();
 
         // Solver inputs, if a database is loaded. Without one the worker still
         // extracts, so centroid overlays keep working.
@@ -4953,8 +5168,10 @@ impl ViewerApp {
         }
 
         // Close on Escape or X key
+        // X is a bare key: ignore it while a text field or drag value has focus.
+        let typing = ctx.egui_wants_keyboard_input();
         let close_key = ctx.input(|i| {
-            i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::X)
+            i.key_pressed(egui::Key::Escape) || (!typing && i.key_pressed(egui::Key::X))
         });
         if close_key {
             self.image_viewer.roi_rect = None;
@@ -5047,7 +5264,7 @@ fn start_fits_capture(tx: Sender<FrameData>, stop_rx: Receiver<()>, mut source: 
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
             let mono = source.next_frame();
-            let frame_data = FrameData::new(mono, source.width, source.height, bit_depth);
+            let frame_data = FrameData::from_pixels(mono, source.width, source.height, bit_depth);
             if tx.try_send(frame_data).is_err() && tx.is_empty() { break; }
             let elapsed = t0.elapsed();
             if elapsed < frame_interval { thread::sleep(frame_interval - elapsed); }
@@ -5087,6 +5304,12 @@ fn menu_check(ui: &mut egui::Ui, checked: bool, label: &str) -> bool {
     ui.button(format!("{prefix}{label}")).clicked()
 }
 
+/// `menu_check` with a right-aligned shortcut hint.
+fn menu_check_sc(ui: &mut egui::Ui, checked: bool, label: &str, shortcut: String) -> bool {
+    let prefix = if checked { "\u{2713}  " } else { "    " };
+    ui.add(egui::Button::new(format!("{prefix}{label}")).shortcut_text(shortcut)).clicked()
+}
+
 /// Menu item with dot prefix for radio-style selections.
 fn menu_radio(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
     let prefix = if selected { "\u{2022}  " } else { "    " };
@@ -5094,6 +5317,35 @@ fn menu_radio(ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
 }
 
 fn snap_floor(v: f32, step: f32) -> f32 { (v / step).floor() * step }
+
+/// Step-line points for the histogram bins overlapping `[lo, hi]`.
+///
+/// The stored histogram has `histogram::NUM_BINS` bins over its full range;
+/// bins are merged `k` at a time so the curve carries about 300 steps across
+/// the visible window whatever the zoom. Merged y values are summed counts,
+/// so the y scale is per drawn step, not per stored bin.
+fn hist_step_line(h: &histogram::Histogram, lo: f64, hi: f64, log_y: bool) -> Vec<[f64; 2]> {
+    const TARGET_STEPS: usize = 300;
+    let n = h.counts.len();
+    if n == 0 || h.edges.len() != n + 1 { return Vec::new(); }
+    let e0 = h.edges[0] as f64;
+    let bw = (h.edges[n] as f64 - e0) / n as f64;
+    if !(bw > 0.0) { return Vec::new(); }
+    let first = (((lo - e0) / bw).floor().max(0.0) as usize).min(n - 1);
+    let last = (((hi - e0) / bw).ceil().max(0.0) as usize).min(n).max(first + 1);
+    let k = ((last - first) / TARGET_STEPS).max(1);
+    let mut pts = Vec::with_capacity(2 * (last - first) / k + 2);
+    let mut i = first;
+    while i < last {
+        let j = (i + k).min(last);
+        let c: u64 = h.counts[i..j].iter().sum();
+        let y = if log_y { (c as f64 + 1.0).log10() } else { c as f64 };
+        pts.push([e0 + i as f64 * bw, y]);
+        pts.push([e0 + j as f64 * bw, y]);
+        i = j;
+    }
+    pts
+}
 fn snap_ceil(v: f32, step: f32) -> f32 { (v / step).ceil() * step }
 
 /// ZScale algorithm (simplified IRAF/DS9 style).

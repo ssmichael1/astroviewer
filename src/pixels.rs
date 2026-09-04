@@ -15,9 +15,8 @@ use std::sync::Arc;
 /// negative). Cheap to clone — both variants are `Arc`-shared.
 #[derive(Clone)]
 pub enum Pixels {
-    // Constructed only by integer sources (GigE / INDI / native-mono camera
-    // decode), which are behind feature flags; unused in a default build.
-    #[allow(dead_code)]
+    /// Integer sources: GigE / INDI / native-mono camera decode, and integer
+    /// FITS playback.
     U16(Arc<Vec<u16>>),
     F32(Arc<Vec<f32>>),
 }

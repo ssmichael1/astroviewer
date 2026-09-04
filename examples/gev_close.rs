@@ -9,15 +9,12 @@ mod gige;
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::{Duration, Instant};
 
-use cameleon_genapi::interface::{ICommand, IEnumeration, IInteger};
+use cameleon_genapi::interface::{ICommand, IInteger};
 use cameleon_genapi::store::{DefaultCacheStore, DefaultNodeStore, DefaultValueStore, NodeStore};
 use cameleon_genapi::ValueCtxt;
 
 use gige::gvcp::{self, Device};
-use gige::gvsp::{self, FrameAssembly, GvspPacket};
-use gige::nic::{self, Iface};
 
 struct GenApi {
     store: DefaultNodeStore,

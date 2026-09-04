@@ -80,7 +80,10 @@ pub struct Ipv4Iface {
     pub ip: Ipv4Addr,
     pub netmask: Ipv4Addr,
     pub is_loopback: bool,
-    /// OS interface name (`en21`, `eth0`, a GUID on Windows).
+    /// OS interface name (`en21`, `eth0`, a GUID on Windows). Read only where
+    /// a broadcast socket is pinned by name (`SO_BINDTODEVICE` on Linux); the
+    /// other platforms pin by `index` or by the bound address.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     pub name: String,
     /// Kernel interface index, when the OS reports one.
     pub index: Option<u32>,

@@ -21,7 +21,9 @@ const EXTENDED_ID_FLAG: u8 = 0x80;
 /// error statuses (bit 15 set) come back in reply to a PACKETRESEND for data
 /// the device cannot supply, and carry none: `PACKET_UNAVAILABLE` and the
 /// `..._REMOVED_FROM_MEMORY` codes are final, `NOT_YET_AVAILABLE` /
-/// `TEMPORARILY_UNAVAILABLE` invite a retry.
+/// `TEMPORARILY_UNAVAILABLE` invite a retry. The receiver only distinguishes
+/// the retryable pair, so `PACKET_UNAVAILABLE` is named by tests alone.
+#[cfg(test)]
 pub const STATUS_PACKET_UNAVAILABLE: u16 = 0x800C;
 pub const STATUS_PACKET_NOT_YET_AVAILABLE: u16 = 0x8010;
 pub const STATUS_PACKET_TEMPORARILY_UNAVAILABLE: u16 = 0x8014;

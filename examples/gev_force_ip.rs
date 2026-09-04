@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
         "\nForcing {} (mac {}) from {} → {}  mask {}  gw {}",
         describe(&cam), fmt_mac(cam.mac), cam.ip, target_ip, subnet, gateway
     );
-    match gvcp::force_ip(cam.mac, target_ip, subnet, gateway, Duration::from_millis(1500)) {
+    match gvcp::ipconfig::force_ip(cam.mac, target_ip, subnet, gateway, Duration::from_millis(1500)) {
         Ok(true) => println!("FORCEIP acknowledged."),
         Ok(false) => println!("FORCEIP not acknowledged; many cameras apply it silently — continuing."),
         Err(e) => println!("FORCEIP failed ({e}); continuing to verify anyway."),
@@ -127,7 +127,7 @@ fn persist_ip(ip: Ipv4Addr, port: u16, subnet: Ipv4Addr, gateway: Ipv4Addr) -> a
     };
     dev.write_persistent_ip(ip, subnet, gateway)?;
     let cfg = dev.ip_config()?;
-    dev.set_ip_config(cfg | gvcp::IP_CONFIG_PERSISTENT | gvcp::IP_CONFIG_LLA)?;
+    dev.set_ip_config(cfg | gvcp::ipconfig::IP_CONFIG_PERSISTENT | gvcp::ipconfig::IP_CONFIG_LLA)?;
     let (pip, psub, pgw) = dev.read_persistent_ip()?;
     let cfg_after = dev.ip_config()?;
     let _ = dev.release_control();

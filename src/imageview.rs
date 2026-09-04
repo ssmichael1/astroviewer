@@ -103,22 +103,16 @@ impl Shading {
         }
     }
 
-    /// The per-value shader with all range/transfer constants precomputed.
-    /// `colormap` must be the one this shading was built from.
-    fn shader<'a>(&self, colormap: &'a Colormap) -> impl Fn(f32) -> Color32 + Sync + 'a {
-        let scale_min = self.scale_min;
+    /// The value → colormap-position mapping with its constants precomputed.
+    fn transfer_map(&self) -> TransferMap {
         let range = self.scale_max - self.scale_min;
         let inv_range = if range > 0.0 { 1.0 / range } else { 1.0 };
-        let inv_gamma = if self.gamma != 0.0 { 1.0 / self.gamma } else { 1.0 };
-        let apply_gamma = (self.gamma - 1.0).abs() > 1e-4;
-        let transfer = self.transfer;
-
         // Asinh with a pivot: s(t) = (asinh(α(t−o)) − asinh(−αo)) / (asinh(α(1−o)) − asinh(−αo))
         // where o is the offset normalized into the display range. asinh is odd,
         // so pixels below the pivot stay visible (compressed toward black) rather
         // than clipping; o = 0 reduces to the plain asinh(αt)/asinh(α) stretch.
         let asinh_alpha = self.gamma;
-        let (asinh_o, asinh_lo, asinh_norm) = if matches!(transfer, TransferFn::Asinh) {
+        let (asinh_o, asinh_lo, asinh_norm) = if matches!(self.transfer, TransferFn::Asinh) {
             let o = ((self.asinh_offset - self.scale_min) * inv_range).clamp(0.0, 1.0);
             let lo = (-asinh_alpha * o).asinh();
             let hi = (asinh_alpha * (1.0 - o)).asinh();
@@ -127,21 +121,81 @@ impl Shading {
         } else {
             (0.0, 0.0, 1.0)
         };
+        TransferMap {
+            scale_min: self.scale_min,
+            inv_range,
+            inv_gamma: if self.gamma != 0.0 { 1.0 / self.gamma } else { 1.0 },
+            apply_gamma: (self.gamma - 1.0).abs() > 1e-4,
+            transfer: self.transfer,
+            asinh_alpha,
+            asinh_o,
+            asinh_lo,
+            asinh_norm,
+        }
+    }
 
+    /// The per-value shader. `colormap` must be the one this shading was built from.
+    fn shader<'a>(&self, colormap: &'a Colormap) -> impl Fn(f32) -> Color32 + Sync + 'a {
+        let map = self.transfer_map();
         move |val: f32| {
-            let mut t = ((val - scale_min) * inv_range).clamp(0.0, 1.0);
-            match transfer {
-                TransferFn::Linear => {
-                    if apply_gamma { t = t.powf(inv_gamma); }
-                }
-                TransferFn::Asinh => {
-                    t = (((asinh_alpha * (t - asinh_o)).asinh() - asinh_lo) * asinh_norm).clamp(0.0, 1.0);
-                }
-            }
-            let rgb = colormap.lookup(t);
+            let rgb = colormap.lookup(map.t(val));
             Color32::from_rgb(rgb[0], rgb[1], rgb[2])
         }
     }
+}
+
+/// Pixel value → position along the colormap in [0, 1]: normalization into the
+/// display range followed by the transfer function. Shared by the shader and
+/// the colorbar, so the bar's labels sit exactly where the image maps them.
+#[derive(Clone, Copy)]
+struct TransferMap {
+    scale_min: f32,
+    inv_range: f32,
+    inv_gamma: f32,
+    apply_gamma: bool,
+    transfer: TransferFn,
+    asinh_alpha: f32,
+    asinh_o: f32,
+    asinh_lo: f32,
+    asinh_norm: f32,
+}
+
+impl TransferMap {
+    #[inline]
+    fn t(&self, val: f32) -> f32 {
+        let mut t = ((val - self.scale_min) * self.inv_range).clamp(0.0, 1.0);
+        match self.transfer {
+            TransferFn::Linear => {
+                if self.apply_gamma { t = t.powf(self.inv_gamma); }
+            }
+            TransferFn::Asinh => {
+                t = (((self.asinh_alpha * (t - self.asinh_o)).asinh() - self.asinh_lo) * self.asinh_norm).clamp(0.0, 1.0);
+            }
+        }
+        t
+    }
+}
+
+/// A "nice" tick step (1, 2 or 5 × 10ⁿ) giving about `target_ticks` ticks over `range`.
+fn nice_step(range: f32, target_ticks: f32) -> f32 {
+    let raw = (range / target_ticks.max(1.0)).max(f32::MIN_POSITIVE);
+    let mag = 10f32.powf(raw.log10().floor());
+    let norm = raw / mag;
+    let nice = if norm < 1.5 { 1.0 } else if norm < 3.0 { 2.0 } else if norm < 7.0 { 5.0 } else { 10.0 };
+    nice * mag
+}
+
+/// The next finer nice step below `step` (5→2→1→0.5…).
+fn nice_step_below(step: f32) -> f32 {
+    let mag = 10f32.powf(step.log10().floor());
+    let norm = step / mag;
+    if norm > 4.0 { 2.0 * mag } else if norm > 1.5 { mag } else { 0.5 * mag }
+}
+
+/// Format a tick value with just enough decimals for its step.
+fn fmt_tick(v: f32, step: f32) -> String {
+    let decimals = if step >= 1.0 { 0 } else { (-step.log10().floor()) as usize };
+    format!("{:.*}", decimals, v)
 }
 
 /// Holds the texture and cached rendering state.
@@ -431,15 +485,26 @@ impl ImageViewer {
         let text_color = params.axes_text_color;
         let font = egui::FontId::monospace(13.0);
 
+        // Ticks at round pixel coordinates (multiples of 1/2/5 × 10ⁿ), spaced
+        // roughly 80 screen px apart, rather than at fixed fractions of the
+        // edge that land on values like 1228 and 2457.
+        let ticks = |extent: u32, screen_len: f32| -> (Vec<u32>, f32) {
+            let target = (screen_len / 80.0).clamp(2.0, 12.0);
+            let step = nice_step(extent as f32, target).max(1.0);
+            let mut v = Vec::new();
+            let mut k = 0.0f32;
+            while k * step <= extent as f32 {
+                v.push((k * step) as u32);
+                k += 1.0;
+            }
+            (v, step)
+        };
+
         // Y-axis (left side)
-        let num_y_ticks = 5;
-        for i in 0..=num_y_ticks {
-            let frac = i as f32 / num_y_ticks as f32;
-            let pixel_val = (frac * height as f32) as u32;
-            let y = image_rect.min.y + frac * image_rect.height();
-            let tick_start = Pos2::new(image_rect.min.x - 5.0, y);
-            let tick_end = Pos2::new(image_rect.min.x, y);
-            painter.line_segment([tick_start, tick_end], stroke);
+        let (y_ticks, _) = ticks(height, image_rect.height());
+        for &pixel_val in &y_ticks {
+            let y = image_rect.min.y + pixel_val as f32 / height as f32 * image_rect.height();
+            painter.line_segment([Pos2::new(image_rect.min.x - 5.0, y), Pos2::new(image_rect.min.x, y)], stroke);
             painter.text(
                 Pos2::new(image_rect.min.x - 8.0, y),
                 egui::Align2::RIGHT_CENTER,
@@ -450,14 +515,10 @@ impl ImageViewer {
         }
 
         // X-axis (bottom)
-        let num_x_ticks = 5;
-        for i in 0..=num_x_ticks {
-            let frac = i as f32 / num_x_ticks as f32;
-            let pixel_val = (frac * width as f32) as u32;
-            let x = image_rect.min.x + frac * image_rect.width();
-            let tick_start = Pos2::new(x, image_rect.max.y);
-            let tick_end = Pos2::new(x, image_rect.max.y + 5.0);
-            painter.line_segment([tick_start, tick_end], stroke);
+        let (x_ticks, _) = ticks(width, image_rect.width());
+        for &pixel_val in &x_ticks {
+            let x = image_rect.min.x + pixel_val as f32 / width as f32 * image_rect.width();
+            painter.line_segment([Pos2::new(x, image_rect.max.y), Pos2::new(x, image_rect.max.y + 5.0)], stroke);
             painter.text(
                 Pos2::new(x, image_rect.max.y + 8.0),
                 egui::Align2::CENTER_TOP,
@@ -468,14 +529,8 @@ impl ImageViewer {
         }
 
         // Axis lines
-        painter.line_segment(
-            [image_rect.left_bottom(), image_rect.left_top()],
-            stroke,
-        );
-        painter.line_segment(
-            [image_rect.left_bottom(), image_rect.right_bottom()],
-            stroke,
-        );
+        painter.line_segment([image_rect.left_bottom(), image_rect.left_top()], stroke);
+        painter.line_segment([image_rect.left_bottom(), image_rect.right_bottom()], stroke);
     }
 
     fn draw_colorbar(
@@ -492,7 +547,11 @@ impl ImageViewer {
         let bar_top = image_rect.min.y;
         let bar_height = image_rect.height();
 
-        // Draw gradient
+        // The bar is the colormap itself, uniform in colormap position t; the
+        // labels are placed by pushing round data values through the same
+        // transfer the image uses, so under gamma or asinh they land exactly
+        // where those values appear in the bar (dense where the stretch
+        // expands the range, sparse where it compresses it).
         let n_segments = 128;
         let seg_height = bar_height / n_segments as f32;
         for i in 0..n_segments {
@@ -505,26 +564,50 @@ impl ImageViewer {
         }
 
         // Border
-        let bar_rect =
-            Rect::from_min_size(Pos2::new(bar_x, bar_top), Vec2::new(bar_width, bar_height));
+        let bar_rect = Rect::from_min_size(Pos2::new(bar_x, bar_top), Vec2::new(bar_width, bar_height));
         painter.rect_stroke(bar_rect, 0.0, Stroke::new(1.0, params.axes_stroke_color), StrokeKind::Outside);
 
-        // Scale labels
         let font = egui::FontId::monospace(13.0);
         let text_color = params.axes_text_color;
+        let tick_stroke = Stroke::new(1.0, params.axes_stroke_color);
         let label_x = bar_x + bar_width + 4.0;
-        let num_labels = 5;
-        for i in 0..=num_labels {
-            let frac = i as f32 / num_labels as f32;
-            let val = params.scale_max - frac * (params.scale_max - params.scale_min);
-            let y = bar_top + frac * bar_height;
-            painter.text(
-                Pos2::new(label_x, y),
-                egui::Align2::LEFT_CENTER,
-                format!("{:.0}", val),
-                font.clone(),
-                text_color,
-            );
+        let (vmin, vmax) = (params.scale_min, params.scale_max);
+        let range = vmax - vmin;
+        if !(range > 0.0) || bar_height <= 0.0 {
+            return;
+        }
+        let map = Shading::new(params, colormap).transfer_map();
+        let y_of = |v: f32| bar_top + (1.0 - map.t(v)) * bar_height;
+
+        // Ends first, then progressively finer round values wherever they fit
+        // without crowding a label already placed.
+        const MIN_GAP: f32 = 16.0;
+        let mut labels: Vec<(f32, String)> = vec![
+            (y_of(vmin), fmt_tick(vmin, 1.0)),
+            (y_of(vmax), fmt_tick(vmax, 1.0)),
+        ];
+        let mut step = nice_step(range, 2.0);
+        let finest = (range / (bar_height / MIN_GAP).max(1.0) / 4.0).max(range * 1e-4);
+        while step >= finest {
+            let k0 = (vmin / step).ceil() as i64;
+            let k1 = (vmax / step).floor() as i64;
+            for k in k0..=k1 {
+                let v = k as f32 * step;
+                if (v - vmin).abs() < step * 0.5 || (vmax - v).abs() < step * 0.5 {
+                    continue;
+                }
+                let y = y_of(v);
+                if labels.iter().all(|(ly, _)| (ly - y).abs() >= MIN_GAP) {
+                    labels.push((y, fmt_tick(v, step)));
+                }
+            }
+            step = nice_step_below(step);
+            if step <= 0.0 { break; }
+        }
+
+        for (y, text) in labels {
+            painter.line_segment([Pos2::new(bar_x + bar_width, y), Pos2::new(bar_x + bar_width + 3.0, y)], tick_stroke);
+            painter.text(Pos2::new(label_x, y), egui::Align2::LEFT_CENTER, text, font.clone(), text_color);
         }
     }
 }
@@ -584,6 +667,37 @@ mod tests {
                 println!("{name:12} {label}: {:6.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
         }
+    }
+
+    #[test]
+    fn nice_steps_are_round() {
+        assert_eq!(nice_step(6224.0, 8.0), 1000.0);
+        assert_eq!(nice_step(1080.0, 5.0), 200.0);
+        assert_eq!(nice_step(65535.0, 2.0), 50000.0);
+        assert_eq!(nice_step_below(50000.0), 20000.0);
+        assert_eq!(nice_step_below(20000.0), 10000.0);
+        assert_eq!(nice_step_below(10000.0), 5000.0);
+        assert_eq!(fmt_tick(1234.0, 1.0), "1234");
+        assert_eq!(fmt_tick(0.25, 0.05), "0.25");
+    }
+
+    /// Under asinh the colorbar must place a value where the image maps it:
+    /// the transfer map is monotonic and hits both ends exactly.
+    #[test]
+    fn transfer_map_is_monotonic_and_spans_unit_range() {
+        let cmap = Colormap::new(ColormapKind::Grayscale);
+        let p = DisplayParams { scale_min: 100.0, scale_max: 5000.0, gamma: 300.0, asinh_offset: 400.0, transfer: TransferFn::Asinh, ..Default::default() };
+        let map = Shading::new(&p, &cmap).transfer_map();
+        assert_eq!(map.t(100.0), 0.0);
+        assert_eq!(map.t(5000.0), 1.0);
+        let mut last = -1.0;
+        for i in 0..=100 {
+            let t = map.t(100.0 + i as f32 * 49.0);
+            assert!(t >= last, "not monotonic at {i}");
+            last = t;
+        }
+        // Strong asinh: the low half of the range covers most of the bar.
+        assert!(map.t(600.0) > 0.5);
     }
 
     #[test]

@@ -1912,8 +1912,7 @@ impl ViewerApp {
                     }
                 }
                 ScaleMode::ZScale => {
-                    let mono_f64: Vec<f64> = frame.mono.as_f32().iter().map(|&v| v as f64).collect();
-                    let (zmin, zmax) = zscale(&mono_f64);
+                    let (zmin, zmax) = zscale(&frame.mono);
                     self.display_params.scale_min = zmin as f32;
                     self.display_params.scale_max = zmax as f32;
                 }
@@ -5351,14 +5350,15 @@ fn snap_ceil(v: f32, step: f32) -> f32 { (v / step).ceil() * step }
 /// ZScale algorithm (simplified IRAF/DS9 style).
 /// Samples pixels, sorts them, fits a line to the central portion,
 /// and derives display min/max that rejects outliers.
-fn zscale(data: &[f64]) -> (f64, f64) {
+fn zscale(data: &Pixels) -> (f64, f64) {
     if data.is_empty() { return (0.0, 1.0); }
 
-    // Sample up to 10000 evenly spaced pixels
+    // Sample up to 10000 evenly spaced pixels, read straight from the frame's
+    // native buffer: only the samples are widened, never the whole frame.
     let n_samples = data.len().min(10_000);
     let step = data.len() as f64 / n_samples as f64;
     let mut samples: Vec<f64> = (0..n_samples)
-        .map(|i| data[(i as f64 * step) as usize])
+        .map(|i| data.value_at((i as f64 * step) as usize).unwrap_or(0.0) as f64)
         .collect();
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 

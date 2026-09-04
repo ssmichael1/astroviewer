@@ -7,6 +7,7 @@
 //! halves the per-frame memory traffic and buffer size versus storing every
 //! integer frame as `f32`.
 
+#[cfg(test)]
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -34,7 +35,10 @@ impl Pixels {
     }
 
     /// View the pixels as `f32`: borrows when already `F32`, allocates a widened
-    /// copy when `U16`. Use for consumers that need a contiguous `&[f32]`.
+    /// copy when `U16`. Only the tests compare buffers this way now; production
+    /// consumers sample (`value_at`), widen once (`to_f32_arc`), or edit in
+    /// place (`make_f32_mut`).
+    #[cfg(test)]
     pub fn as_f32(&self) -> Cow<'_, [f32]> {
         match self {
             Pixels::F32(v) => Cow::Borrowed(v.as_slice()),

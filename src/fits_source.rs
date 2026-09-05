@@ -188,12 +188,29 @@ impl FitsSource {
         let mut raw_frames: Vec<Raw> = Vec::new();
         let mut width = 0u32;
         let mut height = 0u32;
+        // Bit depth from the first image HDU's header: an explicit BITDEPTH
+        // keyword (this app's recordings write it), else the word size for
+        // integer data. `None` for float data, which has no natural range.
+        let mut header_depth: Option<u8> = None;
 
         for hdu in fits.hdus {
             let img = match hdu.data {
                 HduData::Image(im) if im.axes.len() >= 2 => im,
                 _ => continue,
             };
+            if raw_frames.is_empty() {
+                header_depth = hdu
+                    .header
+                    .get_int("BITDEPTH")
+                    .filter(|d| (1..=32).contains(d))
+                    .map(|d| d as u8)
+                    .or_else(|| match hdu.header.get_int("BITPIX") {
+                        Some(8) => Some(8),
+                        Some(16) => Some(16),
+                        Some(32) => Some(32),
+                        _ => None,
+                    });
+            }
 
             let w = img.axes[0] as u32;
             let h = img.axes[1] as u32;
@@ -242,20 +259,24 @@ impl FitsSource {
             )
         };
 
-        // Infer the sensor bit depth from the largest sample, so a 12-bit
-        // camera recorded into 16-bit words still scales as 12-bit.
-        let max_val = frames.max_value();
-        let inferred_depth = if max_val <= 255.0 { 8 }
+        // The header decides the bit depth when it can, so a dim frame is
+        // not mistaken for a shallower sensor and the Full-range scale is
+        // the same for every file from one camera. Float data has no word
+        // size to go on, so its depth is inferred from the largest sample.
+        let bit_depth = header_depth.unwrap_or_else(|| {
+            let max_val = frames.max_value();
+            if max_val <= 255.0 { 8 }
             else if max_val <= 4095.0 { 12 }
             else if max_val <= 16383.0 { 14 }
             else if max_val <= 65535.0 { 16 }
-            else { 32 };
+            else { 32 }
+        });
 
         Ok(Self {
             frames: Arc::new(frames),
             width,
             height,
-            bit_depth: inferred_depth,
+            bit_depth,
             current: 0,
         })
     }

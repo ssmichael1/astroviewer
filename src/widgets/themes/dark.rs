@@ -60,6 +60,16 @@ impl Palette {
             plot_line: accent,
             plot_bg: window,
 
+            status_ok: egui::Color32::from_rgb(34, 197, 94),
+            status_warn: egui::Color32::from_rgb(217, 119, 6),
+            status_err: egui::Color32::from_rgb(220, 38, 38),
+            overlay_dim: egui::Color32::from_rgb(0, 200, 255),
+            overlay_bright: egui::Color32::from_rgb(255, 255, 0),
+            overlay_matched: egui::Color32::from_rgb(50, 255, 50),
+            overlay_catalog: egui::Color32::from_rgb(50, 205, 50),
+            overlay_label: egui::Color32::from_rgb(255, 255, 0),
+            roi_outline: egui::Color32::from_rgba_unmultiplied(255, 255, 0, 128),
+
             image_bg: egui::Color32::from_rgb(5, 6, 8),
 
             check_mark: on_accent,

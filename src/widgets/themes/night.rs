@@ -54,6 +54,18 @@ impl Palette {
             plot_line: red_accent,
             plot_bg: bg_dark,
 
+            // Everything stays in the red band: brightness carries the
+            // meaning that hue carries in the other themes.
+            status_ok: red_accent_light,
+            status_warn: egui::Color32::from_rgb(230, 80, 30),
+            status_err: egui::Color32::from_rgb(255, 40, 40),
+            overlay_dim: egui::Color32::from_rgb(120, 30, 30),
+            overlay_bright: egui::Color32::from_rgb(255, 80, 50),
+            overlay_matched: egui::Color32::from_rgb(220, 70, 60),
+            overlay_catalog: egui::Color32::from_rgb(190, 55, 50),
+            overlay_label: egui::Color32::from_rgb(235, 85, 60),
+            roi_outline: egui::Color32::from_rgba_unmultiplied(230, 70, 60, 140),
+
             image_bg: egui::Color32::from_rgb(5, 2, 2),
 
             check_mark: egui::Color32::from_rgb(200, 80, 80),

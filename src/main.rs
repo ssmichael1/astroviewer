@@ -7,11 +7,14 @@ mod bayer;
 mod bright_stars;
 mod colormaps;
 mod fits_source;
+#[cfg(feature = "focus")]
+mod focus;
 mod histogram;
 mod imageview;
 mod overlays;
 mod pixels;
 mod sources;
+mod wcs;
 mod widgets;
 
 #[cfg(feature = "svbony")]
@@ -35,7 +38,7 @@ use eframe::egui;
 #[cfg(any(feature = "svbony", feature = "toupcam"))]
 use image::DynamicImage;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -208,13 +211,98 @@ struct SavedConfig {
 #[cfg(feature = "starsolve")]
 fn default_true() -> bool { true }
 
+/// Which figure the Focus tab's trend plot shows.
+#[cfg(feature = "focus")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusPlot {
+    Hfr,
+    Sharpness,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomTab {
     Histogram,
     Controls,
     #[cfg(feature = "starsolve")]
     PlateSolve,
+    #[cfg(feature = "focus")]
+    Focus,
     Log,
+}
+
+impl BottomTab {
+    /// Every tab this build has, in display order.
+    fn all() -> Vec<BottomTab> {
+        let mut tabs = vec![BottomTab::Histogram, BottomTab::Controls];
+        #[cfg(feature = "starsolve")]
+        tabs.push(BottomTab::PlateSolve);
+        #[cfg(feature = "focus")]
+        tabs.push(BottomTab::Focus);
+        tabs.push(BottomTab::Log);
+        tabs
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            BottomTab::Histogram => "Histogram",
+            BottomTab::Controls => "Controls",
+            #[cfg(feature = "starsolve")]
+            BottomTab::PlateSolve => "Plate Solve",
+            #[cfg(feature = "focus")]
+            BottomTab::Focus => "Focus",
+            BottomTab::Log => "Log",
+        }
+    }
+
+    /// Tab by saved name; `None` for a tab this build does not have.
+    fn from_name(name: &str) -> Option<BottomTab> {
+        Self::all().into_iter().find(|t| t.name() == name)
+    }
+}
+
+// ── Persisted UI settings ───────────────────────────────────────────────────
+
+/// Display and layout state remembered between runs. Every field is optional
+/// so a file from an older or differently featured build still loads; enums
+/// travel as their display names, matched back case by case.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct UiConfig {
+    theme: Option<String>,
+    colormap: Option<String>,
+    scale_mode: Option<String>,
+    transfer: Option<String>,
+    gamma: Option<f32>,
+    show_axes: Option<bool>,
+    show_colorbar: Option<bool>,
+    side_panel_open: Option<bool>,
+    side_panel_width: Option<f32>,
+    bottom_tab: Option<String>,
+    bottom_panel_open: Option<bool>,
+    bottom_panel_height: Option<f32>,
+    window_size: Option<[f32; 2]>,
+    window_pos: Option<[f32; 2]>,
+}
+
+impl UiConfig {
+    fn path() -> std::path::PathBuf {
+        let dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("astroviewer");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("ui.json")
+    }
+
+    fn load() -> Self {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(Self::path(), json);
+        }
+    }
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
@@ -237,6 +325,11 @@ enum RecordMsg {
         offset: Option<f64>,
         /// Sensor temperature, °C.
         ccd_temp: Option<f64>,
+        /// Sky mapping from the last plate solve, when one is locked.
+        wcs: Option<wcs::WcsKeys>,
+        /// Sensor ADC depth, written as BITDEPTH so playback scales the
+        /// file the way the live view did.
+        bit_depth: u8,
         /// Cooler setpoint, °C (only when the cooler is on).
         set_temp: Option<f64>,
     },
@@ -368,6 +461,21 @@ struct ViewerApp {
     #[cfg(feature = "starsolve")]
     camera_model_path: Option<std::path::PathBuf>,
 
+    /// Focus trend: one point per completed worker frame, plus best-so-far.
+    #[cfg(feature = "focus")]
+    focus_history: focus::FocusHistory,
+    /// Per-star results from the worker's last frame, for the overlay labels.
+    #[cfg(feature = "focus")]
+    focus_last: Option<focus::FocusSample>,
+    /// Measure only stars inside the zoom ROI (when one is drawn).
+    #[cfg(feature = "focus")]
+    focus_use_roi: bool,
+    /// Draw each measured star's HFR next to it on the image.
+    #[cfg(feature = "focus")]
+    focus_show_labels: bool,
+    #[cfg(feature = "focus")]
+    focus_plot: FocusPlot,
+
     frame_times: Vec<Instant>,
     fps: f64,
 
@@ -401,9 +509,19 @@ struct ViewerApp {
 
     side_panel_open: bool,
     bottom_tab: BottomTab,
+    /// Bottom panel shown; off leaves only the tab strip.
+    bottom_panel_open: bool,
+    /// Last measured panel sizes and window geometry, persisted at exit.
+    side_panel_width: f32,
+    bottom_panel_height: f32,
+    /// `(inner size, outer position)` in logical points.
+    window_geometry: Option<([f32; 2], [f32; 2])>,
 
     // Log
     log: Vec<LogEntry>,
+    /// Entries acknowledged: the Log tab has been shown since they arrived.
+    /// Everything past this index that is a warning or error is "unread".
+    log_seen: usize,
     log_rx: Receiver<LogEntry>,
     log_tx: Sender<LogEntry>,
 
@@ -541,6 +659,23 @@ impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Load system UI + monospace fonts (with a real semibold for emphasis).
         install_fonts(&cc.egui_ctx);
+
+        // A terminal Ctrl-C (or SIGTERM from a supervisor) becomes a normal
+        // window close, so `on_exit` runs: recording flushed, camera stopped
+        // and released, settings saved. A second signal while that is in
+        // progress exits immediately, in case a camera teardown hangs.
+        {
+            let ctx = cc.egui_ctx.clone();
+            let result = ctrlc::set_handler(move || {
+                if QUIT_REQUESTED.swap(true, Ordering::SeqCst) {
+                    std::process::exit(130);
+                }
+                ctx.request_repaint();
+            });
+            if let Err(e) = result {
+                tracing::warn!("signal handler not installed: {e}");
+            }
+        }
 
         // Theme
         let mut style = (*cc.egui_ctx.global_style()).clone();
@@ -687,6 +822,16 @@ impl ViewerApp {
             last_centroids: Vec::new(),
             #[cfg(feature = "starsolve")]
             last_solve: None,
+            #[cfg(feature = "focus")]
+            focus_history: focus::FocusHistory::new(400),
+            #[cfg(feature = "focus")]
+            focus_last: None,
+            #[cfg(feature = "focus")]
+            focus_use_roi: false,
+            #[cfg(feature = "focus")]
+            focus_show_labels: false,
+            #[cfg(feature = "focus")]
+            focus_plot: FocusPlot::Hfr,
             #[cfg(feature = "starsolve")]
             camera_model: None,
             #[cfg(feature = "starsolve")]
@@ -707,7 +852,12 @@ impl ViewerApp {
             fits_fps: Arc::new(AtomicU32::new(10)),
             side_panel_open: true,
             bottom_tab: BottomTab::Histogram,
+            bottom_panel_open: true,
+            side_panel_width: 220.0,
+            bottom_panel_height: 300.0,
+            window_geometry: None,
             log, log_rx, log_tx,
+            log_seen: 0,
             bg_subtract_enabled: false,
             bg_percentile: 0.35,
             bg_image: None,
@@ -729,6 +879,7 @@ impl ViewerApp {
 
         #[cfg(feature = "starsolve")]
         app.load_config();
+        app.apply_ui_config(&UiConfig::load());
 
         // Startup source precedence: an explicit CLI descriptor (or bare FITS
         // path) wins; otherwise reconnect to the last source used; otherwise
@@ -752,6 +903,59 @@ impl ViewerApp {
         }
 
         app
+    }
+
+    /// Restore remembered display and layout settings. Window geometry is
+    /// applied in `main` before the window exists; here only the in-app state.
+    fn apply_ui_config(&mut self, cfg: &UiConfig) {
+        if let Some(t) = cfg.theme.as_deref().and_then(|n| widgets::UiTheme::ALL.iter().find(|(_, l)| *l == n)) {
+            self.ui_theme = t.0;
+        }
+        if let Some(k) = cfg.colormap.as_deref().and_then(|n| ColormapKind::ALL.iter().find(|k| k.name() == n)) {
+            self.colormap = Colormap::new(*k);
+        }
+        if let Some(m) = cfg.scale_mode.as_deref().and_then(|n| ScaleMode::ALL.iter().find(|(_, l)| *l == n)) {
+            self.scale_mode = m.0;
+        }
+        if let Some(t) = cfg.transfer.as_deref().and_then(|n| imageview::TransferFn::ALL.iter().find(|(_, l)| *l == n)) {
+            self.display_params.transfer = t.0;
+        }
+        if let Some(g) = cfg.gamma.filter(|g| g.is_finite() && *g > 0.0) {
+            self.display_params.gamma = g;
+        }
+        if let Some(v) = cfg.show_axes { self.display_params.show_axes = v; }
+        if let Some(v) = cfg.show_colorbar { self.display_params.show_colorbar = v; }
+        if let Some(v) = cfg.side_panel_open { self.side_panel_open = v; }
+        if let Some(w) = cfg.side_panel_width.filter(|w| (120.0..=800.0).contains(w)) {
+            self.side_panel_width = w;
+        }
+        if let Some(t) = cfg.bottom_tab.as_deref().and_then(BottomTab::from_name) {
+            self.bottom_tab = t;
+        }
+        if let Some(v) = cfg.bottom_panel_open { self.bottom_panel_open = v; }
+        if let Some(h) = cfg.bottom_panel_height.filter(|h| (120.0..=900.0).contains(h)) {
+            self.bottom_panel_height = h;
+        }
+    }
+
+    fn ui_config(&self) -> UiConfig {
+        let label = |theme: widgets::UiTheme| widgets::UiTheme::ALL.iter().find(|(t, _)| *t == theme).map(|(_, l)| l.to_string());
+        UiConfig {
+            theme: label(self.ui_theme),
+            colormap: Some(self.colormap.kind.name().to_string()),
+            scale_mode: ScaleMode::ALL.iter().find(|(m, _)| *m == self.scale_mode).map(|(_, l)| l.to_string()),
+            transfer: imageview::TransferFn::ALL.iter().find(|(t, _)| *t == self.display_params.transfer).map(|(_, l)| l.to_string()),
+            gamma: Some(self.display_params.gamma),
+            show_axes: Some(self.display_params.show_axes),
+            show_colorbar: Some(self.display_params.show_colorbar),
+            side_panel_open: Some(self.side_panel_open),
+            side_panel_width: Some(self.side_panel_width),
+            bottom_tab: Some(self.bottom_tab.name().to_string()),
+            bottom_panel_open: Some(self.bottom_panel_open),
+            bottom_panel_height: Some(self.bottom_panel_height),
+            window_size: self.window_geometry.map(|(size, _)| size),
+            window_pos: self.window_geometry.map(|(_, pos)| pos),
+        }
     }
 
     #[cfg(feature = "starsolve")]
@@ -973,7 +1177,17 @@ impl ViewerApp {
 
     fn add_log(&mut self, entry: LogEntry) {
         self.log.push(entry);
-        if self.log.len() > 500 { self.log.remove(0); }
+        if self.log.len() > 500 {
+            self.log.remove(0);
+            self.log_seen = self.log_seen.saturating_sub(1);
+        }
+    }
+
+    /// Warnings and errors that arrived since the Log tab was last shown.
+    fn unread_log(&self) -> impl Iterator<Item = &LogEntry> {
+        self.log[self.log_seen.min(self.log.len())..]
+            .iter()
+            .filter(|e| matches!(e.level, LogLevel::Error | LogLevel::Warn))
     }
 
     fn pal(&self) -> widgets::Palette {
@@ -1175,7 +1389,7 @@ impl ViewerApp {
 
             while let Ok(msg) = rx.recv() {
                 match msg {
-                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp } => {
+                    RecordMsg::Frame { mono, width, height, date_obs, exptime_s, cfa, gain, offset, ccd_temp, set_temp, wcs, bit_depth } => {
                         if write_err.is_some() {
                             continue;
                         }
@@ -1201,6 +1415,7 @@ impl ViewerApp {
                         hdu.header.set("BSCALE", HeaderValue::Float(1.0), Some("default scaling"));
                         hdu.header.set("DATE-OBS", HeaderValue::String(date_obs), Some("estimated mid-exposure UTC"));
                         hdu.header.set("EXPTIME", HeaderValue::Float(exptime_s), Some("exposure time in seconds"));
+                        hdu.header.set("BITDEPTH", HeaderValue::Integer(bit_depth as i64), Some("sensor ADC bit depth"));
                         // Only written when the pixels still carry an intact
                         // mosaic (no hardware or superpixel binning) so
                         // calibration software never demosaics mono data.
@@ -1220,6 +1435,9 @@ impl ViewerApp {
                         }
                         if let Some(t) = set_temp {
                             hdu.header.set("SET-TEMP", HeaderValue::Float(t), Some("cooler setpoint (C)"));
+                        }
+                        if let Some(w) = wcs {
+                            w.write(&mut hdu.header);
                         }
                         match hdu.write_to(&mut writer) {
                             Ok(()) => frame_count += 1,
@@ -1353,6 +1571,16 @@ impl ViewerApp {
             let mid = chrono::Utc::now() - chrono::Duration::microseconds((exposure_us / 2.0) as i64);
             let date_obs = mid.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
 
+            // WCS from the most recent lock. It may trail the frame by a
+            // solve job; at live frame rates that is the same pointing.
+            #[cfg(feature = "starsolve")]
+            let wcs = self
+                .last_solve
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|sol| wcs::WcsKeys::from_solution(sol, frame.width, frame.height));
+            #[cfg(not(feature = "starsolve"))]
+            let wcs = None;
             let msg = RecordMsg::Frame {
                 mono: frame.mono.clone(),
                 width: frame.width,
@@ -1364,6 +1592,8 @@ impl ViewerApp {
                 offset,
                 ccd_temp,
                 set_temp,
+                wcs,
+                bit_depth: frame.bit_depth,
             };
             if tx.try_send(msg).is_ok() {
                 self.rec_frame_count += 1;
@@ -1396,6 +1626,12 @@ impl ViewerApp {
     /// Toolbar Play. Resume a paused GigE session in place; otherwise open the
     /// selected source fresh.
     fn play_or_resume(&mut self) {
+        // Nothing selected: Play used to do nothing, silently. Send the
+        // user to the one place a source can be chosen instead.
+        if matches!(self.camera_source, CameraSource::None) {
+            self.connect_dialog_open = true;
+            return;
+        }
         #[cfg(feature = "gev")]
         if let CaptureState::Gev { handle, .. } = &self.capture_state {
             let _ = handle.cmd_tx.send(gev_camera::GevCmd::Resume);
@@ -1849,15 +2085,32 @@ impl ViewerApp {
         #[cfg(feature = "starsolve")]
         if let Ok(out) = self.solve_rx.try_recv() {
             self.solve_busy = false;
-            self.centroid_time_ms = out.extract_ms;
-            self.centroid_count = out.centroids.len();
-            self.last_centroids = out.centroids;
-            if let Some(result) = out.solve {
-                // Update FOV estimate from successful solve
-                if let Ok(ref sol) = result {
-                    self.fov_estimate_deg = sol.fov_rad.to_degrees();
+            // A job dispatched before Solve was switched off lands here after
+            // the switch cleared everything; keeping it would bring the
+            // centroid and star overlays back on the next frame. Only the
+            // busy flag is taken from it.
+            if self.solve_enabled {
+                self.centroid_time_ms = out.extract_ms;
+                self.centroid_count = out.centroids.len();
+                self.last_centroids = out.centroids;
+                #[cfg(feature = "focus")]
+                if let Some(sample) = out.focus {
+                    #[allow(unused_mut)]
+                    let mut focuser_pos: Option<i32> = None;
+                    #[cfg(feature = "toupcam")]
+                    if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
+                        focuser_pos = controls.focuser.as_ref().map(|f| f.position);
+                    }
+                    self.focus_history.push(&sample, focuser_pos);
+                    self.focus_last = Some(sample);
                 }
-                self.last_solve = Some(result);
+                if let Some(result) = out.solve {
+                    // Update FOV estimate from successful solve
+                    if let Ok(ref sol) = result {
+                        self.fov_estimate_deg = sol.fov_rad.to_degrees();
+                    }
+                    self.last_solve = Some(result);
+                }
             }
         }
 
@@ -1945,7 +2198,7 @@ impl ViewerApp {
             // the worker to do. The overlays were cleared when it was switched off.
             #[cfg(feature = "starsolve")]
             if self.solve_enabled {
-                self.maybe_dispatch_solve(&frame.mono, frame.width, frame.height);
+                self.maybe_dispatch_solve(&frame.mono, frame.width, frame.height, frame.bit_depth);
             }
 
             // Rebuild overlays from the most recent completed extraction. These
@@ -1958,7 +2211,7 @@ impl ViewerApp {
             // draw only the first (brightest; tetra3 sorts by mass) few
             // thousand. Extraction and solving still see the full list.
             #[cfg(feature = "starsolve")]
-            if self.show_centroids {
+            if self.solve_enabled && self.show_centroids {
                 const MAX_CENTROID_OVERLAYS: usize = 4000;
                 self.overlay_items = self
                     .last_centroids
@@ -1989,6 +2242,22 @@ impl ViewerApp {
                                 });
                             }
                         }
+                    }
+                }
+            }
+
+            // Per-star HFR labels from the last focus measurement, so tilt and
+            // field curvature show as a gradient of numbers across the frame.
+            #[cfg(feature = "focus")]
+            if self.focus_show_labels {
+                if let Some(sample) = &self.focus_last {
+                    for s in &sample.stars {
+                        self.overlay_items.push(overlays::OverlayItem::Marker {
+                            x: s.x,
+                            y: s.y,
+                            kind: overlays::MarkerKind::Label,
+                            label: Some(format!("{:.2}", s.hfr)),
+                        });
                     }
                 }
             }
@@ -2046,7 +2315,7 @@ impl ViewerApp {
             ui.label(egui::RichText::new(self.source_label()).size(13.0).color(pal.accent));
 
             if let Some(err) = &self.camera_error {
-                ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
+                ui.label(egui::RichText::new(err).color(pal.status_err).small());
             }
 
             // Source-specific settings
@@ -2174,6 +2443,22 @@ impl ViewerApp {
                 widgets::tip(ui, "Pixel value mapped to the top of the colormap. Drag the blue line on the histogram for finer control.", |ui| {
                     widgets::styled_slider(ui, &mut self.display_params.scale_max, range_lo..=range_hi, "Max", &pal);
                 });
+                // Exact entry: the sliders are coarse over a 16-bit range.
+                ui.horizontal(|ui| {
+                    let step = ((range_hi - range_lo) / 2000.0).max(0.01) as f64;
+                    let dp = &mut self.display_params;
+                    ui.label("Min");
+                    widgets::tip(ui, "Type or drag an exact lower limit", |ui| {
+                        ui.add(egui::DragValue::new(&mut dp.scale_min).range(range_lo..=range_hi).speed(step).max_decimals(1));
+                    });
+                    ui.label("Max");
+                    widgets::tip(ui, "Type or drag an exact upper limit", |ui| {
+                        ui.add(egui::DragValue::new(&mut dp.scale_max).range(range_lo..=range_hi).speed(step).max_decimals(1));
+                    });
+                    if dp.scale_max < dp.scale_min {
+                        dp.scale_max = dp.scale_min;
+                    }
+                });
             } else {
                 ui.label(format!("Range: {:.0} – {:.0}", self.display_params.scale_min, self.display_params.scale_max));
             }
@@ -2184,18 +2469,6 @@ impl ViewerApp {
             widgets::tip(ui, "Colormap strip labeled with the current display range", |ui| {
                 widgets::styled_checkbox(ui, &mut self.display_params.show_colorbar, "Show Colorbar", &pal);
             });
-            #[cfg(feature = "starsolve")]
-            {
-                widgets::tip(ui, "Ellipses at extracted star centroids, cyan (faint) to yellow (bright)", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_centroids, "Show Centroids", &pal);
-                });
-                widgets::tip(ui, "Cross-hairs on centroids the plate solve matched to catalog stars", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Show Matched Stars", &pal);
-                });
-                widgets::tip(ui, "Labels for named bright stars in the solved field (needs Centroids and Matched Stars)", |ui| {
-                    widgets::styled_checkbox(ui, &mut self.show_star_names, "Show Star Names", &pal);
-                });
-            }
         });
 
         ui.add_space(4.0);
@@ -2271,6 +2544,12 @@ impl ViewerApp {
 
     fn bottom_panel_tabs(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
+        // The strip must measure exactly its own height: a collapsed panel
+        // is sized from its content, so any extra allocation here pushes the
+        // whole strip below the window. Restored at the end, since the tab
+        // contents draw in this same ui and would inherit the change.
+        let item_spacing_y = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
 
         let avail = ui.available_rect_before_wrap();
         let bar_rect = egui::Rect::from_min_size(avail.min, egui::vec2(avail.width(), 28.0));
@@ -2280,19 +2559,21 @@ impl ViewerApp {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
 
-                let mut tabs: Vec<(BottomTab, &str)> = vec![
-                    (BottomTab::Histogram, "Histogram"),
-                    (BottomTab::Controls, "Controls"),
-                ];
-                #[cfg(feature = "starsolve")]
-                tabs.push((BottomTab::PlateSolve, "Plate Solve"));
-                tabs.push((BottomTab::Log, "Log"));
+                // Unread warnings and errors show as a count on the Log tab.
+                let unread = self.unread_log().count();
+                let unread_err = self.unread_log().any(|e| matches!(e.level, LogLevel::Error));
+                let badge_font = egui::FontId::new(10.0, egui::FontFamily::Proportional);
+                let badge_w = |ui: &egui::Ui| {
+                    ui.painter().layout_no_wrap(unread.to_string(), badge_font.clone(), pal.tab_active_text).size().x + 10.0
+                };
 
-                for (tab, label) in tabs {
-                    let is_active = self.bottom_tab == tab;
+                for tab in BottomTab::all() {
+                    let label = tab.name();
+                    let is_active = self.bottom_tab == tab && self.bottom_panel_open;
+                    let badge = (tab == BottomTab::Log && unread > 0).then(|| badge_w(ui));
                     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
                     let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), pal.tab_active_text);
-                    let tab_w = galley.size().x + 24.0;
+                    let tab_w = galley.size().x + 24.0 + badge.map_or(0.0, |w| w + 4.0);
                     let tab_rect = egui::Rect::from_min_size(
                         ui.cursor().min,
                         egui::vec2(tab_w, 28.0),
@@ -2311,28 +2592,44 @@ impl ViewerApp {
                     }
 
                     let text_color = if is_active { pal.tab_active_text } else { pal.tab_inactive_text };
-                    ui.painter().text(
-                        tab_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        font,
-                        text_color,
-                    );
+                    let text_pos = match badge {
+                        Some(w) => egui::Pos2::new(tab_rect.center().x - (w + 4.0) / 2.0, tab_rect.center().y),
+                        None => tab_rect.center(),
+                    };
+                    ui.painter().text(text_pos, egui::Align2::CENTER_CENTER, label, font, text_color);
+                    if let Some(w) = badge {
+                        let color = if unread_err { pal.status_err } else { pal.status_warn };
+                        let center = egui::Pos2::new(text_pos.x + galley.size().x / 2.0 + 4.0 + w / 2.0, tab_rect.center().y);
+                        let rect = egui::Rect::from_center_size(center, egui::vec2(w, 14.0));
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(7), color);
+                        ui.painter().text(center, egui::Align2::CENTER_CENTER, unread.to_string(), badge_font.clone(), egui::Color32::WHITE);
+                    }
 
                     if resp.clicked() {
                         self.bottom_tab = tab;
+                        self.bottom_panel_open = true;
                     }
                 }
 
-                // Show unread log count badge on Log tab
-                let unread = self.log.iter().filter(|e| matches!(e.level, LogLevel::Error | LogLevel::Warn)).count();
-                if unread > 0 && self.bottom_tab != BottomTab::Log {
-                    // Already rendered tabs, no need for extra badge
-                }
+                // Collapse / expand chevron at the far right of the strip.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    let glyph = if self.bottom_panel_open { "\u{25BC}" } else { "\u{25B2}" };
+                    let tip = if self.bottom_panel_open { "Collapse the panel (B)" } else { "Expand the panel (B)" };
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(4), pal.tab_hover_bg);
+                    }
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(9.0), pal.tab_inactive_text);
+                    if resp.on_hover_text(tip).clicked() {
+                        self.bottom_panel_open = !self.bottom_panel_open;
+                    }
+                });
             });
         });
 
-        ui.allocate_space(egui::vec2(0.0, 28.0));
+        ui.allocate_rect(bar_rect, egui::Sense::hover());
+        ui.spacing_mut().item_spacing.y = item_spacing_y;
     }
 
     fn histogram_content(&mut self, ui: &mut egui::Ui) {
@@ -3439,7 +3736,7 @@ impl ViewerApp {
             };
             if connected {
                 ui.label(egui::RichText::new("● connected")
-                    .color(egui::Color32::from_rgb(34, 197, 94)).small());
+                    .color(pal.status_ok).small());
                 if ui.small_button("Disconnect").clicked() {
                     let _ = handle.cmd_tx.send(IndiCmd::SetSwitch {
                         device: device.clone(),
@@ -3667,7 +3964,21 @@ impl ViewerApp {
                 self.last_centroids.clear();
                 self.centroid_count = 0;
                 self.overlay_items.clear();
+                #[cfg(feature = "focus")]
+                {
+                    self.focus_last = None;
+                }
             }
+            // Overlay switches live beside the pipeline that produces them.
+            widgets::tip(ui, "Ellipses at extracted star centroids, cyan (faint) to yellow (bright)", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_centroids, "Centroids", &pal);
+            });
+            widgets::tip(ui, "Cross-hairs on centroids the plate solve matched to catalog stars", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_matched_stars, "Matched", &pal);
+            });
+            widgets::tip(ui, "Labels for named bright stars in the solved field (needs Centroids and Matched)", |ui| {
+                widgets::styled_checkbox(ui, &mut self.show_star_names, "Names", &pal);
+            });
             ui.separator();
 
             // Database
@@ -3675,7 +3986,7 @@ impl ViewerApp {
                 ui.add(egui::Spinner::new().size(14.0));
                 let secs = self.gen_started.map_or(0.0, |t| t.elapsed().as_secs_f32());
                 ui.label(egui::RichText::new(format!("Building star database… {:.0}s", secs))
-                    .color(egui::Color32::from_rgb(217, 119, 6)));
+                    .color(pal.status_warn));
             } else if self.solver_db.is_none() {
                 if widgets::tip(ui, "Load a tetra3 pattern database (.bin)", |ui| widgets::styled_button(ui, "Load Database...", &pal)) {
                     if let Some(path) = rfd::FileDialog::new()
@@ -3706,7 +4017,7 @@ impl ViewerApp {
                     self.start_solver_generation();
                 }
             } else {
-                ui.label(egui::RichText::new("DB").color(egui::Color32::from_rgb(34, 197, 94)));
+                ui.label(egui::RichText::new("DB").color(pal.status_ok));
                 if widgets::styled_button(ui, "Unload", &pal) {
                     self.solver_db = None;
                     self.last_solve = None;
@@ -3737,7 +4048,7 @@ impl ViewerApp {
                     }
                 }
             } else {
-                ui.label(egui::RichText::new("Cal").color(egui::Color32::from_rgb(34, 197, 94)));
+                ui.label(egui::RichText::new("Cal").color(pal.status_ok));
                 if widgets::styled_button(ui, "Unload", &pal) {
                     self.camera_model = None;
                     self.camera_model_path = None;
@@ -3760,9 +4071,9 @@ impl ViewerApp {
                 let (text, color) = if !self.solve_enabled {
                     ("Off", pal.text_secondary)
                 } else if self.solve_busy {
-                    ("Solving...", egui::Color32::from_rgb(217, 119, 6))
+                    ("Solving...", pal.status_warn)
                 } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
-                    ("Locked", egui::Color32::from_rgb(34, 197, 94))
+                    ("Locked", pal.status_ok)
                 } else {
                     ("Searching...", pal.text_secondary)
                 };
@@ -4001,14 +4312,159 @@ impl ViewerApp {
                         tetra3::SolveStatus::TooFew => "Too few stars",
                         tetra3::SolveStatus::InvalidConfig => "Invalid solver config",
                     };
-                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(220, 38, 38)));
+                    ui.label(egui::RichText::new(msg).color(pal.status_err));
                 }
             }
         }
     }
 
+    /// The Focus tab: the current HFR in digits large enough to read from the
+    /// telescope, the best value since the last reset, and a trend of the
+    /// last few hundred frames. Focusing is watching a number move as the
+    /// knob turns, so the history and the best-so-far matter as much as the
+    /// current value.
+    #[cfg(feature = "focus")]
+    fn focus_content(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let dim = pal.text_secondary;
+        let good = pal.status_ok;
+        let warn = pal.status_warn;
+
+        // ── Top bar ─────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            if widgets::tip(ui, "Forget the trend and the best-so-far. Do this after a large focuser move or a filter change.", |ui| {
+                widgets::styled_button(ui, "Reset", &pal)
+            }) {
+                self.focus_history.reset();
+            }
+            ui.separator();
+            widgets::tip(ui, "Measure only stars inside the zoom ROI (draw one by dragging on the image). Off, or with no ROI drawn: the brightest stars anywhere in the frame.", |ui| {
+                widgets::styled_checkbox(ui, &mut self.focus_use_roi, "ROI only", &pal);
+            });
+            widgets::tip(ui, "Write each measured star's HFR next to it on the image. A gradient of values across the frame shows tilt or field curvature.", |ui| {
+                widgets::styled_checkbox(ui, &mut self.focus_show_labels, "Label stars", &pal);
+            });
+            ui.separator();
+            widgets::tip(ui, "HFR: half flux radius of the brightest stars, smaller is better. Sharpness: whole-frame contrast, larger is better; useful far from focus when no stars are detected.", |ui| {
+                widgets::combo_box(ui, "focus_plot", "Plot", &mut self.focus_plot,
+                    &[(FocusPlot::Hfr, "HFR"), (FocusPlot::Sharpness, "Sharpness")], &pal);
+            });
+            ui.separator();
+            // Pipeline state, so a silent readout explains itself.
+            let (text, color) = if !self.solve_enabled {
+                ("Solve is off: enable it in the Plate Solve tab", warn)
+            } else if self.focus_use_roi && self.image_viewer.roi_rect.is_none() {
+                ("ROI only: drag a region on the image", warn)
+            } else if self.focus_last.as_ref().is_some_and(|s| s.hfr_px.is_none()) {
+                ("No measurable stars: too faint, saturated, or elongated", dim)
+            } else {
+                ("", dim)
+            };
+            if !text.is_empty() {
+                ui.label(egui::RichText::new(text).color(color));
+            }
+        });
+        ui.add_space(4.0);
+
+        let latest = self.focus_history.latest().copied();
+        let best = self.focus_history.best().copied();
+        // Arcseconds per pixel from the last solve, when locked.
+        let arcsec_per_px: Option<f64> = self.last_solve.as_ref().and_then(|s| s.as_ref().ok()).map(|sol| {
+            sol.fov_rad.to_degrees() as f64 / sol.camera_model.image_width.max(1) as f64 * 3600.0
+        });
+
+        ui.horizontal_top(|ui| {
+            // ── Readout column ──────────────────────────────────────────────
+            ui.vertical(|ui| {
+                ui.set_width(210.0);
+                let big = egui::FontId::monospace(44.0);
+                let mid = egui::FontId::monospace(20.0);
+                let small = egui::FontId::proportional(12.0);
+
+                ui.label(egui::RichText::new("HFR").color(dim).font(small.clone()));
+                let hfr = latest.and_then(|p| p.hfr_px);
+                let hfr_txt = hfr.map_or("--.--".to_string(), |h| format!("{:.2}", h));
+                let hfr_color = match (hfr, best.and_then(|b| b.hfr_px)) {
+                    (Some(h), Some(b)) if h <= b * 1.02 => good,
+                    (Some(_), _) => pal.text_primary,
+                    (None, _) => dim,
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(hfr_txt).font(big).color(hfr_color));
+                    ui.vertical(|ui| {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("px").color(dim).font(small.clone()));
+                        if let (Some(h), Some(spp)) = (hfr, arcsec_per_px) {
+                            ui.label(egui::RichText::new(format!("{:.2}\"", h as f64 * spp)).color(dim).font(small.clone()));
+                        }
+                    });
+                });
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Best").color(dim).font(small.clone()));
+                    let best_txt = best.and_then(|b| b.hfr_px).map_or("--.--".to_string(), |h| format!("{:.2}", h));
+                    ui.label(egui::RichText::new(best_txt).font(mid).color(good));
+                    if let Some(p) = best.and_then(|b| b.focuser_pos) {
+                        ui.label(egui::RichText::new(format!("@ {}", p)).color(dim).font(small.clone()));
+                    }
+                });
+
+                ui.add_space(6.0);
+                let stat = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(k).color(dim).font(small.clone()));
+                        ui.label(egui::RichText::new(v).font(egui::FontId::monospace(12.0)));
+                    });
+                };
+                let (n, cand) = self.focus_last.as_ref().map_or((0, 0), |s| (s.stars.len(), s.candidates));
+                stat(ui, "Stars", format!("{} of {}", n, cand));
+                stat(ui, "Sharpness", latest.map_or("--".to_string(), |p| format!("{:.2}", p.sharpness)));
+                if let Some(p) = latest.and_then(|p| p.focuser_pos) {
+                    stat(ui, "Focuser", format!("{}", p));
+                }
+            });
+
+            ui.separator();
+
+            // ── Trend plot ──────────────────────────────────────────────────
+            let (points, best_line, y_label): (Vec<[f64; 2]>, Option<f64>, &str) = match self.focus_plot {
+                FocusPlot::Hfr => (
+                    self.focus_history.iter().filter_map(|p| p.hfr_px.map(|h| [p.t, h as f64])).collect(),
+                    best.and_then(|b| b.hfr_px).map(|h| h as f64),
+                    "HFR (px)",
+                ),
+                FocusPlot::Sharpness => (
+                    self.focus_history.iter().map(|p| [p.t, p.sharpness as f64]).collect(),
+                    None,
+                    "Sharpness",
+                ),
+            };
+            let plot_height = ui.available_height().max(60.0);
+            egui_plot::Plot::new("focus_trend")
+                .height(plot_height)
+                .y_axis_label(y_label)
+                .x_axis_label("Time (s)")
+                .show_axes([true, true])
+                .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
+                .show_grid([false, true])
+                .include_y(0.0)
+                .set_margin_fraction(egui::vec2(0.02, 0.1))
+                .show(ui, |plot_ui| {
+                    if let Some(b) = best_line {
+                        plot_ui.hline(egui_plot::HLine::new("best", b).color(good).width(1.0).style(egui_plot::LineStyle::dashed_dense()));
+                    }
+                    if !points.is_empty() {
+                        plot_ui.line(egui_plot::Line::new(y_label, egui_plot::PlotPoints::from(points)).color(pal.plot_line).width(1.5));
+                    }
+                });
+        });
+    }
+
     fn log_content(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal();
+        // Showing the tab acknowledges everything in it.
+        self.log_seen = self.log.len();
         if widgets::styled_button(ui, "Clear", &pal) {
             self.log.clear();
         }
@@ -4020,8 +4476,8 @@ impl ViewerApp {
                 for entry in self.log.iter().rev() {
                     let color = match entry.level {
                         LogLevel::Info => pal.text_secondary,
-                        LogLevel::Warn => egui::Color32::from_rgb(217, 119, 6),
-                        LogLevel::Error => egui::Color32::from_rgb(220, 38, 38),
+                        LogLevel::Warn => pal.status_warn,
+                        LogLevel::Error => pal.status_err,
                     };
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&entry.timestamp).monospace().size(11.0).color(pal.text_secondary));
@@ -4075,9 +4531,9 @@ fn indi_property_rows(
     let state_dot = |ui: &mut egui::Ui, state: PropState| {
         let (color, name) = match state {
             PropState::Idle => (pal.text_secondary, "idle"),
-            PropState::Ok => (egui::Color32::from_rgb(34, 197, 94), "ok"),
-            PropState::Busy => (egui::Color32::from_rgb(245, 158, 11), "busy"),
-            PropState::Alert => (egui::Color32::from_rgb(239, 68, 68), "alert"),
+            PropState::Ok => (pal.status_ok, "ok"),
+            PropState::Busy => (pal.status_warn, "busy"),
+            PropState::Alert => (pal.status_err, "alert"),
         };
         ui.label(egui::RichText::new("●").color(color).small()).on_hover_text(name);
     };
@@ -4348,6 +4804,7 @@ const SC_QUIT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifi
 const SC_PLAY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Space);
 const SC_RECORD: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::R);
 const SC_SIDE_PANEL: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::S);
+const SC_BOTTOM_PANEL: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::B);
 
 // ── Main update loop ────────────────────────────────────────────────────────
 
@@ -4361,6 +4818,7 @@ impl eframe::App for ViewerApp {
         self.stop_capture();
         #[cfg(feature = "starsolve")]
         self.save_config();
+        self.ui_config().save();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4374,6 +4832,18 @@ impl eframe::App for ViewerApp {
         #[cfg(feature = "starsolve")]
         self.poll_solver_generation();
         self.apply_theme(&ctx);
+
+        if QUIT_REQUESTED.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Remember where the window is, for next launch. Read every frame
+        // rather than at exit because the viewport info is gone by then.
+        if let (Some(inner), Some(outer)) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().outer_rect)) {
+            if inner.width() > 100.0 && inner.height() > 100.0 && outer.min.x.is_finite() && outer.min.y.is_finite() {
+                self.window_geometry = Some(([inner.width(), inner.height()], [outer.min.x, outer.min.y]));
+            }
+        }
 
         if self.pending_fits_load.is_some() || self.pending_bg.is_some() { ctx.request_repaint(); }
         // While capturing, frames wake the UI instantly via the pump thread;
@@ -4418,15 +4888,17 @@ impl eframe::App for ViewerApp {
         // ones stay quiet while any widget has keyboard focus (text fields,
         // drag values) so typing never trips them.
         let typing = ctx.egui_wants_keyboard_input();
-        let (sc_open, sc_connect, sc_quit, sc_side, sc_play, sc_record) = ctx.input_mut(|i| (
+        let (sc_open, sc_connect, sc_quit, sc_side, sc_bottom, sc_play, sc_record) = ctx.input_mut(|i| (
             i.consume_shortcut(&SC_OPEN),
             i.consume_shortcut(&SC_CONNECT),
             i.consume_shortcut(&SC_QUIT),
             !typing && i.consume_shortcut(&SC_SIDE_PANEL),
+            !typing && i.consume_shortcut(&SC_BOTTOM_PANEL),
             !typing && i.consume_shortcut(&SC_PLAY),
             !typing && i.consume_shortcut(&SC_RECORD),
         ));
         if sc_side { self.side_panel_open = !self.side_panel_open; }
+        if sc_bottom { self.bottom_panel_open = !self.bottom_panel_open; }
         if sc_open && self.pending_fits_path.is_none() { self.open_fits_dialog(); }
         if sc_connect { self.connect_dialog_open = true; }
         if sc_quit { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
@@ -4504,6 +4976,9 @@ impl eframe::App for ViewerApp {
                         ui.separator();
                         if menu_check_sc(ui, self.side_panel_open, "Side Panel", ctx.format_shortcut(&SC_SIDE_PANEL)) {
                             self.side_panel_open = !self.side_panel_open;
+                        }
+                        if menu_check_sc(ui, self.bottom_panel_open, "Bottom Panel", ctx.format_shortcut(&SC_BOTTOM_PANEL)) {
+                            self.bottom_panel_open = !self.bottom_panel_open;
                         }
                         ui.separator();
                         if menu_check(ui, self.display_params.show_axes, "Show Axes") {
@@ -4614,9 +5089,15 @@ impl eframe::App for ViewerApp {
                         {
                             self.pause_or_stop();
                         }
-                    } else if widgets::tip(ui, &format!("Start capture from the selected source ({play_sc})"), |ui| {
-                        widgets::primary_button(ui, "\u{25B6}  Play", &pal)
-                    }) {
+                    } else if widgets::tip(
+                        ui,
+                        &if matches!(self.camera_source, CameraSource::None) {
+                            format!("No source selected: opens the Connect dialog ({play_sc})")
+                        } else {
+                            format!("Start capture from the selected source ({play_sc})")
+                        },
+                        |ui| widgets::primary_button(ui, "\u{25B6}  Play", &pal),
+                    ) {
                         self.play_or_resume();
                     }
                     ui.separator();
@@ -4624,7 +5105,7 @@ impl eframe::App for ViewerApp {
                     // circle to start, filled square to stop) so idle vs.
                     // recording is unmistakable; sized to match the other
                     // transport buttons via the shared icon_button helper.
-                    let rec_red = egui::Color32::from_rgb(220, 60, 60);
+                    let rec_red = pal.status_err;
                     if self.recording {
                         // Blinking "armed" indicator to the left of the button.
                         // Honor reduced-motion: hold the dot solid if requested.
@@ -4667,6 +5148,10 @@ impl eframe::App for ViewerApp {
             });
 
         // Status bar — rendered before side panel so it spans the full window width
+        let unread_count = self.unread_log().count();
+        let unread_err = self.unread_log().any(|e| matches!(e.level, LogLevel::Error));
+        let unread_last = self.unread_log().last().map(|e| e.message.clone());
+        let mut open_log = false;
         egui::Panel::bottom("status_bar")
             .exact_size(22.0)
             .frame(egui::Frame::new()
@@ -4687,7 +5172,7 @@ impl eframe::App for ViewerApp {
                         ui.label(egui::RichText::new(format!(
                             "\u{25CF} REC {} · {} frames",
                             self.rec_filename, self.rec_frame_count
-                        )).size(small).monospace().color(egui::Color32::from_rgb(220, 40, 40)));
+                        )).size(small).monospace().color(pal.status_err));
                         sep(ui);
                     }
 
@@ -4705,16 +5190,31 @@ impl eframe::App for ViewerApp {
                     // Right group: solve status + cursor readout
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        // Unread warnings and errors: count plus the latest
+                        // message, clickable through to the Log tab.
+                        if let Some(last) = unread_last {
+                            let color = if unread_err { pal.status_err } else { pal.status_warn };
+                            let mut msg = last.clone();
+                            if msg.chars().count() > 60 {
+                                msg = msg.chars().take(57).collect::<String>() + "…";
+                            }
+                            let text = format!("\u{26A0} {}  {}", unread_count, msg);
+                            let r = ui.add(egui::Label::new(egui::RichText::new(text).size(small).color(color)).sense(egui::Sense::click()));
+                            if r.on_hover_text("Open the Log tab").clicked() {
+                                open_log = true;
+                            }
+                            sep(ui);
+                        }
                         #[cfg(feature = "starsolve")]
                         {
                             // solve_busy also covers extraction-only jobs; only
                             // call it solving when the solver is actually on.
                             if self.solve_enabled && self.solve_busy {
                                 ui.label(egui::RichText::new("Solving…").size(small).monospace()
-                                    .color(egui::Color32::from_rgb(217, 119, 6)));
+                                    .color(pal.status_warn));
                             } else if self.last_solve.as_ref().is_some_and(|s| s.is_ok()) {
                                 ui.label(egui::RichText::new("Solved").size(small).monospace()
-                                    .color(egui::Color32::from_rgb(34, 197, 94)));
+                                    .color(pal.status_ok));
                             }
                         }
                         if let (Some((px, py)), Some(val)) = (self.cursor_pixel, self.cursor_value) {
@@ -4725,10 +5225,15 @@ impl eframe::App for ViewerApp {
                 });
             });
 
+        if open_log {
+            self.bottom_tab = BottomTab::Log;
+            self.bottom_panel_open = true;
+        }
+
         // Side panel — rendered before bottom panel so it extends full height to status bar
         if self.side_panel_open {
-            egui::Panel::left("controls")
-                .resizable(true).default_size(220.0)
+            let resp = egui::Panel::left("controls")
+                .resizable(true).default_size(self.side_panel_width)
                 .frame(egui::Frame::new()
                     .fill(pal.panel_fill)
                     .inner_margin(egui::Margin { left: 6, right: 6, top: 8, bottom: 6 })
@@ -4736,20 +5241,34 @@ impl eframe::App for ViewerApp {
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| { self.side_panel(ui); });
                 });
+            self.side_panel_width = resp.response.rect.width();
         }
 
         // Bottom tabbed panel — rendered after side panel so it only spans the image area
-        egui::Panel::bottom("bottom_panel")
+        // Collapsed, only the tab strip remains. egui's switched panel keeps
+        // the two sizes under separate ids, animates between them, and lets
+        // a drag on the handle past the strip height collapse the panel.
+        let frame = egui::Frame::new().fill(pal.panel_fill).inner_margin(egui::Margin::ZERO);
+        let expanded = egui::Panel::bottom("bottom_panel")
             .resizable(true)
-            .default_size(300.0)
-            .size_range(150.0..=600.0)
-            .frame(egui::Frame::new()
-                .fill(pal.panel_fill)
-                .inner_margin(egui::Margin::ZERO)
-            )
-            .show(ui, |ui| {
-                ui.set_min_height(260.0);
+            .default_size(self.bottom_panel_height)
+            .size_range(120.0..=900.0)
+            .frame(frame);
+        let collapsed = egui::Panel::bottom("bottom_panel_collapsed").resizable(false).exact_size(28.0).frame(frame);
+        // The tab strip inside may flip the flag itself (chevron, tab click);
+        // the panel's own drag-to-collapse reports through `open`. Whichever
+        // changed this frame wins.
+        let before = self.bottom_panel_open;
+        let mut open = before;
+        let resp = egui::Panel::show_switched(ui, &mut open, collapsed, expanded, |ui, show_expanded| {
+                // egui stores a panel's height from its content each frame, so
+                // a tab with little in it would shrink the panel and that size
+                // would stick. Claim the full height whatever the tab holds.
+                ui.set_min_height(ui.available_height());
                 self.bottom_panel_tabs(ui);
+                if !show_expanded {
+                    return;
+                }
 
                 egui::Frame::new()
                     .fill(pal.panel_fill)
@@ -4769,14 +5288,30 @@ impl eframe::App for ViewerApp {
                             }
                             #[cfg(feature = "starsolve")]
                             BottomTab::PlateSolve => self.plate_solve_content(ui),
+                            #[cfg(feature = "focus")]
+                            BottomTab::Focus => self.focus_content(ui),
                             BottomTab::Log => self.log_content(ui),
                         }
                     });
             });
+        if self.bottom_panel_open == before {
+            self.bottom_panel_open = open;
+        }
+        if self.bottom_panel_open && open {
+            self.bottom_panel_height = resp.response.rect.height();
+        }
 
         // Update display params with current palette colors
         self.display_params.axes_text_color = pal.axes_text;
         self.display_params.axes_stroke_color = pal.axes_stroke;
+        self.display_params.overlay_colors = overlays::OverlayColors {
+            dim: pal.overlay_dim,
+            bright: pal.overlay_bright,
+            matched: pal.overlay_matched,
+            catalog: pal.overlay_catalog,
+            label: pal.overlay_label,
+        };
+        self.display_params.roi_color = pal.roi_outline;
 
         // Central panel
         egui::CentralPanel::default()
@@ -4839,6 +5374,9 @@ impl eframe::App for ViewerApp {
 #[cfg(feature = "starsolve")]
 const SOLVE_TIMEOUT_MS: u64 = 10;
 
+/// Set by the signal handler; the next UI pass turns it into a window close.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// One frame's work for the plate-solve worker: extract centroids, then solve
 /// them if a database is loaded.
 #[cfg(feature = "starsolve")]
@@ -4852,6 +5390,9 @@ struct SolveJob {
     /// `None` when no database is loaded — the worker still extracts, so the
     /// centroid overlay and star count keep working without a solver.
     solve: Option<SolveParams>,
+    /// Focus measurement to run on this frame's centroids.
+    #[cfg(feature = "focus")]
+    focus: Option<focus::FocusConfig>,
 }
 
 /// Solver inputs, snapshotted on the UI thread at dispatch time.
@@ -4871,6 +5412,8 @@ struct SolveOutput {
     centroids: Vec<tetra3::Centroid>,
     extract_ms: f32,
     solve: Option<tetra3::SolveResult>,
+    #[cfg(feature = "focus")]
+    focus: Option<focus::FocusSample>,
 }
 
 /// Long-lived worker running extraction and solving off the UI thread. One
@@ -4911,6 +5454,28 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
             .unwrap_or_default();
             let extract_ms = t0.elapsed().as_secs_f32() * 1000.0;
 
+            // Focus figures ride on the same frame and centroids. A few
+            // thousand pixels of arithmetic; nothing next to extraction.
+            #[cfg(feature = "focus")]
+            let focus = job.focus.as_ref().map(|cfg| {
+                let stars: Vec<focus::Star> = centroids
+                    .iter()
+                    .map(|c| focus::Star {
+                        x: c.x,
+                        y: c.y,
+                        mass: c.mass.unwrap_or(0.0),
+                        // The overlay ellipse axes are 3σ; undo that for the
+                        // window size. The ratio is scale-free.
+                        sigma: c.cov.map(|cov| overlays::cov_to_ellipse(cov).0 / 3.0),
+                        elongation: c.cov.map(|cov| {
+                            let (a, b, _) = overlays::cov_to_ellipse(cov);
+                            if b > 0.0 { a / b } else { f32::INFINITY }
+                        }),
+                    })
+                    .collect();
+                focus::measure(&job.mono, job.width, job.height, &stars, cfg)
+            });
+
             let solve = job.solve.map(|p| {
                 let mut cfg = tetra3::SolveConfig::new(p.fov_rad, job.width, job.height);
                 cfg.fov_max_error_rad = p.fov_max_error;
@@ -4930,7 +5495,14 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
                 p.db.solve_from_centroids(&centroids, &cfg)
             });
 
-            if out_tx.send(SolveOutput { centroids, extract_ms, solve }).is_err() {
+            let out = SolveOutput {
+                centroids,
+                extract_ms,
+                solve,
+                #[cfg(feature = "focus")]
+                focus,
+            };
+            if out_tx.send(out).is_err() {
                 break;
             }
         }
@@ -4943,7 +5515,7 @@ impl ViewerApp {
     /// previous one — in which case this frame is skipped rather than queued, so
     /// the pipeline always works on recent data instead of falling behind.
     #[cfg(feature = "starsolve")]
-    fn maybe_dispatch_solve(&mut self, mono: &Pixels, w: u32, h: u32) {
+    fn maybe_dispatch_solve(&mut self, mono: &Pixels, w: u32, h: u32, bit_depth: u8) {
         if self.solve_busy {
             return;
         }
@@ -4971,7 +5543,29 @@ impl ViewerApp {
             }
         });
 
-        let job = SolveJob { mono, width: w, height: h, centroid_config: self.centroid_config.clone(), tracking: self.tracking_mode, solve };
+        // Focus: stars whose peak reaches ~95% of full scale are treated as
+        // clipped. Judged on the frame the worker sees, so a background-
+        // subtracted frame is slightly lenient; the cores it lets through
+        // are already flat and drop out on the elongation cut or read wide.
+        #[cfg(feature = "focus")]
+        let focus_cfg = focus::FocusConfig {
+            saturation: Some(0.95 * ((1u64 << bit_depth) - 1) as f32),
+            roi: if self.focus_use_roi { self.image_viewer.roi_rect } else { None },
+            ..Default::default()
+        };
+        #[cfg(not(feature = "focus"))]
+        let _ = bit_depth;
+
+        let job = SolveJob {
+            mono,
+            width: w,
+            height: h,
+            centroid_config: self.centroid_config.clone(),
+            tracking: self.tracking_mode,
+            solve,
+            #[cfg(feature = "focus")]
+            focus: Some(focus_cfg),
+        };
         if self.solve_tx.try_send(job).is_ok() {
             self.solve_busy = true;
         }
@@ -5009,7 +5603,7 @@ impl ViewerApp {
                 ui.spacing_mut().item_spacing.y = 5.0;
 
                 if let Some(err) = &self.camera_error {
-                    ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(220, 38, 38)).small());
+                    ui.label(egui::RichText::new(err).color(pal.status_err).small());
                 }
 
                 for b in sources::backends() {
@@ -5223,7 +5817,7 @@ impl ViewerApp {
                         if let overlays::OverlayItem::Centroid { mass, .. } = item { Some(*mass) } else { None }
                     }).fold(0.0_f32, f32::max);
 
-                    overlays::draw_overlays(ui.painter(), &overlay_items, to_screen, scale_x, max_mass, 2.0);
+                    overlays::draw_overlays(ui.painter(), &overlay_items, to_screen, scale_x, max_mass, 2.0, &self.display_params.overlay_colors);
 
                     // Pixel info on hover
                     if let Some(pos) = resp.hover_pos() {
@@ -5453,10 +6047,17 @@ fn main() -> Result<()> {
         // after launch — which would overwrite the macOS Dock icon (and Windows
         // taskbar icon) provided by the app bundle's .icns / the exe's embedded .ico.
         // With IconData::default(), eframe leaves the OS-provided icon untouched.
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 1000.0])
-            .with_title("AstroViewer")
-            .with_icon(egui::IconData::default()),
+        viewport: {
+            let saved = UiConfig::load();
+            let mut vp = egui::ViewportBuilder::default()
+                .with_inner_size(saved.window_size.filter(|s| s[0] >= 400.0 && s[1] >= 300.0).unwrap_or([1400.0, 1000.0]))
+                .with_title("AstroViewer")
+                .with_icon(egui::IconData::default());
+            if let Some(pos) = saved.window_pos {
+                vp = vp.with_position(pos);
+            }
+            vp
+        },
         ..Default::default()
     };
     eframe::run_native("AstroViewer", options, Box::new(|cc| Ok(Box::new(ViewerApp::new(cc)))))

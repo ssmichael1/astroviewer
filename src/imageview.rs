@@ -33,6 +33,8 @@ pub struct DisplayParams {
     pub show_colorbar: bool,
     pub axes_text_color: Color32,
     pub axes_stroke_color: Color32,
+    pub overlay_colors: overlays::OverlayColors,
+    pub roi_color: Color32,
 }
 
 impl Default for DisplayParams {
@@ -47,6 +49,8 @@ impl Default for DisplayParams {
             show_colorbar: true,
             axes_text_color: Color32::from_rgb(51, 51, 51),
             axes_stroke_color: Color32::from_rgb(97, 97, 97),
+            overlay_colors: overlays::OverlayColors::default(),
+            roi_color: Color32::from_rgba_unmultiplied(255, 255, 0, 128),
         }
     }
 }
@@ -324,10 +328,9 @@ impl ImageViewer {
                 }
             }
 
-            // Left-click on image clears zoom ROI
-            if resp.clicked_by(egui::PointerButton::Primary) && self.roi_rect.is_some() {
-                self.roi_rect = None;
-            }
+            // A stray left click used to clear the zoom ROI, which lost the
+            // zoom too easily. The ROI now goes away only with Escape, the
+            // zoom window's close button, or a new right-drag replacing it.
 
             // ROI selection (right-click drag)
             if resp.dragged_by(egui::PointerButton::Secondary) && self.roi_start.is_none() {
@@ -374,7 +377,7 @@ impl ImageViewer {
                 ui.painter().rect_stroke(
                     drag_rect,
                     0.0,
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 0, 128)),
+                    Stroke::new(1.0, params.roi_color),
                     StrokeKind::Outside,
                 );
             }
@@ -401,7 +404,7 @@ impl ImageViewer {
                 if let OverlayItem::Centroid { mass, .. } = item { Some(*mass) } else { None }
             }).fold(0.0_f32, f32::max);
 
-            overlays::draw_overlays(ui.painter(), overlay_items, to_screen, scale_x, max_mass, 1.0);
+            overlays::draw_overlays(ui.painter(), overlay_items, to_screen, scale_x, max_mass, 1.0, &params.overlay_colors);
         }
 
         // Draw colorbar

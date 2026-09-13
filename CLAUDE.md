@@ -65,6 +65,8 @@ svbony::Camera::get_image()
 
 3. **Colormapping on the UI thread** — Apply colormap, gamma, and scaling when converting to an egui texture. This keeps the pipeline simple and lets scale/gamma changes take effect immediately without re-fetching from the camera.
 
+4. **Display binning before recolor** — When the frame is drawn smaller than its pixel count, `imageview` mean-bins the mono data by the integer factor `display_bin_factor` (largest that keeps the binned image at least as wide as the viewport in physical pixels) and recolors only the binned image. Point-sampling a 26 Mpix frame at 3× decimation drops most 2-pixel stars and keeps full per-pixel noise; the block mean is the low-pass filter that decimation requires and cuts the shaded/uploaded pixel count by `bin²`. The residual sub-2× minification uses bilinear filtering; magnification stays nearest. Hover values, the ROI zoom window and everything downstream (solver, recording) see the unbinned data.
+
 4. **Camera controls via `svbony` API directly** — Query `control_caps()` to discover available controls, render a slider/checkbox for each writable one. No intermediate abstraction layer.
 
 ## Implementation Plan

@@ -1,5 +1,5 @@
 //! INDI client — connects to an indiserver, drives a CCD driver, and delivers
-//! frames as `FrameData` over the same channel pattern as `camera` / `gev_camera`.
+//! frames as `FrameData` over the same channel pattern as the `svbony` / `gev` backends.
 //!
 //! Protocol notes (INDI 1.7, docs.indilib.org/protocol):
 //! - Plain TCP (default port 7624) carrying a stream of flat XML elements with
@@ -24,7 +24,7 @@
 //!   (`CCD_EXPOSURE.EXPOSURE` instead of `CCD_EXPOSURE.CCD_EXPOSURE_VALUE`,
 //!   `CONNECTION.CONNECTED` instead of `CONNECTION.CONNECT`).
 //!
-//! Threading (mirrors `gev_camera`):
+//! Threading (mirrors the `gev` backend):
 //! - A *writer* thread owns the command channel and serializes `IndiCmd` → XML.
 //! - A *reader* thread blocks on the socket, parses elements, maintains the
 //!   property store, decodes BLOBs, and pushes property snapshots to the UI.
@@ -224,8 +224,8 @@ struct SharedState {
 pub fn start_client(
     host: &str,
     port: u16,
-    frame_tx: Sender<super::FrameData>,
-    log_tx: Sender<super::LogEntry>,
+    frame_tx: Sender<crate::FrameData>,
+    log_tx: Sender<crate::LogEntry>,
 ) -> Result<IndiHandle> {
     let stream = TcpStream::connect((host, port))
         .map_err(|e| anyhow!("connect {host}:{port}: {e}"))?;
@@ -276,7 +276,7 @@ fn writer_loop(
     mut stream: TcpStream,
     cmd_rx: Receiver<IndiCmd>,
     shared: Arc<SharedState>,
-    log_tx: Sender<super::LogEntry>,
+    log_tx: Sender<crate::LogEntry>,
 ) {
     loop {
         let cmd = match cmd_rx.recv() {
@@ -353,7 +353,7 @@ fn writer_loop(
             IndiCmd::Stop => unreachable!(),
         };
         if let Err(e) = result {
-            let _ = log_tx.try_send(super::LogEntry::error(format!("INDI write: {e}")));
+            let _ = log_tx.try_send(crate::LogEntry::error(format!("INDI write: {e}")));
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -403,11 +403,11 @@ struct RawChild {
 fn reader_loop(
     stream: TcpStream,
     server_addr: String,
-    frame_tx: Sender<super::FrameData>,
+    frame_tx: Sender<crate::FrameData>,
     props_slot: Arc<Mutex<Option<Vec<IndiProperty>>>>,
     cmd_tx: Sender<IndiCmd>,
     shared: Arc<SharedState>,
-    log_tx: Sender<super::LogEntry>,
+    log_tx: Sender<crate::LogEntry>,
 ) {
     let mut reader = Reader::from_reader(BufReader::with_capacity(1 << 16, stream));
     reader.config_mut().trim_text(true);
@@ -425,7 +425,7 @@ fn reader_loop(
                 let children = match read_children(&mut reader, &tag) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = log_tx.try_send(super::LogEntry::error(format!("INDI parse: {e}")));
+                        let _ = log_tx.try_send(crate::LogEntry::error(format!("INDI parse: {e}")));
                         return;
                     }
                 };
@@ -443,13 +443,13 @@ fn reader_loop(
                 );
             }
             Ok(Event::Eof) => {
-                let _ = log_tx.try_send(super::LogEntry::info("INDI server disconnected".into()));
+                let _ = log_tx.try_send(crate::LogEntry::info("INDI server disconnected".into()));
                 return;
             }
             Ok(_) => {}
             Err(e) => {
                 // Also the normal exit path: Stop shuts the socket down under us.
-                let _ = log_tx.try_send(super::LogEntry::info(format!("INDI reader exit: {e}")));
+                let _ = log_tx.try_send(crate::LogEntry::info(format!("INDI reader exit: {e}")));
                 return;
             }
         }
@@ -530,18 +530,18 @@ fn handle_element(
     children: Vec<RawChild>,
     store: &mut HashMap<(String, String), IndiProperty>,
     server_addr: &str,
-    frame_tx: &Sender<super::FrameData>,
+    frame_tx: &Sender<crate::FrameData>,
     props_slot: &Mutex<Option<Vec<IndiProperty>>>,
     cmd_tx: &Sender<IndiCmd>,
     shared: &SharedState,
-    log_tx: &Sender<super::LogEntry>,
+    log_tx: &Sender<crate::LogEntry>,
 ) {
     let get = |k: &str| attrs.get(k).cloned().unwrap_or_default();
     match tag {
         // INDIGO accepted the 2.0 extension offered in getProperties.
         "switchProtocol" => {
             shared.indigo.store(true, Ordering::Relaxed);
-            let _ = log_tx.try_send(super::LogEntry::info(
+            let _ = log_tx.try_send(crate::LogEntry::info(
                 "INDIGO protocol 2.0 negotiated — raw (non-base64) BLOB transfer enabled".into(),
             ));
         }
@@ -599,7 +599,7 @@ fn handle_element(
             if !msg.is_empty() {
                 let device = get("device");
                 let text = if device.is_empty() { msg } else { format!("{device}: {msg}") };
-                let _ = log_tx.try_send(super::LogEntry::info(text));
+                let _ = log_tx.try_send(crate::LogEntry::info(text));
             }
         }
         _ => {}
@@ -665,10 +665,10 @@ fn push_snapshot(
 fn handle_blob(
     child: &RawChild,
     server_addr: &str,
-    frame_tx: &Sender<super::FrameData>,
+    frame_tx: &Sender<crate::FrameData>,
     cmd_tx: &Sender<IndiCmd>,
     shared: &SharedState,
-    log_tx: &Sender<super::LogEntry>,
+    log_tx: &Sender<crate::LogEntry>,
 ) {
     // INDIGO URL mode: the element carries a `url` (absolute) or `path`
     // (server-relative) attribute and no inline data — fetch raw binary.
@@ -678,7 +678,7 @@ fn handle_blob(
     } else {
         let format = child.attrs.get("format").map(String::as_str).unwrap_or("");
         if !format.contains("fits") {
-            let _ = log_tx.try_send(super::LogEntry::error(format!(
+            let _ = log_tx.try_send(crate::LogEntry::error(format!(
                 "INDI: unsupported BLOB format {format:?} (only FITS is handled)"
             )));
             return;
@@ -690,7 +690,7 @@ fn handle_blob(
             let _ = frame_tx.try_send(frame);
         }
         Err(e) => {
-            let _ = log_tx.try_send(super::LogEntry::error(format!("INDI BLOB decode: {e}")));
+            let _ = log_tx.try_send(crate::LogEntry::error(format!("INDI BLOB decode: {e}")));
         }
     }
     // Live view: an INDI exposure is one-shot, so trigger the next one now.
@@ -755,7 +755,7 @@ fn http_fetch(server_addr: &str, loc: &str) -> Result<Vec<u8>> {
 }
 
 /// Base64 text → FITS → mono `FrameData` (first image HDU).
-fn decode_fits_blob(b64: &str) -> Result<super::FrameData> {
+fn decode_fits_blob(b64: &str) -> Result<crate::FrameData> {
     use base64::Engine;
     // Servers wrap base64 in newlines; strip all whitespace before decoding.
     let cleaned: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
@@ -764,7 +764,7 @@ fn decode_fits_blob(b64: &str) -> Result<super::FrameData> {
 }
 
 /// Raw FITS bytes → mono `FrameData` (first image HDU).
-fn decode_fits_bytes(data: &[u8]) -> Result<super::FrameData> {
+fn decode_fits_bytes(data: &[u8]) -> Result<crate::FrameData> {
     let fits = fitskit::FitsFile::from_bytes(data)?;
     for hdu in fits.iter() {
         let img = match &hdu.data {
@@ -790,7 +790,7 @@ fn decode_fits_bytes(data: &[u8]) -> Result<super::FrameData> {
             else if max_val <= 16383.0 { 14 }
             else { 16 };
         let mono: Vec<u16> = pixels[..npix].iter().map(|&v| v.clamp(0.0, 65535.0).round() as u16).collect();
-        return Ok(super::FrameData::new_u16(mono, width, height, bit_depth));
+        return Ok(crate::FrameData::new_u16(mono, width, height, bit_depth));
     }
     bail!("no image HDU in BLOB")
 }

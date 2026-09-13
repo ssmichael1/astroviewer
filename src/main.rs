@@ -9,6 +9,10 @@ mod colormaps;
 mod fits_source;
 #[cfg(feature = "focus")]
 mod focus;
+#[cfg(all(feature = "focus", has_focuser))]
+mod autofocus;
+#[cfg(has_focuser)]
+mod focuser;
 mod histogram;
 mod imageview;
 mod overlays;
@@ -17,20 +21,10 @@ mod sources;
 mod wcs;
 mod widgets;
 
-#[cfg(feature = "svbony")]
 mod camera;
 
 #[cfg(feature = "gev")]
-mod gev_camera;
-
-#[cfg(feature = "gev")]
 mod gige;
-
-#[cfg(feature = "indi")]
-mod indi_camera;
-
-#[cfg(feature = "toupcam")]
-mod toupcam_camera;
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
@@ -155,26 +149,26 @@ enum CaptureState {
     Fits { _stop_tx: Sender<()> },
     #[cfg(feature = "svbony")]
     SVBony {
-        handle: camera::CameraHandle,
+        handle: camera::svbony::CameraHandle,
         control_values: Vec<(svbony::ControlType, i64, bool)>,
     },
     #[cfg(feature = "gev")]
     Gev {
-        handle: gev_camera::GevHandle,
-        controls: Vec<gev_camera::GevControl>,
+        handle: camera::gev::GevHandle,
+        controls: Vec<camera::gev::GevControl>,
     },
     #[cfg(feature = "toupcam")]
     Toupcam {
         // Boxed: the handle (device info, full model description) and the
         // control mirror are much larger than the other variants.
-        handle: Box<toupcam_camera::ToupHandle>,
-        controls: Box<toupcam_camera::ToupControls>,
+        handle: Box<camera::toupcam::ToupHandle>,
+        controls: Box<camera::toupcam::ToupControls>,
     },
     #[cfg(feature = "indi")]
     Indi {
-        handle: indi_camera::IndiHandle,
+        handle: camera::indi::IndiHandle,
         /// Latest property snapshot from the reader thread.
-        props: Vec<indi_camera::IndiProperty>,
+        props: Vec<camera::indi::IndiProperty>,
         /// Selected INDI device (a server can host several drivers).
         device: String,
         /// Exposure used by the Single/Live capture buttons, in seconds.
@@ -217,6 +211,9 @@ fn default_true() -> bool { true }
 enum FocusPlot {
     Hfr,
     Sharpness,
+    /// HFR against focuser position from the last autofocus run, with its fit.
+    #[cfg(has_focuser)]
+    VCurve,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -282,6 +279,13 @@ struct UiConfig {
     bottom_panel_height: Option<f32>,
     window_size: Option<[f32; 2]>,
     window_pos: Option<[f32; 2]>,
+    /// Reopen the EAF focuser at launch, as it was open at exit.
+    eaf_connect: Option<bool>,
+    af_step: Option<i32>,
+    af_points_per_side: Option<usize>,
+    af_frames_per_point: Option<usize>,
+    af_settle_frames: Option<usize>,
+    af_overshoot: Option<i32>,
 }
 
 impl UiConfig {
@@ -524,6 +528,28 @@ struct ViewerApp {
     log_seen: usize,
     log_rx: Receiver<LogEntry>,
     log_tx: Sender<LogEntry>,
+
+    /// The focuser, if one is connected: an EAF on its own USB cable, or the
+    /// focuser port of the open camera. Independent of the camera source, so
+    /// the Focus tab and the autofocus routine never care which it is.
+    #[cfg(has_focuser)]
+    focuser: Option<focuser::Focuser>,
+    /// EAF focusers found by the last scan, for the side-panel picker.
+    #[cfg(feature = "eaf")]
+    eaf_devices: Vec<focuser::eaf::FocuserInfo>,
+    #[cfg(feature = "eaf")]
+    eaf_selected: usize,
+    /// A scan in progress (the SDK must not be called on the UI thread).
+    #[cfg(feature = "eaf")]
+    eaf_scan: Option<Receiver<Vec<focuser::eaf::FocuserInfo>>>,
+    /// Open the first focuser the startup scan finds, as it was open at exit.
+    #[cfg(feature = "eaf")]
+    eaf_autoconnect: bool,
+    /// The autofocus run in progress, or the last one (kept for its V-curve).
+    #[cfg(all(feature = "focus", has_focuser))]
+    autofocus: Option<autofocus::Autofocus>,
+    #[cfg(all(feature = "focus", has_focuser))]
+    af_cfg: autofocus::AutofocusConfig,
 
     // Background subtraction
     bg_subtract_enabled: bool,
@@ -857,6 +883,20 @@ impl ViewerApp {
             bottom_panel_height: 300.0,
             window_geometry: None,
             log, log_rx, log_tx,
+            #[cfg(has_focuser)]
+            focuser: None,
+            #[cfg(feature = "eaf")]
+            eaf_devices: Vec::new(),
+            #[cfg(feature = "eaf")]
+            eaf_selected: 0,
+            #[cfg(feature = "eaf")]
+            eaf_scan: None,
+            #[cfg(feature = "eaf")]
+            eaf_autoconnect: false,
+            #[cfg(all(feature = "focus", has_focuser))]
+            autofocus: None,
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_cfg: autofocus::AutofocusConfig::default(),
             log_seen: 0,
             bg_subtract_enabled: false,
             bg_percentile: 0.35,
@@ -879,7 +919,16 @@ impl ViewerApp {
 
         #[cfg(feature = "starsolve")]
         app.load_config();
-        app.apply_ui_config(&UiConfig::load());
+        let ui_cfg = UiConfig::load();
+        app.apply_ui_config(&ui_cfg);
+
+        // A focuser is its own device: reopen it if it was open last time.
+        // The scan runs on its own thread; the connect follows when it lands.
+        #[cfg(feature = "eaf")]
+        {
+            app.eaf_autoconnect = ui_cfg.eaf_connect == Some(true);
+            app.refresh_eaf_devices();
+        }
 
         // Startup source precedence: an explicit CLI descriptor (or bare FITS
         // path) wins; otherwise reconnect to the last source used; otherwise
@@ -936,6 +985,14 @@ impl ViewerApp {
         if let Some(h) = cfg.bottom_panel_height.filter(|h| (120.0..=900.0).contains(h)) {
             self.bottom_panel_height = h;
         }
+        #[cfg(all(feature = "focus", has_focuser))]
+        {
+            if let Some(v) = cfg.af_step.filter(|v| *v > 0) { self.af_cfg.step = v; }
+            if let Some(v) = cfg.af_points_per_side.filter(|v| (1..=20).contains(v)) { self.af_cfg.points_per_side = v; }
+            if let Some(v) = cfg.af_frames_per_point.filter(|v| (1..=20).contains(v)) { self.af_cfg.frames_per_point = v; }
+            if let Some(v) = cfg.af_settle_frames.filter(|v| *v <= 10) { self.af_cfg.settle_frames = v; }
+            if let Some(v) = cfg.af_overshoot.filter(|v| *v >= 0) { self.af_cfg.overshoot = v; }
+        }
     }
 
     fn ui_config(&self) -> UiConfig {
@@ -955,6 +1012,30 @@ impl ViewerApp {
             bottom_panel_height: Some(self.bottom_panel_height),
             window_size: self.window_geometry.map(|(size, _)| size),
             window_pos: self.window_geometry.map(|(_, pos)| pos),
+            #[cfg(feature = "eaf")]
+            eaf_connect: Some(self.focuser.as_ref().is_some_and(|f| !f.is_camera_bound())),
+            #[cfg(not(feature = "eaf"))]
+            eaf_connect: None,
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_step: Some(self.af_cfg.step),
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_points_per_side: Some(self.af_cfg.points_per_side),
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_frames_per_point: Some(self.af_cfg.frames_per_point),
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_settle_frames: Some(self.af_cfg.settle_frames),
+            #[cfg(all(feature = "focus", has_focuser))]
+            af_overshoot: Some(self.af_cfg.overshoot),
+            #[cfg(not(all(feature = "focus", has_focuser)))]
+            af_step: None,
+            #[cfg(not(all(feature = "focus", has_focuser)))]
+            af_points_per_side: None,
+            #[cfg(not(all(feature = "focus", has_focuser)))]
+            af_frames_per_point: None,
+            #[cfg(not(all(feature = "focus", has_focuser)))]
+            af_settle_frames: None,
+            #[cfg(not(all(feature = "focus", has_focuser)))]
+            af_overshoot: None,
         }
     }
 
@@ -1614,7 +1695,7 @@ impl ViewerApp {
     fn pause_or_stop(&mut self) {
         #[cfg(feature = "gev")]
         if let CaptureState::Gev { handle, .. } = &self.capture_state {
-            let _ = handle.cmd_tx.send(gev_camera::GevCmd::Pause);
+            let _ = handle.cmd_tx.send(camera::gev::GevCmd::Pause);
             self.capture_running = false;
             self.frame_times.clear();
             self.fps = 0.0;
@@ -1634,7 +1715,7 @@ impl ViewerApp {
         }
         #[cfg(feature = "gev")]
         if let CaptureState::Gev { handle, .. } = &self.capture_state {
-            let _ = handle.cmd_tx.send(gev_camera::GevCmd::Resume);
+            let _ = handle.cmd_tx.send(camera::gev::GevCmd::Resume);
             self.capture_running = true;
             return;
         }
@@ -1647,7 +1728,7 @@ impl ViewerApp {
             CaptureState::Fits { _stop_tx } => {}
             #[cfg(feature = "svbony")]
             CaptureState::SVBony { mut handle, .. } => {
-                let _ = handle.cmd_tx.send(camera::CameraCmd::Stop);
+                let _ = handle.cmd_tx.send(camera::svbony::CameraCmd::Stop);
                 // Wait for capture thread to finish so the SDK cleans up before we drop
                 if let Some(jh) = handle.join_handle.take() {
                     let _ = jh.join();
@@ -1659,7 +1740,13 @@ impl ViewerApp {
             }
             #[cfg(feature = "toupcam")]
             CaptureState::Toupcam { mut handle, .. } => {
-                let _ = handle.cmd_tx.send(toupcam_camera::ToupCmd::Stop);
+                // A focuser on the camera's port goes with the camera.
+                if self.focuser.as_ref().is_some_and(|f| f.is_camera_bound()) {
+                    #[cfg(feature = "focus")]
+                    { self.autofocus = None; }
+                    self.focuser = None;
+                }
+                let _ = handle.cmd_tx.send(camera::toupcam::ToupCmd::Stop);
                 // Wait for the capture thread so the SDK closes cleanly before drop.
                 if let Some(jh) = handle.join_handle.take() {
                     let _ = jh.join();
@@ -1809,7 +1896,7 @@ impl ViewerApp {
         self.stop_capture();
         self.camera_error = None;
 
-        match camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+        match camera::svbony::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
                 let control_values: Vec<_> = handle.controls.iter().zip(handle.initial_values.iter())
                     .map(|(caps, &(val, auto))| (caps.control_type, val, auto))
@@ -1834,10 +1921,21 @@ impl ViewerApp {
         self.stop_capture();
         self.camera_error = None;
 
-        match toupcam_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
-            Ok((handle, controls)) => {
+        match camera::toupcam::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+            Ok((handle, mut controls)) => {
                 self.add_log(LogEntry::info(format!("Camera opened: {}", info.display_name)));
                 let id = info.id.clone();
+                // The camera's focuser port becomes the app's focuser unless
+                // a standalone focuser is already connected.
+                if let Some(state) = controls.focuser.take() {
+                    if self.focuser.is_none() {
+                        let (driver, initial) = focuser::toupcam::ToupFocuserDriver::new(handle.cmd_tx.clone(), &state);
+                        self.focuser = Some(focuser::Focuser::new(Box::new(driver), initial));
+                        self.add_log(LogEntry::info(format!("Focuser: camera focuser port at {}", state.position)));
+                    } else {
+                        self.add_log(LogEntry::info("Camera has a focuser port; keeping the connected focuser".into()));
+                    }
+                }
                 self.capture_state = CaptureState::Toupcam { handle: Box::new(handle), controls: Box::new(controls) };
                 self.camera_source = CameraSource::Toupcam(id);
                 self.capture_running = true;
@@ -1852,11 +1950,11 @@ impl ViewerApp {
     }
 
     #[cfg(feature = "gev")]
-    fn start_gev(&mut self, info: &gev_camera::GevDeviceInfo) {
+    fn start_gev(&mut self, info: &camera::gev::GevDeviceInfo) {
         self.stop_capture();
         self.camera_error = None;
 
-        match gev_camera::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
+        match camera::gev::start_camera(info, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
                 let controls = handle.controls.clone();
                 self.frame_pool_return = Some(handle.buffer_return.clone());
@@ -1896,7 +1994,7 @@ impl ViewerApp {
                 #[cfg(feature = "gev")]
                 if let CameraSource::Gev(id) = &source {
                     if let Ok(ip) = id.parse::<std::net::Ipv4Addr>() {
-                        self.start_gev(&gev_camera::GevDeviceInfo {
+                        self.start_gev(&camera::gev::GevDeviceInfo {
                             ip,
                             model: String::new(),
                             manufacturer: String::new(),
@@ -1945,9 +2043,9 @@ impl ViewerApp {
         let addr = addr.trim().to_string();
         let (host, port) = match addr.rsplit_once(':') {
             Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
-            _ => (addr.clone(), indi_camera::DEFAULT_PORT),
+            _ => (addr.clone(), camera::indi::DEFAULT_PORT),
         };
-        match indi_camera::start_client(&host, port, self.frame_tx.clone(), self.log_tx.clone()) {
+        match camera::indi::start_client(&host, port, self.frame_tx.clone(), self.log_tx.clone()) {
             Ok(handle) => {
                 self.add_log(LogEntry::info(format!("INDI: connected to {host}:{port}")));
                 self.capture_state = CaptureState::Indi {
@@ -2054,12 +2152,19 @@ impl ViewerApp {
                 if let (Some(fw), Some(p)) = (controls.filter_wheel.as_mut(), t.filter_position) {
                     fw.position = (p >= 0).then_some(p as u32);
                 }
-                if let Some(f) = controls.focuser.as_mut() {
-                    if let Some(p) = t.focuser_position { f.position = p; }
-                    if let Some(m) = t.focuser_moving { f.moving = m; }
+                // The camera's focuser port reports through the camera
+                // telemetry; fold it into the app's focuser slot.
+                if let Some(f) = self.focuser.as_mut().filter(|f| f.is_camera_bound()) {
+                    if let (Some(p), Some(m)) = (t.focuser_position, t.focuser_moving) {
+                        f.apply(focuser::FocuserTelemetry { position: p, moving: m, ..Default::default() });
+                    }
                 }
             }
         }
+        #[cfg(feature = "eaf")]
+        self.poll_eaf_scan();
+        #[cfg(has_focuser)]
+        self.poll_focuser();
         // Refresh INDI property snapshots; default the device picker to the
         // first device with a CONNECTION property (skipping e.g. INDIGO's
         // virtual "Server" device).
@@ -2071,7 +2176,7 @@ impl ViewerApp {
             if device.is_empty() {
                 if let Some(p) = props
                     .iter()
-                    .find(|p| p.name == indi_camera::PROP_CONNECTION)
+                    .find(|p| p.name == camera::indi::PROP_CONNECTION)
                     .or(props.first())
                 {
                     *device = p.device.clone();
@@ -2095,13 +2200,9 @@ impl ViewerApp {
                 self.last_centroids = out.centroids;
                 #[cfg(feature = "focus")]
                 if let Some(sample) = out.focus {
-                    #[allow(unused_mut)]
-                    let mut focuser_pos: Option<i32> = None;
-                    #[cfg(feature = "toupcam")]
-                    if let CaptureState::Toupcam { ref controls, .. } = self.capture_state {
-                        focuser_pos = controls.focuser.as_ref().map(|f| f.position);
-                    }
-                    self.focus_history.push(&sample, focuser_pos);
+                    self.focus_history.push(&sample, out.focuser.map(|(p, _)| p));
+                    #[cfg(has_focuser)]
+                    self.autofocus_sample(out.focuser, sample.hfr_px);
                     self.focus_last = Some(sample);
                 }
                 if let Some(result) = out.solve {
@@ -2340,6 +2441,12 @@ impl ViewerApp {
         });
 
         ui.add_space(4.0);
+
+        #[cfg(has_focuser)]
+        {
+            self.focuser_section(ui);
+            ui.add_space(4.0);
+        }
 
         section(ui, "Display", &pal, |ui| {
             let cmap_options: Vec<(ColormapKind, &str)> = ColormapKind::ALL.iter().map(|&k| (k, k.name())).collect();
@@ -2884,7 +2991,7 @@ impl ViewerApp {
     /// listed stay at their SDK defaults.
     #[cfg(feature = "toupcam")]
     fn toupcam_controls_content(&mut self, ui: &mut egui::Ui) {
-        use toupcam_camera::{CorrectionAction, ToupCmd};
+        use camera::toupcam::{CorrectionAction, ToupCmd};
         let pal = self.pal();
         let log_tx = self.log_tx.clone();
         let CaptureState::Toupcam { ref handle, ref mut controls } = self.capture_state else { return };
@@ -3157,7 +3264,7 @@ impl ViewerApp {
 
         // ── Advanced: curated, capability-gated SDK options ─────────────────
         if !controls.advanced.is_empty() {
-            use toupcam_camera::AdvKind;
+            use camera::toupcam::AdvKind;
             ui.add_space(6.0);
             egui::CollapsingHeader::new(
                 egui::RichText::new("Advanced").strong().color(pal.accent),
@@ -3347,36 +3454,8 @@ impl ViewerApp {
             });
         }
 
-        // ── Astro auto-focuser ───────────────────────────────────────────────
-        if let Some(f) = controls.focuser.as_mut() {
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new(
-                egui::RichText::new("Focuser").strong().color(pal.accent),
-            )
-            .default_open(true)
-            .show(ui, |ui| {
-                egui::Grid::new("toup_focuser").num_columns(4).spacing([6.0, 8.0]).show(ui, |ui| {
-                    ctrl_label(ui, label_w, "Position");
-                    let pos_text = if f.moving {
-                        format!("{} (moving)", f.position)
-                    } else {
-                        f.position.to_string()
-                    };
-                    ui.label(egui::RichText::new(pos_text).monospace().size(12.0));
-                    ui.end_row();
-
-                    ctrl_label(ui, label_w, "Target");
-                    ui.add(egui::DragValue::new(&mut f.target).range(0..=f.max_step).speed(10));
-                    if ui.button("Move").clicked() {
-                        let _ = handle.cmd_tx.send(ToupCmd::SetFocuserPosition(f.target));
-                    }
-                    if ui.button("Halt").clicked() {
-                        let _ = handle.cmd_tx.send(ToupCmd::FocuserHalt);
-                    }
-                    ui.end_row();
-                });
-            });
-        }
+        // The focuser port is driven from the side panel's Focuser section,
+        // through the app's backend-agnostic focuser slot.
 
         // ── ST4 autoguider port: manual pulse for cable/mount testing ───────
         if controls.has_st4 {
@@ -3448,7 +3527,7 @@ impl ViewerApp {
     /// the capture thread pushes a fresh snapshot.
     #[cfg(feature = "gev")]
     fn gev_controls_content(&mut self, ui: &mut egui::Ui) {
-        use gev_camera::{GevCmd, GevControlKind};
+        use camera::gev::{GevCmd, GevControlKind};
         let pal = self.pal();
         if !matches!(self.capture_state, CaptureState::Gev { .. }) { return }
 
@@ -3466,7 +3545,7 @@ impl ViewerApp {
         });
         let filter = self.gev_filter.trim().to_lowercase();
         let filtering = !filter.is_empty();
-        let matches = |c: &gev_camera::GevControl| {
+        let matches = |c: &camera::gev::GevControl| {
             !filtering
                 || c.display.to_lowercase().contains(&filter)
                 || c.name.to_lowercase().contains(&filter)
@@ -3667,7 +3746,7 @@ impl ViewerApp {
     /// collapsible-grid pattern as the GigE panel.
     #[cfg(feature = "indi")]
     fn indi_controls_content(&mut self, ui: &mut egui::Ui) {
-        use indi_camera::{BlobMode, IndiCmd, IndiProperty, IndiValue, PropState};
+        use camera::indi::{BlobMode, IndiCmd, IndiProperty, IndiValue, PropState};
         let pal = self.pal();
         if !matches!(self.capture_state, CaptureState::Indi { .. }) { return }
 
@@ -3719,7 +3798,7 @@ impl ViewerApp {
             // INDIGO (protocol 2.0) CONNECTED/DISCONNECTED — read them from
             // the property definition instead of assuming.
             let conn = props.iter().find(|p| {
-                p.device == *device && p.name == indi_camera::PROP_CONNECTION
+                p.device == *device && p.name == camera::indi::PROP_CONNECTION
             });
             let connected = conn.is_some_and(|p| {
                 p.elements.iter().any(|el| {
@@ -3740,7 +3819,7 @@ impl ViewerApp {
                 if ui.small_button("Disconnect").clicked() {
                     let _ = handle.cmd_tx.send(IndiCmd::SetSwitch {
                         device: device.clone(),
-                        property: indi_camera::PROP_CONNECTION.to_string(),
+                        property: camera::indi::PROP_CONNECTION.to_string(),
                         values: vec![(on_item.into(), false), (off_item.into(), true)],
                     });
                 }
@@ -3784,7 +3863,7 @@ impl ViewerApp {
             }
             let exposing = props.iter().any(|p| {
                 p.device == *device
-                    && p.name == indi_camera::PROP_EXPOSURE
+                    && p.name == camera::indi::PROP_EXPOSURE
                     && p.state == PropState::Busy
             });
             if exposing {
@@ -3807,7 +3886,7 @@ impl ViewerApp {
         for group in &groups {
             if !props.iter().any(|p| {
                 p.device == *device && &p.group == group
-                    && p.name != indi_camera::PROP_CONNECTION && matches(p)
+                    && p.name != camera::indi::PROP_CONNECTION && matches(p)
             }) {
                 continue;
             }
@@ -3827,7 +3906,7 @@ impl ViewerApp {
                     .show(ui, |ui| {
                         for prop in props.iter_mut().filter(|p| {
                             p.device == *device && &p.group == group
-                                && p.name != indi_camera::PROP_CONNECTION
+                                && p.name != camera::indi::PROP_CONNECTION
                         }) {
                             if !matches(prop) { continue }
                             indi_property_rows(ui, prop, &handle.cmd_tx, &pal);
@@ -3842,7 +3921,7 @@ impl ViewerApp {
         ui: &mut egui::Ui,
         caps: &svbony::ControlCaps,
         cv: &mut (svbony::ControlType, i64, bool),
-        cmd_tx: &Sender<camera::CameraCmd>,
+        cmd_tx: &Sender<camera::svbony::CameraCmd>,
         label_w: f32,
         slider_w: f32,
         value_w: f32,
@@ -3942,7 +4021,7 @@ impl ViewerApp {
         }
 
         if cv.1 != old_val || cv.2 != old_auto {
-            let _ = cmd_tx.send(camera::CameraCmd::SetControl(cv.0, cv.1, cv.2));
+            let _ = cmd_tx.send(camera::svbony::CameraCmd::SetControl(cv.0, cv.1, cv.2));
         }
     }
 
@@ -4347,7 +4426,12 @@ impl ViewerApp {
             ui.separator();
             widgets::tip(ui, "HFR: half flux radius of the brightest stars, smaller is better. Sharpness: whole-frame contrast, larger is better; useful far from focus when no stars are detected.", |ui| {
                 widgets::combo_box(ui, "focus_plot", "Plot", &mut self.focus_plot,
-                    &[(FocusPlot::Hfr, "HFR"), (FocusPlot::Sharpness, "Sharpness")], &pal);
+                    &[
+                        (FocusPlot::Hfr, "HFR"),
+                        (FocusPlot::Sharpness, "Sharpness"),
+                        #[cfg(has_focuser)]
+                        (FocusPlot::VCurve, "V-curve"),
+                    ], &pal);
             });
             ui.separator();
             // Pipeline state, so a silent readout explains itself.
@@ -4364,6 +4448,8 @@ impl ViewerApp {
                 ui.label(egui::RichText::new(text).color(color));
             }
         });
+        #[cfg(has_focuser)]
+        self.autofocus_bar(ui);
         ui.add_space(4.0);
 
         let latest = self.focus_history.latest().copied();
@@ -4428,6 +4514,11 @@ impl ViewerApp {
             ui.separator();
 
             // ── Trend plot ──────────────────────────────────────────────────
+            #[cfg(has_focuser)]
+            if self.focus_plot == FocusPlot::VCurve {
+                self.vcurve_plot(ui);
+                return;
+            }
             let (points, best_line, y_label): (Vec<[f64; 2]>, Option<f64>, &str) = match self.focus_plot {
                 FocusPlot::Hfr => (
                     self.focus_history.iter().filter_map(|p| p.hfr_px.map(|h| [p.t, h as f64])).collect(),
@@ -4439,6 +4530,8 @@ impl ViewerApp {
                     None,
                     "Sharpness",
                 ),
+                #[cfg(has_focuser)]
+                FocusPlot::VCurve => unreachable!(),
             };
             let plot_height = ui.available_height().max(60.0);
             egui_plot::Plot::new("focus_trend")
@@ -4459,6 +4552,131 @@ impl ViewerApp {
                     }
                 });
         });
+    }
+
+    /// The autofocus row of the Focus tab: sweep parameters, Start/Abort,
+    /// and the run's status.
+    #[cfg(all(feature = "focus", has_focuser))]
+    fn autofocus_bar(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let running = self.autofocus.as_ref().is_some_and(|a| a.is_running());
+        let can_start = self.focuser.is_some() && self.solve_enabled && !running;
+        let mut start = false;
+        let mut abort = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Autofocus").strong().color(pal.accent));
+            ui.add_enabled_ui(!running, |ui| {
+                let field = |ui: &mut egui::Ui, tip: &str, label: &str, dv: egui::DragValue<'_>| {
+                    widgets::tip(ui, tip, |ui| {
+                        ui.label(egui::RichText::new(label).color(pal.text_secondary));
+                        ui.add(dv);
+                    });
+                };
+                field(ui, "Focuser steps between sweep points. Aim for the HFR to roughly double from the centre to the ends of the sweep.", "Step",
+                    egui::DragValue::new(&mut self.af_cfg.step).range(1..=100_000).speed(10));
+                field(ui, "Sweep points each side of the current position.", "Points/side",
+                    egui::DragValue::new(&mut self.af_cfg.points_per_side).range(1..=20));
+                field(ui, "Frames measured at each point; their median is used.", "Frames/pt",
+                    egui::DragValue::new(&mut self.af_cfg.frames_per_point).range(1..=20));
+                field(ui, "Frames discarded after each move, so a frame partly exposed while the motor was turning is not measured. Raise this for long exposures.", "Settle",
+                    egui::DragValue::new(&mut self.af_cfg.settle_frames).range(0..=10));
+                field(ui, "Backlash margin: every position is approached from this many steps below, moving upward, so play in the drive cancels out.", "Overshoot",
+                    egui::DragValue::new(&mut self.af_cfg.overshoot).range(0..=100_000).speed(10));
+            });
+            ui.separator();
+            if running {
+                if widgets::tip(ui, "Stop the run and return the focuser to where it started", |ui| widgets::styled_button(ui, "Abort", &pal)) {
+                    abort = true;
+                }
+            } else {
+                ui.add_enabled_ui(can_start, |ui| {
+                    if widgets::tip(ui, "Sweep the focuser through the range, fit the V-curve, and move to its minimum", |ui| widgets::primary_button(ui, "Start", &pal)) {
+                        start = true;
+                    }
+                });
+            }
+            let (text, color) = if self.focuser.is_none() {
+                ("Connect a focuser in the side panel".to_string(), pal.status_warn)
+            } else if !self.solve_enabled && !running {
+                ("Needs Solve on".to_string(), pal.status_warn)
+            } else if let Some(af) = &self.autofocus {
+                let (done, total) = af.progress();
+                let color = match af.outcome() {
+                    Some(autofocus::Outcome::Focused { .. }) => pal.status_ok,
+                    Some(_) => pal.status_warn,
+                    None => pal.text_primary,
+                };
+                let text = if af.is_running() && !af.status().starts_with("Verifying") && !af.status().starts_with("Moving to focus") {
+                    format!("{} \u{2014} {done}/{total}", af.status())
+                } else {
+                    af.status().to_string()
+                };
+                (text, color)
+            } else {
+                (String::new(), pal.text_secondary)
+            };
+            if !text.is_empty() {
+                ui.label(egui::RichText::new(text).color(color));
+            }
+        });
+        if start {
+            self.start_autofocus();
+        }
+        if abort {
+            self.abort_autofocus();
+        }
+    }
+
+    /// HFR against focuser position: the sweep points, the fitted hyperbola,
+    /// its minimum, and where the focuser is now.
+    #[cfg(all(feature = "focus", has_focuser))]
+    fn vcurve_plot(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let good = pal.status_ok;
+        let Some(af) = self.autofocus.as_ref() else {
+            ui.label(egui::RichText::new("No autofocus run yet").color(pal.text_secondary));
+            return;
+        };
+        let pts: Vec<[f64; 2]> = af.points().iter().map(|p| [p.position as f64, p.hfr as f64]).collect();
+        let fit = af.fit().copied();
+        let fit_line: Option<Vec<[f64; 2]>> = fit.and_then(|f| {
+            let lo = af.points().iter().map(|p| p.position).min()? as f64;
+            let hi = af.points().iter().map(|p| p.position).max()? as f64;
+            let n = 100;
+            Some((0..=n).map(|i| {
+                let x = lo + (hi - lo) * i as f64 / n as f64;
+                [x, f.eval(x)]
+            }).collect())
+        });
+        let current = self.focuser.as_ref().map(|f| f.position as f64);
+        let target = af.current_target().map(|t| t as f64);
+        let plot_height = ui.available_height().max(60.0);
+        egui_plot::Plot::new("focus_vcurve")
+            .height(plot_height)
+            .y_axis_label("HFR (px)")
+            .x_axis_label("Focuser position")
+            .show_axes([true, true])
+            .allow_drag(false).allow_zoom(false).allow_scroll(false).allow_boxed_zoom(false)
+            .show_grid([true, true])
+            .include_y(0.0)
+            .set_margin_fraction(egui::vec2(0.05, 0.1))
+            .show(ui, |plot_ui| {
+                if let Some(line) = fit_line {
+                    plot_ui.line(egui_plot::Line::new("fit", egui_plot::PlotPoints::from(line)).color(pal.plot_line).width(1.5));
+                }
+                if let Some(f) = fit {
+                    plot_ui.vline(egui_plot::VLine::new("minimum", f.vertex).color(good).width(1.0).style(egui_plot::LineStyle::dashed_dense()));
+                }
+                if let Some(t) = target.filter(|_| af.is_running()) {
+                    plot_ui.vline(egui_plot::VLine::new("target", t).color(pal.text_secondary).width(1.0).style(egui_plot::LineStyle::dotted_dense()));
+                }
+                if let Some(c) = current {
+                    plot_ui.vline(egui_plot::VLine::new("focuser", c).color(pal.accent).width(1.0));
+                }
+                if !pts.is_empty() {
+                    plot_ui.points(egui_plot::Points::new("HFR", egui_plot::PlotPoints::from(pts)).radius(4.0).color(pal.accent));
+                }
+            });
     }
 
     fn log_content(&mut self, ui: &mut egui::Ui) {
@@ -4521,11 +4739,11 @@ fn fmt_gev_float(v: f64) -> String {
 #[cfg(feature = "indi")]
 fn indi_property_rows(
     ui: &mut egui::Ui,
-    prop: &mut indi_camera::IndiProperty,
-    cmd_tx: &Sender<indi_camera::IndiCmd>,
+    prop: &mut camera::indi::IndiProperty,
+    cmd_tx: &Sender<camera::indi::IndiCmd>,
     pal: &widgets::Palette,
 ) {
-    use indi_camera::{IndiCmd, IndiValue, PropPerm, PropState, SwitchRule};
+    use camera::indi::{IndiCmd, IndiValue, PropPerm, PropState, SwitchRule};
 
     let writable = prop.perm != PropPerm::Ro;
     let state_dot = |ui: &mut egui::Ui, state: PropState| {
@@ -4701,9 +4919,9 @@ fn indi_property_rows(
 /// All switch elements of a property as (name, on) pairs — INDI switch writes
 /// send the full vector so the driver can apply its rule atomically.
 #[cfg(feature = "indi")]
-fn indi_switch_payload(prop: &indi_camera::IndiProperty) -> Vec<(String, bool)> {
+fn indi_switch_payload(prop: &camera::indi::IndiProperty) -> Vec<(String, bool)> {
     prop.elements.iter().filter_map(|el| match el.value {
-        indi_camera::IndiValue::Switch(on) => Some((el.name.clone(), on)),
+        camera::indi::IndiValue::Switch(on) => Some((el.name.clone(), on)),
         _ => None,
     }).collect()
 }
@@ -4819,6 +5037,10 @@ impl eframe::App for ViewerApp {
         #[cfg(feature = "starsolve")]
         self.save_config();
         self.ui_config().save();
+        #[cfg(has_focuser)]
+        if let Some(mut f) = self.focuser.take() {
+            f.stop();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4850,6 +5072,10 @@ impl eframe::App for ViewerApp {
         // this slow tick only keeps telemetry, logs, and INDI property updates
         // flowing between frames.
         if self.capture_running { ctx.request_repaint_after(std::time::Duration::from_millis(200)); }
+        #[cfg(has_focuser)]
+        if self.focuser.as_ref().is_some_and(|f| f.moving) { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
+        #[cfg(feature = "eaf")]
+        if self.eaf_scan.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
         // Keep repainting while the database builds so the elapsed timer ticks
         // and completion is detected promptly.
         #[cfg(feature = "starsolve")]
@@ -5393,6 +5619,10 @@ struct SolveJob {
     /// Focus measurement to run on this frame's centroids.
     #[cfg(feature = "focus")]
     focus: Option<focus::FocusConfig>,
+    /// Focuser `(position, moving)` when this frame was dispatched, so the
+    /// measurement comes back tagged with where the focuser was.
+    #[cfg(feature = "focus")]
+    focuser: Option<(i32, bool)>,
 }
 
 /// Solver inputs, snapshotted on the UI thread at dispatch time.
@@ -5414,6 +5644,8 @@ struct SolveOutput {
     solve: Option<tetra3::SolveResult>,
     #[cfg(feature = "focus")]
     focus: Option<focus::FocusSample>,
+    #[cfg(feature = "focus")]
+    focuser: Option<(i32, bool)>,
 }
 
 /// Long-lived worker running extraction and solving off the UI thread. One
@@ -5501,6 +5733,8 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
                 solve,
                 #[cfg(feature = "focus")]
                 focus,
+                #[cfg(feature = "focus")]
+                focuser: job.focuser,
             };
             if out_tx.send(out).is_err() {
                 break;
@@ -5508,6 +5742,278 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
         }
     });
     (job_tx, out_rx)
+}
+
+#[cfg(has_focuser)]
+enum FocuserUiAction {
+    #[cfg(feature = "eaf")]
+    Refresh,
+    #[cfg(feature = "eaf")]
+    Connect(usize),
+    Disconnect,
+}
+
+// ── Focuser and autofocus ───────────────────────────────────────────────────
+#[cfg(has_focuser)]
+impl ViewerApp {
+    /// Focuser `(position, moving)` for tagging a frame at dispatch time.
+    #[cfg(feature = "focus")]
+    fn focuser_snapshot(&self) -> Option<(i32, bool)> {
+        self.focuser.as_ref().map(|f| (f.position, f.moving))
+    }
+
+    /// Pull the focuser's latest state and let a running autofocus see it.
+    fn poll_focuser(&mut self) {
+        let Some(f) = self.focuser.as_mut() else { return };
+        f.poll();
+        #[cfg(feature = "focus")]
+        {
+            let (p, m) = (f.position, f.moving);
+            self.autofocus_telemetry(p, m);
+        }
+    }
+
+    #[cfg(feature = "eaf")]
+    fn refresh_eaf_devices(&mut self) {
+        if self.eaf_scan.is_none() {
+            self.eaf_scan = Some(focuser::eaf::scan());
+        }
+    }
+
+    /// Collect a finished scan, and make the startup auto-connect if one is owed.
+    #[cfg(feature = "eaf")]
+    fn poll_eaf_scan(&mut self) {
+        let Some(rx) = self.eaf_scan.as_ref() else { return };
+        let list = match rx.try_recv() {
+            Ok(list) => list,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.eaf_scan = None;
+        self.eaf_devices = list;
+        self.eaf_selected = self.eaf_selected.min(self.eaf_devices.len().saturating_sub(1));
+        if std::mem::take(&mut self.eaf_autoconnect) && self.focuser.is_none() && !self.eaf_devices.is_empty() {
+            self.add_log(LogEntry::info("Reconnecting focuser".into()));
+            self.connect_eaf(0);
+        }
+    }
+
+    #[cfg(feature = "eaf")]
+    fn connect_eaf(&mut self, index: usize) {
+        let Some(info) = self.eaf_devices.get(index).cloned() else { return };
+        self.disconnect_focuser();
+        match focuser::eaf::start(&info, self.log_tx.clone()) {
+            Ok((driver, initial)) => {
+                self.add_log(LogEntry::info(format!("Focuser opened: {} at {}", info.name, initial.position)));
+                self.focuser = Some(focuser::Focuser::new(Box::new(driver), initial));
+            }
+            Err(e) => self.add_log(LogEntry::error(format!("Failed to open focuser {}: {e}", info.name))),
+        }
+    }
+
+    /// Close the focuser, whatever backend it is. A camera-bound focuser is
+    /// released here too; the camera itself stays open.
+    fn disconnect_focuser(&mut self) {
+        let Some(mut f) = self.focuser.take() else { return };
+        #[cfg(feature = "focus")]
+        if self.autofocus.as_ref().is_some_and(|a| a.is_running()) {
+            f.halt();
+            self.autofocus = None;
+            self.add_log(LogEntry::warn("Autofocus cancelled: focuser disconnected".into()));
+        }
+        f.stop();
+        self.add_log(LogEntry::info(format!("Focuser closed: {}", f.name())));
+    }
+
+    #[cfg(feature = "focus")]
+    fn autofocus_telemetry(&mut self, position: i32, moving: bool) {
+        let Some(af) = self.autofocus.as_mut() else { return };
+        if !af.is_running() { return; }
+        let actions = af.on_telemetry(position, moving);
+        self.run_autofocus_actions(actions);
+    }
+
+    #[cfg(feature = "focus")]
+    fn autofocus_sample(&mut self, focuser: Option<(i32, bool)>, hfr: Option<f32>) {
+        let Some(af) = self.autofocus.as_mut() else { return };
+        if !af.is_running() { return; }
+        let (pos, moving) = match focuser {
+            Some((p, m)) => (Some(p), m),
+            None => (None, false),
+        };
+        let actions = af.on_sample(pos, moving, hfr);
+        self.run_autofocus_actions(actions);
+    }
+
+    #[cfg(feature = "focus")]
+    fn run_autofocus_actions(&mut self, actions: Vec<autofocus::Action>) {
+        for a in actions {
+            match a {
+                autofocus::Action::MoveTo(p) => {
+                    if let Some(f) = self.focuser.as_mut() {
+                        f.move_to(p);
+                        f.target = p;
+                    }
+                }
+                autofocus::Action::Halt => {
+                    if let Some(f) = self.focuser.as_mut() {
+                        f.halt();
+                    }
+                }
+                autofocus::Action::Log(msg) => self.add_log(LogEntry::info(msg)),
+                autofocus::Action::Finished => {
+                    // The trend and best-so-far belong to the new position.
+                    self.focus_history.reset();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "focus")]
+    fn start_autofocus(&mut self) {
+        let Some(f) = self.focuser.as_ref() else { return };
+        if !self.solve_enabled {
+            self.add_log(LogEntry::warn("Autofocus needs Solve enabled (Plate Solve tab)".into()));
+            return;
+        }
+        if f.moving {
+            self.add_log(LogEntry::warn("Autofocus: wait for the focuser to stop".into()));
+            return;
+        }
+        match autofocus::Autofocus::start(self.af_cfg, f.position, f.max_step()) {
+            Ok(mut af) => {
+                let actions = af.begin();
+                self.autofocus = Some(af);
+                self.focus_plot = FocusPlot::VCurve;
+                self.run_autofocus_actions(actions);
+            }
+            Err(e) => self.add_log(LogEntry::error(format!("Autofocus: {e}"))),
+        }
+    }
+
+    #[cfg(feature = "focus")]
+    fn abort_autofocus(&mut self) {
+        if let Some(af) = self.autofocus.as_mut() {
+            let actions = af.abort();
+            self.run_autofocus_actions(actions);
+        }
+    }
+
+    /// Side-panel Focuser section: a device picker when nothing is open;
+    /// otherwise position, a target field with Move/Halt, and jog buttons.
+    fn focuser_section(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal();
+        let mut action: Option<FocuserUiAction> = None;
+        section(ui, "Focuser", &pal, |ui| {
+            let label_w = 65.0;
+            match self.focuser.as_mut() {
+                None => {
+                    #[cfg(feature = "eaf")]
+                    {
+                        let names: Vec<String> = self.eaf_devices.iter().map(|d| format!("{} #{}", d.name, d.id)).collect();
+                        let opts: Vec<(usize, &str)> = names.iter().enumerate().map(|(i, n)| (i, n.as_str())).collect();
+                        let scanning = self.eaf_scan.is_some();
+                        ui.horizontal(|ui| {
+                            if scanning {
+                                ui.label(egui::RichText::new("Scanning\u{2026}").color(pal.text_secondary));
+                            } else if opts.is_empty() {
+                                ui.label(egui::RichText::new("No EAF found").color(pal.text_secondary));
+                            } else {
+                                widgets::combo_box(ui, "eaf_pick", "", &mut self.eaf_selected, &opts, &pal);
+                                if widgets::tip(ui, "Open the selected focuser", |ui| widgets::styled_button(ui, "Open", &pal)) {
+                                    action = Some(FocuserUiAction::Connect(self.eaf_selected));
+                                }
+                            }
+                            ui.add_enabled_ui(!scanning, |ui| {
+                                if widgets::tip(ui, "Scan USB again for EAF focusers", |ui| widgets::styled_button(ui, "Refresh", &pal)) {
+                                    action = Some(FocuserUiAction::Refresh);
+                                }
+                            });
+                        });
+                    }
+                    #[cfg(not(feature = "eaf"))]
+                    ui.label(egui::RichText::new("None. A ToupTek camera's focuser port appears here when the camera is opened.").color(pal.text_secondary).small());
+                }
+                Some(f) => {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(f.name()).size(13.0).color(pal.accent));
+                        if let Some(t) = f.temperature_c {
+                            widgets::tip(ui, "Temperature at the focuser; note it with a good focus and refocus when it drifts", |ui| {
+                                ui.label(egui::RichText::new(format!("{t:.1} \u{b0}C")).color(pal.text_secondary));
+                            });
+                        }
+                        if f.hand_control {
+                            ui.label(egui::RichText::new("hand control").color(pal.status_warn).small());
+                        }
+                    });
+                    let max_step = f.max_step();
+                    egui::Grid::new("focuser_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Position"); });
+                        let pos_text = match (f.moving, f.last_target) {
+                            (true, Some(t)) => format!("{} \u{2192} {}", f.position, t),
+                            (true, None) => format!("{} (moving)", f.position),
+                            (false, _) => f.position.to_string(),
+                        };
+                        ui.label(egui::RichText::new(pos_text).monospace().size(12.0));
+                        ui.end_row();
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Target"); });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut f.target).range(0..=max_step).speed(10));
+                            if widgets::tip(ui, "Move to the target position", |ui| widgets::styled_button(ui, "Move", &pal)) {
+                                let t = f.target;
+                                f.move_to(t);
+                            }
+                            if widgets::tip(ui, "Stop the focuser where it is", |ui| widgets::styled_button(ui, "Halt", &pal)) {
+                                f.halt();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.set_width(label_w); ui.label("Jog"); });
+                        ui.horizontal(|ui| {
+                            if widgets::tip(ui, "Step inward by the jog size", |ui| widgets::styled_button(ui, "\u{2212}", &pal)) {
+                                let t = (f.position - f.jog).max(0);
+                                f.target = t;
+                                f.move_to(t);
+                            }
+                            widgets::tip(ui, "Jog size, steps", |ui| {
+                                ui.add(egui::DragValue::new(&mut f.jog).range(1..=max_step).speed(5));
+                            });
+                            if widgets::tip(ui, "Step outward by the jog size", |ui| widgets::styled_button(ui, "+", &pal)) {
+                                let t = (f.position + f.jog).min(max_step);
+                                f.target = t;
+                                f.move_to(t);
+                            }
+                        });
+                        ui.end_row();
+                    });
+                    if !f.is_camera_bound() {
+                        ui.add_space(4.0);
+                        if widgets::tip(ui, "Close the focuser", |ui| widgets::styled_button(ui, "Disconnect", &pal)) {
+                            action = Some(FocuserUiAction::Disconnect);
+                        }
+                    }
+                }
+            }
+        });
+        match action {
+            #[cfg(feature = "eaf")]
+            Some(FocuserUiAction::Refresh) => self.refresh_eaf_devices(),
+            #[cfg(feature = "eaf")]
+            Some(FocuserUiAction::Connect(i)) => self.connect_eaf(i),
+            Some(FocuserUiAction::Disconnect) => self.disconnect_focuser(),
+            None => {}
+        }
+    }
+}
+
+#[cfg(all(feature = "focus", not(has_focuser)))]
+impl ViewerApp {
+    /// No backend can drive a focuser in this build, so frames carry no position.
+    fn focuser_snapshot(&self) -> Option<(i32, bool)> {
+        None
+    }
 }
 
 impl ViewerApp {
@@ -5565,6 +6071,8 @@ impl ViewerApp {
             solve,
             #[cfg(feature = "focus")]
             focus: Some(focus_cfg),
+            #[cfg(feature = "focus")]
+            focuser: self.focuser_snapshot(),
         };
         if self.solve_tx.try_send(job).is_ok() {
             self.solve_busy = true;

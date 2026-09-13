@@ -25,6 +25,8 @@ ctrlc = { version = "3", features = ["termination"] }
 svbony = { version = "0.1", features = ["image"], optional = true }
 # ToupTek (toupcam) USB/GigE cameras and rebrands (Altair, Omegon, RisingCam, …).
 toupcam = { version = "0.1.0", features = ["image"], optional = true }
+# ZWO EAF electronic focuser (USB). Local checkout until the crate is published.
+zwo-eaf = { path = "../zwo_eaf/zwo-eaf", optional = true }
 tetra3 = { version = "0.13.0", features = [
     "image",
     "parallel",
@@ -51,9 +53,12 @@ starsolve = ["dep:tetra3"]
 # Focus assist: HFR + sharpness readout with a trend plot. Rides on the
 # starsolve extraction worker for its star positions.
 focus = ["starsolve"]
+# ZWO EAF focuser: manual control from the side panel, and with `focus` the
+# autofocus routine on the Focus tab.
+eaf = ["dep:zwo-eaf"]
 gev = ["dep:cameleon-genapi", "dep:zip", "dep:socket2", "dep:if-addrs", "dep:windows-sys", "dep:libc"]
 indi = ["dep:quick-xml", "dep:base64"]
-all = ["svbony", "toupcam", "starsolve", "gev", "indi", "focus"]
+all = ["svbony", "toupcam", "starsolve", "gev", "indi", "focus", "eaf"]
 
 [[example]]
 name = "extract_bench"

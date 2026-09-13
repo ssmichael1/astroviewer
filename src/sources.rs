@@ -106,7 +106,7 @@ pub enum SourceInfo {
     #[cfg(feature = "svbony")]
     SVBony(svbony::CameraInfo),
     #[cfg(feature = "gev")]
-    Gev(crate::gev_camera::GevDeviceInfo),
+    Gev(crate::camera::gev::GevDeviceInfo),
     #[cfg(feature = "toupcam")]
     Toupcam(toupcam::DeviceInfo),
 }
@@ -273,7 +273,7 @@ fn parse_svb(id: &str) -> Result<CameraSource, String> {
 
 #[cfg(feature = "svbony")]
 fn discover_svbony() -> Vec<DiscoveredSource> {
-    crate::camera::enumerate()
+    crate::camera::svbony::enumerate()
         .into_iter()
         .map(|c| DiscoveredSource {
             source: CameraSource::SVBony(c.camera_id),
@@ -293,7 +293,7 @@ fn parse_toupcam(id: &str) -> Result<CameraSource, String> {
 
 #[cfg(feature = "toupcam")]
 fn discover_toupcam() -> Vec<DiscoveredSource> {
-    crate::toupcam_camera::enumerate()
+    crate::camera::toupcam::enumerate()
         .into_iter()
         .map(|d| DiscoveredSource {
             source: CameraSource::Toupcam(d.id.clone()),
@@ -321,7 +321,7 @@ fn manual_gev(s: &str) -> Result<CameraSource, String> {
 
 #[cfg(feature = "gev")]
 fn discover_gev() -> Vec<DiscoveredSource> {
-    crate::gev_camera::enumerate()
+    crate::camera::gev::enumerate()
         .into_iter()
         .map(|g| DiscoveredSource {
             source: CameraSource::Gev(g.id.clone()),

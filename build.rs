@@ -1,4 +1,12 @@
 fn main() {
+    // `has_focuser`: some backend can drive a focuser (ZWO EAF, or the
+    // focuser port on ToupTek astro cameras). Gates the app's focuser slot
+    // and the side-panel Focuser section, which are backend-agnostic.
+    println!("cargo::rustc-check-cfg=cfg(has_focuser)");
+    if std::env::var_os("CARGO_FEATURE_EAF").is_some() || std::env::var_os("CARGO_FEATURE_TOUPCAM").is_some() {
+        println!("cargo:rustc-cfg=has_focuser");
+    }
+
     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         // On macOS the SVBony SDK links `libusb-1.0.0.dylib` dynamically with an
         // install name of `@rpath/libusb-1.0.0.dylib`. Add rpaths so the binary

@@ -128,6 +128,14 @@ svbony::Camera::get_image()
 - [ ] Frame recording to FITS files (stretch goal)
 - [ ] Performance profiling — ensure 30+ fps at full sensor resolution
 
+## Focuser & Autofocus
+
+- `src/focuser/mod.rs` — the app's one focuser slot, independent of the camera. Backends implement the `FocuserDriver` trait (name, max_step, move_to, halt, poll telemetry, stop); the UI, the Focus tab and autofocus only see `Focuser`. Add an INDI or other focuser by implementing the trait.
+- `src/focuser/eaf.rs` (feature `eaf`) — ZWO EAF driver on the `zwo-eaf` crate (local path `../zwo_eaf`). One thread owns the SDK handle. **Never call the EAF SDK on the main thread:** on macOS it pumps the run loop and re-enters winit's event handler (abort). Scans run on a throwaway thread; the open happens inside the focuser thread.
+- `src/focuser/toupcam.rs` — `ToupFocuserDriver` for the focuser port on ToupTek astro cameras; camera-bound, released with the camera.
+- `src/autofocus.rs` (features `focus` + a focuser backend) — pure V-curve state machine: sweep, backlash-safe approach from below, closed-form hyperbola fit on HFR², verify at the minimum. Fed by focuser telemetry and per-frame HFR samples tagged with the focuser position at dispatch; emits `Action`s the app executes. Unit-tested against a synthetic star.
+- The `has_focuser` cfg (set in `build.rs` when `eaf` or `toupcam` is enabled) gates the slot, the side-panel Focuser section and the autofocus UI.
+
 ## Project Structure
 
 ```
@@ -139,7 +147,10 @@ viewer/
     ├── imageview.rs   ← image display widget (colormap, zoom, overlays)
     ├── colormaps.rs   ← colormap definitions (LUTs)
     ├── histogram.rs   ← histogram computation + display widget
-    ├── camera.rs      ← svbony camera manager (thread, controls)
+    ├── camera/        ← one backend per file: svbony, toupcam, gev, indi
+    ├── gige/          ← GigE Vision transport used by camera/gev
+    ├── focuser/       ← mod.rs: FocuserDriver trait + slot; eaf.rs, toupcam.rs drivers
+    ├── autofocus.rs   ← V-curve autofocus state machine
     └── sim.rs         ← simulated camera source
 ```
 

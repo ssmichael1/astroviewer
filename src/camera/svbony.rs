@@ -29,8 +29,8 @@ pub fn enumerate() -> Vec<CameraInfo> {
 /// and return a handle with control metadata and command channel.
 pub fn start_camera(
     info: &CameraInfo,
-    frame_tx: Sender<super::FrameData>,
-    log_tx: Sender<super::LogEntry>,
+    frame_tx: Sender<crate::FrameData>,
+    log_tx: Sender<crate::LogEntry>,
 ) -> anyhow::Result<CameraHandle> {
     let cam = Camera::open(info.camera_id)?;
 
@@ -76,11 +76,11 @@ pub fn start_camera(
     };
     let needs_shift = img_type == ImageType::Y16 && bit_depth < 16;
     if img_type == preferred {
-        let _ = log_tx.try_send(super::LogEntry::info(
+        let _ = log_tx.try_send(crate::LogEntry::info(
             format!("Using native format {:?} for {}-bit sensor", img_type, bit_depth),
         ));
     } else {
-        let _ = log_tx.try_send(super::LogEntry::info(
+        let _ = log_tx.try_send(crate::LogEntry::info(
             format!("Format {:?} not supported, using {:?} with >>{}  shift", preferred, img_type, 16 - bit_depth),
         ));
     }
@@ -119,9 +119,9 @@ pub fn start_camera(
 fn capture_loop(
     cam: Camera,
     cam_name: &str,
-    frame_tx: Sender<super::FrameData>,
+    frame_tx: Sender<crate::FrameData>,
     cmd_rx: Receiver<CameraCmd>,
-    log_tx: Sender<super::LogEntry>,
+    log_tx: Sender<crate::LogEntry>,
     bit_depth: u8,
     mut timeout_ms: i32,
     shift_bits: u8,
@@ -154,7 +154,7 @@ fn capture_loop(
             for (ctrl, val, auto) in &controls_to_set {
                 if let Err(e) = cam.set_control(*ctrl, *val, *auto) {
                     let msg = format!("Set {:?} = {} (auto={}): {:?}", ctrl, val, auto, e);
-                    let _ = log_tx.try_send(super::LogEntry::error(msg));
+                    let _ = log_tx.try_send(crate::LogEntry::error(msg));
                 }
                 if *ctrl == ControlType::Exposure {
                     timeout_ms = ((val / 1000) * 2 + 500).max(2000) as i32;
@@ -170,7 +170,7 @@ fn capture_loop(
                 } else {
                     img
                 };
-                let frame_data = super::process_image(img, bit_depth);
+                let frame_data = crate::process_image(img, bit_depth);
                 if frame_tx.try_send(frame_data).is_err() && frame_tx.is_empty() {
                     let _ = cam.stop_capture();
                     return;
@@ -178,13 +178,13 @@ fn capture_loop(
             }
             Err(svbony::Error::Timeout) => continue,
             Err(svbony::Error::CameraRemoved) => {
-                let _ = log_tx.try_send(super::LogEntry::error(
+                let _ = log_tx.try_send(crate::LogEntry::error(
                     format!("{}: camera disconnected", cam_name),
                 ));
                 return;
             }
             Err(e) => {
-                let _ = log_tx.try_send(super::LogEntry::error(
+                let _ = log_tx.try_send(crate::LogEntry::error(
                     format!("{}: capture error: {:?}", cam_name, e),
                 ));
                 let _ = cam.stop_capture();

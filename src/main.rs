@@ -439,6 +439,10 @@ struct ViewerApp {
     /// Receiver for an in-progress background database generation.
     #[cfg(feature = "starsolve")]
     gen_rx: Option<Receiver<Result<tetra3::SolverDatabase, String>>>,
+    /// In-flight database load from disk, off the UI thread: a mag-13
+    /// database is ~1.7 GB and would otherwise hold the window closed.
+    #[cfg(feature = "starsolve")]
+    db_load: Option<SolverDbLoad>,
     #[cfg(feature = "starsolve")]
     gen_started: Option<Instant>,
     /// Whether to show the one-time "build the database now?" prompt.
@@ -569,10 +573,15 @@ struct ViewerApp {
     pending_fits_path: Option<Receiver<Option<std::path::PathBuf>>>,
     // Async FITS loading result (path, source, optional background)
     pending_fits_load: Option<Receiver<FitsLoadResult>>,
+    /// Bumped whenever the source changes, so a superseded FITS load's
+    /// first-frame preview never reaches the screen.
+    fits_load_gen: Arc<AtomicU64>,
 
     /// Every discovered device across all backends, in registry order — the
     /// unified list behind the Source menu, `source_label`, and `open_source`.
     discovered: Vec<sources::DiscoveredSource>,
+    /// In-flight discovery of the network backends (GigE broadcast).
+    pending_network_discovery: Option<Receiver<Vec<sources::DiscoveredSource>>>,
     /// Whether the Connect-to-Source window is showing.
     connect_dialog_open: bool,
     /// Text of each backend's address-entry field in the Connect dialog,
@@ -756,7 +765,9 @@ impl ViewerApp {
 
         let log = vec![LogEntry::info("Viewer started".to_string())];
 
-        let discovered = sources::discover_all();
+        // USB backends answer in milliseconds; the network ones are left to
+        // `refresh_sources`' worker so they don't hold the window closed.
+        let discovered = sources::discover(false);
 
         // Each addressed backend's connect field starts at its registry
         // default ("localhost" for INDI, empty for GigE).
@@ -833,6 +844,8 @@ impl ViewerApp {
             #[cfg(feature = "starsolve")]
             gen_rx: None,
             #[cfg(feature = "starsolve")]
+            db_load: None,
+            #[cfg(feature = "starsolve")]
             gen_started: None,
             #[cfg(feature = "starsolve")]
             show_build_prompt: false,
@@ -907,7 +920,9 @@ impl ViewerApp {
             fits_frames: None,
             pending_fits_path: None,
             pending_fits_load: None,
+            fits_load_gen: Arc::new(AtomicU64::new(0)),
             discovered,
+            pending_network_discovery: None,
             connect_dialog_open: false,
             manual_inputs,
             #[cfg(feature = "gev")]
@@ -917,6 +932,7 @@ impl ViewerApp {
             camera_error: None,
         };
 
+        app.start_network_discovery();
         #[cfg(feature = "starsolve")]
         app.load_config();
         let ui_cfg = UiConfig::load();
@@ -1110,7 +1126,7 @@ impl ViewerApp {
                 self.solve_enabled = cfg.solve_enabled;
 
                 if !cfg.solver_db_path.is_empty() && std::path::Path::new(&cfg.solver_db_path).exists() {
-                    self.load_solver_db(std::path::Path::new(&cfg.solver_db_path));
+                    self.load_solver_db(std::path::Path::new(&cfg.solver_db_path), true);
                 }
 
                 if !cfg.camera_model_path.is_empty() && std::path::Path::new(&cfg.camera_model_path).exists() {
@@ -1132,36 +1148,83 @@ impl ViewerApp {
             }
         }
 
-        // Provision a plate-solver database when the saved config didn't load
-        // one (first run, or a missing/relocated file). Prefer a previously
-        // generated cache; otherwise offer to build it from the bundled Gaia
-        // catalog. This keeps plate solving working fully offline.
-        if self.solver_db.is_none() {
-            let cache = Self::generated_solver_path();
-            if cache.exists() {
-                self.load_solver_db(&cache);
-            } else if let Some(catalog) = Self::default_catalog_path() {
-                self.solver_catalog_path = Some(catalog);
-                self.show_build_prompt = true;
-            }
+        if self.db_load.is_none() {
+            self.provision_default_solver_db(None);
         }
     }
 
-    /// Loads a solver database from `path`, logging the result and updating state.
+    /// Provision a plate-solver database when the saved config didn't load
+    /// one (first run, a missing/relocated file, or one that failed to load).
+    /// Prefer a previously generated cache; otherwise offer to build it from
+    /// the bundled Gaia catalog. This keeps plate solving working fully
+    /// offline. `failed` is a path that just failed to load, not retried.
     #[cfg(feature = "starsolve")]
-    fn load_solver_db(&mut self, path: &std::path::Path) {
-        self.add_log(LogEntry::info(format!("Auto-loading database: {}", path.display())));
-        match tetra3::SolverDatabase::load_from_file(path.to_str().unwrap_or("")) {
+    fn provision_default_solver_db(&mut self, failed: Option<&std::path::Path>) {
+        let cache = Self::generated_solver_path();
+        if cache.exists() && failed != Some(cache.as_path()) {
+            self.load_solver_db(&cache, true);
+        } else if let Some(catalog) = Self::default_catalog_path() {
+            self.solver_catalog_path = Some(catalog);
+            self.show_build_prompt = true;
+        }
+    }
+
+    /// Start loading a solver database from `path` on a worker thread;
+    /// [`Self::poll_solver_load`] installs it. With `fallback`, a failed
+    /// load falls back to [`Self::provision_default_solver_db`].
+    #[cfg(feature = "starsolve")]
+    fn load_solver_db(&mut self, path: &std::path::Path, fallback: bool) {
+        if self.db_load.is_some() {
+            return;
+        }
+        self.add_log(LogEntry::info(format!("Loading database: {}", path.display())));
+        let (tx, rx) = bounded(1);
+        let thread_path = path.to_path_buf();
+        thread::spawn(move || {
+            let result = tetra3::SolverDatabase::load_from_file(thread_path.to_str().unwrap_or(""))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.db_load = Some(SolverDbLoad {
+            rx,
+            path: path.to_path_buf(),
+            started: Instant::now(),
+            fallback,
+        });
+    }
+
+    /// Install a finished background database load. No-op while none is in
+    /// flight or it is still running.
+    #[cfg(feature = "starsolve")]
+    fn poll_solver_load(&mut self) {
+        let Some(load) = self.db_load.as_ref() else {
+            return;
+        };
+        let result = match load.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("load thread stopped unexpectedly".to_string()),
+        };
+        let load = self.db_load.take().expect("checked above");
+        match result {
             Ok(db) => {
                 self.add_log(LogEntry::info(format!(
-                    "Database loaded: {} patterns, {} stars",
+                    "Database loaded in {:.1}s: {} patterns, {} stars, {:.1}°–{:.1}°",
+                    load.started.elapsed().as_secs_f32(),
                     db.props.num_patterns,
                     db.star_vectors.len(),
+                    db.props.min_fov_rad.to_degrees(),
+                    db.props.max_fov_rad.to_degrees(),
                 )));
-                self.solver_db_path = Some(path.to_path_buf());
+                self.solver_db_path = Some(load.path);
                 self.solver_db = Some(std::sync::Arc::new(db));
             }
-            Err(e) => self.add_log(LogEntry::error(format!("Auto-load failed: {}", e))),
+            Err(e) => {
+                self.add_log(LogEntry::error(format!("Database load failed ({}): {}", load.path.display(), e)));
+                if load.fallback {
+                    self.provision_default_solver_db(Some(&load.path));
+                }
+            }
         }
     }
 
@@ -1724,6 +1787,8 @@ impl ViewerApp {
     }
 
     fn stop_capture(&mut self) {
+        // Invalidates the preview of any FITS load still in flight.
+        self.fits_load_gen.fetch_add(1, Ordering::Relaxed);
         match std::mem::replace(&mut self.capture_state, CaptureState::Stopped) {
             CaptureState::Fits { _stop_tx } => {}
             #[cfg(feature = "svbony")]
@@ -1807,9 +1872,20 @@ impl ViewerApp {
         // turns subtraction on, and on a long cube it costs as much as the load.
         let (tx, rx) = bounded(1);
         self.pending_fits_load = Some(rx);
+        // The first frame goes on screen as soon as it is read; playback
+        // starts once the whole file is in. Skipped if the user has moved on
+        // to another source by then.
+        let frame_tx = self.frame_tx.clone();
+        let load_gen = Arc::clone(&self.fits_load_gen);
+        let my_gen = load_gen.load(Ordering::Relaxed);
         std::thread::spawn(move || {
             let path_str = path.to_str().unwrap_or("").to_string();
-            match fits_source::FitsSource::from_file(&path_str) {
+            let preview = |mono, w, h, depth| {
+                if load_gen.load(Ordering::Relaxed) == my_gen {
+                    let _ = frame_tx.try_send(FrameData::from_pixels(mono, w, h, depth));
+                }
+            };
+            match fits_source::FitsSource::from_file_with_preview(&path_str, preview) {
                 Ok(source) => { let _ = tx.send(Ok((path, source))); }
                 Err(e) => { let _ = tx.send(Err(format!("{}", e))); }
             }
@@ -2075,9 +2151,39 @@ impl ViewerApp {
         self.add_log(LogEntry::error(msg));
     }
 
-    /// Re-enumerate every camera backend (the Source menu's Refresh).
+    /// Re-enumerate every camera backend (startup and the Source menu's
+    /// Refresh): local SDK backends inline, network backends on a worker
+    /// thread whose rows [`Self::poll_network_discovery`] splices in.
     fn refresh_sources(&mut self) {
-        self.discovered = sources::discover_all();
+        self.discovered = sources::discover(false);
+        self.start_network_discovery();
+    }
+
+    fn start_network_discovery(&mut self) {
+        if self.pending_network_discovery.is_some()
+            || !sources::backends().iter().any(|b| b.network && b.discover.is_some())
+        {
+            return;
+        }
+        let (tx, rx) = bounded(1);
+        self.pending_network_discovery = Some(rx);
+        thread::spawn(move || {
+            let _ = tx.send(sources::discover(true));
+        });
+    }
+
+    fn poll_network_discovery(&mut self) {
+        let Some(rx) = &self.pending_network_discovery else { return };
+        match rx.try_recv() {
+            Ok(found) => {
+                let network: Vec<&str> = sources::backends().iter().filter(|b| b.network).map(|b| b.name).collect();
+                self.discovered.retain(|d| !network.contains(&d.backend));
+                self.discovered.extend(found);
+                self.pending_network_discovery = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_network_discovery = None,
+        }
     }
 
     /// Re-enumerate only `source`'s backend, splicing its fresh rows into
@@ -4066,25 +4172,17 @@ impl ViewerApp {
                 let secs = self.gen_started.map_or(0.0, |t| t.elapsed().as_secs_f32());
                 ui.label(egui::RichText::new(format!("Building star database… {:.0}s", secs))
                     .color(pal.status_warn));
+            } else if let Some(load) = self.db_load.as_ref() {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(egui::RichText::new(format!("Loading star database… {:.0}s", load.started.elapsed().as_secs_f32()))
+                    .color(pal.status_warn));
             } else if self.solver_db.is_none() {
                 if widgets::tip(ui, "Load a tetra3 pattern database (.bin)", |ui| widgets::styled_button(ui, "Load Database...", &pal)) {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Database", &["bin"])
                         .pick_file()
                     {
-                        self.add_log(LogEntry::info(format!("Loading database: {}...", path.display())));
-                        match tetra3::SolverDatabase::load_from_file(path.to_str().unwrap_or("")) {
-                            Ok(db) => {
-                                self.add_log(LogEntry::info(format!(
-                                    "Database: {} patterns, {} stars, {:.1}°–{:.1}°",
-                                    db.props.num_patterns, db.star_vectors.len(),
-                                    db.props.min_fov_rad.to_degrees(), db.props.max_fov_rad.to_degrees(),
-                                )));
-                                self.solver_db = Some(std::sync::Arc::new(db));
-                                self.solver_db_path = Some(path.clone());
-                            }
-                            Err(e) => self.add_log(LogEntry::error(format!("Load failed: {}", e))),
-                        }
+                        self.load_solver_db(&path, false);
                     }
                 }
                 // Offer to build the default database from the bundled catalog.
@@ -5051,8 +5149,12 @@ impl eframe::App for ViewerApp {
         self.update_gev_rate();
         self.poll_fits_load();
         self.poll_bg();
+        self.poll_network_discovery();
+        if self.pending_network_discovery.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
         #[cfg(feature = "starsolve")]
         self.poll_solver_generation();
+        #[cfg(feature = "starsolve")]
+        self.poll_solver_load();
         self.apply_theme(&ctx);
 
         if QUIT_REQUESTED.load(Ordering::SeqCst) {
@@ -5080,6 +5182,8 @@ impl eframe::App for ViewerApp {
         // and completion is detected promptly.
         #[cfg(feature = "starsolve")]
         if self.gen_rx.is_some() { ctx.request_repaint(); }
+        #[cfg(feature = "starsolve")]
+        if self.db_load.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
 
         let pal = self.pal();
 
@@ -5625,6 +5729,16 @@ struct SolveJob {
     focuser: Option<(i32, bool)>,
 }
 
+/// A solver database loading from disk on a worker thread.
+#[cfg(feature = "starsolve")]
+struct SolverDbLoad {
+    rx: Receiver<Result<tetra3::SolverDatabase, String>>,
+    path: std::path::PathBuf,
+    started: Instant,
+    /// Fall back to the cached/bundled default database if this load fails.
+    fallback: bool,
+}
+
 /// Solver inputs, snapshotted on the UI thread at dispatch time.
 #[cfg(feature = "starsolve")]
 struct SolveParams {
@@ -5657,6 +5771,9 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
     let (job_tx, job_rx) = bounded::<SolveJob>(1);
     let (out_tx, out_rx) = bounded::<SolveOutput>(1);
     thread::spawn(move || {
+        // Keeps the CCL path's full-frame working buffers between frames
+        // instead of allocating and first-touching them per job.
+        let mut extractor = tetra3::CentroidExtractor::new();
         // Ends when the app drops the job sender.
         while let Ok(job) = job_rx.recv() {
             let t0 = Instant::now();
@@ -5678,9 +5795,7 @@ fn spawn_solve_worker() -> (Sender<SolveJob>, Receiver<SolveOutput>) {
                 };
                 tetra3::extract_centroids_fast(&job.mono, job.width, job.height, &cfg)
             } else {
-                tetra3::extract_centroids_from_raw(
-                    &job.mono, job.width, job.height, &job.centroid_config,
-                )
+                extractor.extract_from_raw(&job.mono, job.width, job.height, &job.centroid_config)
             }
             .map(|r| r.centroids)
             .unwrap_or_default();

@@ -10,10 +10,12 @@
 //! estimator works from the same store instead of re-reading the file.
 
 use std::cmp::Ordering;
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use fitskit::{FitsFile, HduData, PixelData};
+use fitskit::{Hdu, HduData, PixelData};
 use rayon::prelude::*;
 
 use crate::pixels::Pixels;
@@ -126,6 +128,37 @@ enum Raw {
     F32(Vec<f32>),
 }
 
+impl Raw {
+    fn max_value(&self) -> f64 {
+        match self {
+            Raw::U16(v) => v.iter().copied().max().unwrap_or(0) as f64,
+            Raw::F32(v) => v.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64,
+        }
+    }
+}
+
+/// Smallest common sensor depth that holds `max_val`.
+fn depth_for_max(max_val: f64) -> u8 {
+    if max_val <= 255.0 { 8 }
+    else if max_val <= 4095.0 { 12 }
+    else if max_val <= 16383.0 { 14 }
+    else if max_val <= 65535.0 { 16 }
+    else { 32 }
+}
+
+/// A copy of the first `npix` samples: the first frame of a cube, or the
+/// whole of a single-frame HDU.
+fn first_frame(px: &PixelData, npix: usize) -> PixelData {
+    match px {
+        PixelData::U8(v) => PixelData::U8(v[..npix.min(v.len())].to_vec()),
+        PixelData::I16(v) => PixelData::I16(v[..npix.min(v.len())].to_vec()),
+        PixelData::I32(v) => PixelData::I32(v[..npix.min(v.len())].to_vec()),
+        PixelData::I64(v) => PixelData::I64(v[..npix.min(v.len())].to_vec()),
+        PixelData::F32(v) => PixelData::F32(v[..npix.min(v.len())].to_vec()),
+        PixelData::F64(v) => PixelData::F64(v[..npix.min(v.len())].to_vec()),
+    }
+}
+
 /// Apply BSCALE/BZERO, keeping integer data as `u16` whenever the result is
 /// exactly representable there; otherwise widen to `f32` (the precision the
 /// viewer displayed before, when every frame went through `f64` then `f32`).
@@ -182,10 +215,14 @@ impl FitsSource {
     /// - 2D image (NAXIS=2): single frame, repeated
     /// - 3D cube (NAXIS=3): multiple frames along axis 3
     /// - Multi-HDU: each image HDU becomes a frame
-    pub fn from_file(path: &str) -> Result<Self> {
-        let fits = FitsFile::from_file(path)?;
+    ///
+    /// The first frame goes to `preview` (pixels, width, height, bit depth)
+    /// as soon as its HDU is read, so the viewer can show it while the rest
+    /// of a multi-GB recording loads.
+    pub fn from_file_with_preview(path: &str, preview: impl FnOnce(Pixels, u32, u32, u8)) -> Result<Self> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let mut preview = Some(preview);
 
-        let mut raw_frames: Vec<Raw> = Vec::new();
         let mut width = 0u32;
         let mut height = 0u32;
         // Bit depth from the first image HDU's header: an explicit BITDEPTH
@@ -193,12 +230,22 @@ impl FitsSource {
         // integer data. `None` for float data, which has no natural range.
         let mut header_depth: Option<u8> = None;
 
-        for hdu in fits.hdus {
+        // Pick out the image HDUs (cheap, header-only) first, then convert
+        // their pixels in parallel: a recording is one HDU per frame, and a
+        // single-threaded pass over a multi-GB file is most of the load time.
+        let mut images: Vec<(PixelData, f64, f64)> = Vec::new();
+        for index in 0usize.. {
+            let hdu = match Hdu::read_from(&mut reader) {
+                Ok(hdu) => hdu,
+                // Running out of file after the primary HDU is the normal end.
+                Err(fitskit::Error::Io(e)) if index > 0 && e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            };
             let img = match hdu.data {
                 HduData::Image(im) if im.axes.len() >= 2 => im,
                 _ => continue,
             };
-            if raw_frames.is_empty() {
+            if images.is_empty() {
                 header_depth = hdu
                     .header
                     .get_int("BITDEPTH")
@@ -214,17 +261,36 @@ impl FitsSource {
 
             let w = img.axes[0] as u32;
             let h = img.axes[1] as u32;
-            if raw_frames.is_empty() {
+            if images.is_empty() {
                 width = w;
                 height = h;
             } else if w != width || h != height {
                 continue;
             }
-            let npix = (w as usize) * (h as usize);
 
             let bscale = hdu.header.get_float("BSCALE").unwrap_or(1.0);
             let bzero = hdu.header.get_float("BZERO").unwrap_or(0.0);
-            match convert(img.pixels, bscale, bzero) {
+            if let Some(preview) = preview.take() {
+                let npix = (w as usize) * (h as usize);
+                let first = convert(first_frame(&img.pixels, npix), bscale, bzero);
+                let depth = header_depth.unwrap_or_else(|| depth_for_max(first.max_value()));
+                let pixels = match first {
+                    Raw::U16(v) => Pixels::U16(Arc::new(v)),
+                    Raw::F32(v) => Pixels::F32(Arc::new(v)),
+                };
+                preview(pixels, w, h, depth);
+            }
+            images.push((img.pixels, bscale, bzero));
+        }
+
+        let npix = (width as usize) * (height as usize);
+        let mut raw_frames: Vec<Raw> = Vec::new();
+        let converted: Vec<Raw> = images
+            .into_par_iter()
+            .map(|(px, bscale, bzero)| convert(px, bscale, bzero))
+            .collect();
+        for raw in converted {
+            match raw {
                 Raw::U16(v) => raw_frames.extend(split_frames(v, npix).into_iter().map(|f| {
                     Raw::U16(Arc::try_unwrap(f).unwrap_or_else(|a| (*a).clone()))
                 })),
@@ -263,14 +329,7 @@ impl FitsSource {
         // not mistaken for a shallower sensor and the Full-range scale is
         // the same for every file from one camera. Float data has no word
         // size to go on, so its depth is inferred from the largest sample.
-        let bit_depth = header_depth.unwrap_or_else(|| {
-            let max_val = frames.max_value();
-            if max_val <= 255.0 { 8 }
-            else if max_val <= 4095.0 { 12 }
-            else if max_val <= 16383.0 { 14 }
-            else if max_val <= 65535.0 { 16 }
-            else { 32 }
-        });
+        let bit_depth = header_depth.unwrap_or_else(|| depth_for_max(frames.max_value()));
 
         Ok(Self {
             frames: Arc::new(frames),

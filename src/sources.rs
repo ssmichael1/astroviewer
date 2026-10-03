@@ -173,6 +173,9 @@ pub struct Backend {
     /// Enumerate currently-visible devices; `None` for address-only backends
     /// (INDI), which are connected via a typed address instead.
     pub discover: Option<fn() -> Vec<DiscoveredSource>>,
+    /// Discovery waits on network replies (GigE broadcast, ~1.2 s) rather
+    /// than asking a local SDK, so it runs off the UI thread.
+    pub network: bool,
     /// Address-entry row shown in the Connect dialog, if this backend can be
     /// reached by a typed address.
     pub manual: Option<ManualEntrySpec>,
@@ -201,6 +204,7 @@ pub fn backends() -> &'static [Backend] {
             name: "SVBony",
             parse: parse_svb,
             discover: Some(discover_svbony),
+            network: false,
             manual: None,
         });
         #[cfg(feature = "toupcam")]
@@ -209,6 +213,7 @@ pub fn backends() -> &'static [Backend] {
             name: "ToupTek",
             parse: parse_toupcam,
             discover: Some(discover_toupcam),
+            network: false,
             manual: None,
         });
         #[cfg(feature = "gev")]
@@ -217,6 +222,7 @@ pub fn backends() -> &'static [Backend] {
             name: "GigE Vision",
             parse: parse_gev,
             discover: Some(discover_gev),
+            network: true,
             // Reachable-by-unicast cameras don't always answer broadcast
             // discovery, so a raw IP must also work.
             manual: Some(ManualEntrySpec {
@@ -232,6 +238,7 @@ pub fn backends() -> &'static [Backend] {
             name: "INDI",
             parse: parse_indi,
             discover: None,
+            network: false,
             manual: Some(ManualEntrySpec {
                 label: "Server",
                 hint: "localhost:7624",
@@ -258,10 +265,15 @@ impl Backend {
     }
 }
 
-/// Enumerate every discovery-capable backend — startup and the Source menu's
-/// Refresh both go through here.
-pub fn discover_all() -> Vec<DiscoveredSource> {
-    backends().iter().flat_map(Backend::discover_devices).collect()
+/// Enumerate the discovery-capable backends whose `network` flag matches —
+/// startup and the Source menu's Refresh run the local ones inline and the
+/// network ones on a worker thread.
+pub fn discover(network: bool) -> Vec<DiscoveredSource> {
+    backends()
+        .iter()
+        .filter(|b| b.network == network)
+        .flat_map(Backend::discover_devices)
+        .collect()
 }
 
 #[cfg(feature = "svbony")]

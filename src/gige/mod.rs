@@ -13,7 +13,7 @@
 //! headers for the specific provenance.
 //!
 //! GenICam feature access (Exposure, Gain, PixelFormat, …) stays with
-//! `cameleon-genapi`, bridged onto [`gvcp::Device`] in `crate::gev_camera`.
+//! `cameleon-genapi`, bridged onto [`gvcp::Device`] in `crate::camera::gev`.
 
 pub mod gvcp;
 pub mod gvsp;

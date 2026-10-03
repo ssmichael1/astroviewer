@@ -65,6 +65,8 @@ svbony::Camera::get_image()
 
 3. **Colormapping on the UI thread** — Apply colormap, gamma, and scaling when converting to an egui texture. This keeps the pipeline simple and lets scale/gamma changes take effect immediately without re-fetching from the camera.
 
+4. **Display binning before recolor** — When the frame is drawn smaller than its pixel count, `imageview` mean-bins the mono data by the integer factor `display_bin_factor` (largest that keeps the binned image at least as wide as the viewport in physical pixels) and recolors only the binned image. Point-sampling a 26 Mpix frame at 3× decimation drops most 2-pixel stars and keeps full per-pixel noise; the block mean is the low-pass filter that decimation requires and cuts the shaded/uploaded pixel count by `bin²`. The residual sub-2× minification uses bilinear filtering; magnification stays nearest. Hover values, the ROI zoom window and everything downstream (solver, recording) see the unbinned data.
+
 4. **Camera controls via `svbony` API directly** — Query `control_caps()` to discover available controls, render a slider/checkbox for each writable one. No intermediate abstraction layer.
 
 ## Implementation Plan
@@ -128,6 +130,14 @@ svbony::Camera::get_image()
 - [ ] Frame recording to FITS files (stretch goal)
 - [ ] Performance profiling — ensure 30+ fps at full sensor resolution
 
+## Focuser & Autofocus
+
+- `src/focuser/mod.rs` — the app's one focuser slot, independent of the camera. Backends implement the `FocuserDriver` trait (name, max_step, move_to, halt, poll telemetry, stop); the UI, the Focus tab and autofocus only see `Focuser`. Add an INDI or other focuser by implementing the trait.
+- `src/focuser/eaf.rs` (feature `eaf`) — ZWO EAF driver on the `zwo-eaf` crate (local path `../zwo_eaf`). One thread owns the SDK handle. **Never call the EAF SDK on the main thread:** on macOS it pumps the run loop and re-enters winit's event handler (abort). Scans run on a throwaway thread; the open happens inside the focuser thread.
+- `src/focuser/toupcam.rs` — `ToupFocuserDriver` for the focuser port on ToupTek astro cameras; camera-bound, released with the camera.
+- `src/autofocus.rs` (features `focus` + a focuser backend) — pure V-curve state machine: sweep, backlash-safe approach from below, closed-form hyperbola fit on HFR², verify at the minimum. When the HFR is still falling at an end of the sweep it walks on with a doubling step, then re-sweeps finely around the turn; if it cannot bracket focus it reports `Outcome::Unbracketed`, never a focus. Fed by focuser telemetry and per-frame HFR samples tagged with the focuser position at dispatch; emits `Action`s the app executes. Unit-tested against a synthetic star.
+- The `has_focuser` cfg (set in `build.rs` when `eaf` or `toupcam` is enabled) gates the slot, the side-panel Focuser section and the autofocus UI.
+
 ## Project Structure
 
 ```
@@ -139,7 +149,10 @@ viewer/
     ├── imageview.rs   ← image display widget (colormap, zoom, overlays)
     ├── colormaps.rs   ← colormap definitions (LUTs)
     ├── histogram.rs   ← histogram computation + display widget
-    ├── camera.rs      ← svbony camera manager (thread, controls)
+    ├── camera/        ← one backend per file: svbony, toupcam, gev, indi
+    ├── gige/          ← GigE Vision transport used by camera/gev
+    ├── focuser/       ← mod.rs: FocuserDriver trait + slot; eaf.rs, toupcam.rs drivers
+    ├── autofocus.rs   ← V-curve autofocus state machine
     └── sim.rs         ← simulated camera source
 ```
 

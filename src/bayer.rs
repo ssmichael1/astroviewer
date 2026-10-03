@@ -1,7 +1,7 @@
 //! Color filter array (Bayer mosaic) utilities for RAW color sensors.
 //!
 //! The viewer streams color cameras as RAW mono-layout frames (see
-//! `toupcam_camera` module docs), so the Bayer mosaic is present in the pixel
+//! `camera::toupcam` module docs), so the Bayer mosaic is present in the pixel
 //! data. Everything here is exact arithmetic on true ADUs — no demosaicking
 //! interpolation:
 //!

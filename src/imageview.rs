@@ -72,13 +72,95 @@ pub struct RgbaKey {
     pub frame_serial: u64,
     pub width: u32,
     pub height: u32,
+    /// Display bin factor (see [`display_bin_factor`]); depends on the
+    /// viewport, so a resize can trigger a rebuild without a new frame.
+    pub bin: u32,
     pub shading: Shading,
 }
 
 impl RgbaKey {
-    pub fn new(frame_serial: u64, width: u32, height: u32, params: &DisplayParams, colormap: &Colormap) -> Self {
-        Self { frame_serial, width, height, shading: Shading::new(params, colormap) }
+    pub fn new(frame_serial: u64, width: u32, height: u32, bin: u32, params: &DisplayParams, colormap: &Colormap) -> Self {
+        Self { frame_serial, width, height, bin, shading: Shading::new(params, colormap) }
     }
+}
+
+/// Integer factor by which a `width`-pixel-wide frame is mean-binned before
+/// recoloring when it is drawn `display_px` physical pixels wide.
+///
+/// Drawing a frame smaller than its pixel count is decimation; done by point
+/// sampling the texture (what `TextureFilter::Nearest` does) it skips the
+/// low-pass filter that sampling theory requires, so a 2-pixel-FWHM star is
+/// picked up or dropped depending on where the sampling grid happens to
+/// fall, and the sky keeps its full per-pixel noise. Averaging blocks of the
+/// data first is that low-pass filter. The factor is the largest that leaves
+/// the binned image at least as wide as the display, so the GPU's residual
+/// minification is under 2×, a range in which bilinear filtering touches
+/// every texel and nothing is dropped. At 1:1 or magnified the factor is 1.
+pub fn display_bin_factor(width: u32, display_px: f32) -> u32 {
+    if display_px <= 0.0 || width == 0 {
+        return 1;
+    }
+    ((width as f32 / display_px).floor() as u32).max(1)
+}
+
+/// A sample type `bin_mean_shade` can accumulate: `u16` sums in `u32`
+/// (integer adds vectorize; exact), `f32` in `f32`.
+trait BinSample: Copy + Sync {
+    type Acc: Copy + Default + Send + Sync;
+    fn add(acc: Self::Acc, s: Self) -> Self::Acc;
+    fn add_acc(a: Self::Acc, b: Self::Acc) -> Self::Acc;
+    fn to_f32(acc: Self::Acc) -> f32;
+}
+
+impl BinSample for u16 {
+    type Acc = u32;
+    #[inline] fn add(acc: u32, s: u16) -> u32 { acc + s as u32 }
+    #[inline] fn add_acc(a: u32, b: u32) -> u32 { a + b }
+    #[inline] fn to_f32(acc: u32) -> f32 { acc as f32 }
+}
+
+impl BinSample for f32 {
+    type Acc = f32;
+    #[inline] fn add(acc: f32, s: f32) -> f32 { acc + s }
+    #[inline] fn add_acc(a: f32, b: f32) -> f32 { a + b }
+    #[inline] fn to_f32(acc: f32) -> f32 { acc }
+}
+
+/// Mean-bin `src` (row-major `w`×`h`) in `bin`×`bin` blocks and shade each
+/// block mean into `dst`, row-major `ceil(w/bin)`×`ceil(h/bin)`. Blocks on
+/// the right and bottom edges average only the pixels they cover.
+///
+/// Output rows go across the rayon pool. Each sums its `bin` source rows
+/// column-wise first (one vectorized add per source pixel), then reduces the
+/// column sums in runs of `bin`; the runtime block width only enters that
+/// second, `bin`× smaller pass.
+fn bin_mean_shade<T: BinSample>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    bin: usize,
+    dst: &mut [Color32],
+    shade: impl Fn(f32) -> Color32 + Sync,
+) {
+    let bw = w.div_ceil(bin);
+    let bh = h.div_ceil(bin);
+    debug_assert_eq!(src.len(), w * h);
+    debug_assert_eq!(dst.len(), bw * bh);
+    dst.par_chunks_mut(bw).enumerate().for_each(|(oy, out)| {
+        let y0 = oy * bin;
+        let rows = &src[y0 * w..(y0 + bin).min(h) * w];
+        let nrows = (rows.len() / w) as f32;
+        let mut colsum = vec![T::Acc::default(); w];
+        for row in rows.chunks_exact(w) {
+            for (c, &s) in colsum.iter_mut().zip(row) {
+                *c = T::add(*c, s);
+            }
+        }
+        for (d, block) in out.iter_mut().zip(colsum.chunks(bin)) {
+            let sum = block.iter().copied().fold(T::Acc::default(), T::add_acc);
+            *d = shade(T::to_f32(sum) / (block.len() as f32 * nrows));
+        }
+    });
 }
 
 /// Everything that maps a pixel value to a color: display range, transfer
@@ -202,6 +284,17 @@ fn fmt_tick(v: f32, step: f32) -> String {
     format!("{:.*}", decimals, v)
 }
 
+/// Sampling for the main image texture. Magnification stays nearest so a
+/// frame smaller than the viewport shows crisp pixels; minification is
+/// bilinear, which with the bin factor keeping the residual ratio under 2×
+/// weights every texel into some screen pixel instead of dropping most.
+const DISPLAY_TEXTURE: TextureOptions = TextureOptions {
+    magnification: egui::TextureFilter::Nearest,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: None,
+};
+
 /// Holds the texture and cached rendering state.
 pub struct ImageViewer {
     texture: Option<TextureHandle>,
@@ -260,23 +353,6 @@ impl ImageViewer {
             return response;
         }
 
-        // Recolor and re-upload only when the frame or display params changed.
-        let key = RgbaKey::new(frame_serial, width, height, params, colormap);
-        if self.rgba_key != Some(key) || self.texture.is_none() {
-            self.rgba_key = Some(key);
-            self.update_rgba(mono_data, width, height, params, colormap);
-            match &mut self.texture {
-                Some(tex) => tex.set(self.image.clone(), TextureOptions::NEAREST),
-                None => {
-                    self.texture = Some(ui.ctx().load_texture(
-                        "camera_image",
-                        self.image.clone(),
-                        TextureOptions::NEAREST,
-                    ));
-                }
-            }
-        }
-
         let available = ui.available_size();
 
         // Reserve space for axes and colorbar
@@ -298,6 +374,37 @@ impl ImageViewer {
         let top_left = ui.cursor().min + Vec2::new(axis_margin_left, 0.0);
         let image_rect = Rect::from_min_size(top_left, Vec2::new(display_w, display_h));
 
+        // Recolor and re-upload only when the frame, display params or bin
+        // factor changed. The bin factor follows the drawn size in physical
+        // pixels (points × scale factor on HiDPI), so a window resize that
+        // crosses an integer ratio rebuilds; ordinary repaints do not.
+        let bin = display_bin_factor(width, display_w * ui.ctx().pixels_per_point()).min(width).min(height).max(1);
+        let key = RgbaKey::new(frame_serial, width, height, bin, params, colormap);
+        if self.rgba_key != Some(key) || self.texture.is_none() {
+            self.rgba_key = Some(key);
+            self.update_rgba(mono_data, width, height, bin, params, colormap);
+            match &mut self.texture {
+                Some(tex) => tex.set(self.image.clone(), DISPLAY_TEXTURE),
+                None => {
+                    self.texture = Some(ui.ctx().load_texture(
+                        "camera_image",
+                        self.image.clone(),
+                        DISPLAY_TEXTURE,
+                    ));
+                }
+            }
+        }
+        // The binned texture covers ceil(w/bin)·bin source columns, up to
+        // bin−1 more than the frame has. Map only the frame's extent onto
+        // `image_rect` so hover, ROI and overlay geometry stay exact.
+        let uv_max = {
+            let [bw, bh] = self.image.size;
+            Pos2::new(
+                width as f32 / (bw as u32 * bin) as f32,
+                height as f32 / (bh as u32 * bin) as f32,
+            )
+        };
+
         // Draw axes
         if params.show_axes {
             self.draw_axes(ui, image_rect, width, height, params);
@@ -309,7 +416,7 @@ impl ImageViewer {
             ui.painter().image(
                 tex.id(),
                 image_rect,
-                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Rect::from_min_max(Pos2::new(0.0, 0.0), uv_max),
                 Color32::WHITE,
             );
 
@@ -425,40 +532,60 @@ impl ImageViewer {
         response
     }
 
-    /// Recolor the frame into `self.image`.
+    /// Recolor the frame into `self.image`, mean-binned by `bin` (see
+    /// [`display_bin_factor`]; 1 recolors every pixel).
     ///
     /// `u16` frames go through the per-value table; `f32` frames (float FITS,
     /// background-subtracted data) evaluate the shader per pixel, since their
     /// values are not indexable. Both paths use the same shader, so a `u16`
-    /// frame and its `f32` widening produce byte-identical pixels. Rows are
-    /// distributed across the rayon pool: this runs on the UI thread and at
-    /// full sensor resolution is the single largest cost per frame.
+    /// frame and its `f32` widening produce byte-identical pixels at bin 1.
+    /// Binned, a `u16` block mean is rounded to the nearest integer for the
+    /// table lookup. Rows are distributed across the rayon pool: this runs on
+    /// the UI thread and at full sensor resolution is the single largest cost
+    /// per frame; binning shrinks the shaded and uploaded pixel count by
+    /// `bin²`, while the pass over the source stays one read per pixel.
     fn update_rgba(
         &mut self,
         mono_data: &Pixels,
         width: u32,
         height: u32,
+        bin: u32,
         params: &DisplayParams,
         colormap: &Colormap,
     ) {
         let (w, h) = (width as usize, height as usize);
-        let npix = w * h;
+        let bin = (bin.max(1) as usize).min(w.max(1)).min(h.max(1));
+        let (bw, bh) = (w.div_ceil(bin), h.div_ceil(bin));
+        let npix = bw * bh;
         let shading = Shading::new(params, colormap);
         let shade = shading.shader(colormap);
 
+        if matches!(mono_data, Pixels::U16(_)) {
+            self.ensure_lut(shading, &shade);
+        }
+
         let img = Arc::make_mut(&mut self.image);
-        if img.size != [w, h] || img.pixels.len() != npix {
-            img.size = [w, h];
-            img.source_size = Vec2::new(w as f32, h as f32);
+        if img.size != [bw, bh] || img.pixels.len() != npix {
+            img.size = [bw, bh];
+            img.source_size = Vec2::new(bw as f32, bh as f32);
             img.pixels.resize(npix, Color32::BLACK);
+        }
+
+        if bin > 1 {
+            match mono_data {
+                Pixels::U16(v) => {
+                    let lut = &self.lut;
+                    bin_mean_shade(v.as_slice(), w, h, bin, &mut img.pixels, |m| {
+                        lut[((m + 0.5) as usize).min(u16::MAX as usize)]
+                    });
+                }
+                Pixels::F32(v) => bin_mean_shade(v.as_slice(), w, h, bin, &mut img.pixels, &shade),
+            }
+            return;
         }
 
         match mono_data {
             Pixels::U16(v) => {
-                if self.lut_shading != Some(shading) || self.lut.len() != 1 << 16 {
-                    self.lut = (0..=u16::MAX).map(|x| shade(x as f32)).collect();
-                    self.lut_shading = Some(shading);
-                }
                 let lut = &self.lut;
                 img.pixels
                     .par_chunks_mut(w)
@@ -479,6 +606,15 @@ impl ImageViewer {
                         }
                     });
             }
+        }
+    }
+
+    /// Rebuild the `u16` value → color table if `shading` differs from the one
+    /// it was built for.
+    fn ensure_lut(&mut self, shading: Shading, shade: &(impl Fn(f32) -> Color32 + Sync)) {
+        if self.lut_shading != Some(shading) || self.lut.len() != 1 << 16 {
+            self.lut = (0..=u16::MAX).map(|x| shade(x as f32)).collect();
+            self.lut_shading = Some(shading);
         }
     }
 
@@ -631,11 +767,11 @@ mod tests {
         let f = Pixels::F32(Arc::new(raw.iter().map(|&x| x as f32).collect()));
 
         let mut vu = ImageViewer::new();
-        vu.update_rgba(&u, w, h, params, &cmap);
+        vu.update_rgba(&u, w, h, 1, params, &cmap);
         let px_u = vu.image.pixels.clone();
 
         let mut vf = ImageViewer::new();
-        vf.update_rgba(&f, w, h, params, &cmap);
+        vf.update_rgba(&f, w, h, 1, params, &cmap);
 
         assert_eq!(px_u, vf.image.pixels, "u16 vs f32 pixels differ for {kind:?}");
         assert_eq!(vu.image.size, [w as usize, h as usize]);
@@ -663,13 +799,79 @@ mod tests {
             for (label, px) in [("u16", &u), ("f32", &f)] {
                 // First call includes the LUT build / buffer allocation; the
                 // second is the steady state.
-                v.update_rgba(px, w, h, p, &cmap);
-                let t = std::time::Instant::now();
-                v.rgba_key = None;
-                v.update_rgba(px, w, h, p, &cmap);
-                println!("{name:12} {label}: {:6.1} ms", t.elapsed().as_secs_f64() * 1e3);
+                for bin in [1u32, 3] {
+                    v.update_rgba(px, w, h, bin, p, &cmap);
+                    let t = std::time::Instant::now();
+                    v.rgba_key = None;
+                    v.update_rgba(px, w, h, bin, p, &cmap);
+                    println!("{name:12} {label} bin {bin}: {:6.1} ms", t.elapsed().as_secs_f64() * 1e3);
+                }
             }
         }
+    }
+
+    /// The bin factor keeps the binned image between 1× and 2× the drawn
+    /// width and never bins a frame drawn at or above 1:1.
+    #[test]
+    fn bin_factor_brackets_display_width() {
+        assert_eq!(display_bin_factor(6224, 6224.0), 1);
+        assert_eq!(display_bin_factor(6224, 9000.0), 1);
+        assert_eq!(display_bin_factor(6224, 2000.0), 3);
+        assert_eq!(display_bin_factor(6224, 1556.0), 4);
+        assert_eq!(display_bin_factor(6224, 0.0), 1);
+        assert_eq!(display_bin_factor(0, 100.0), 1);
+        for w in [640u32, 1920, 6224] {
+            for px in [100.0f32, 333.0, 1000.0, 1919.0, 4000.0] {
+                let b = display_bin_factor(w, px);
+                let bw = w.div_ceil(b) as f32;
+                assert!(bw >= px.min(w as f32), "w={w} px={px} bin={b} bw={bw}");
+                assert!(bw < 2.0 * px || b == 1, "w={w} px={px} bin={b} bw={bw}");
+            }
+        }
+    }
+
+    /// Binned recoloring shades exact block means, with ragged right and
+    /// bottom edges averaging only the pixels they cover; `u16` frames round
+    /// the mean to the nearest table entry.
+    #[test]
+    fn binned_recolor_shades_block_means() {
+        let (w, h, bin) = (7u32, 5u32, 3usize);
+        let raw: Vec<u16> = (0..(w * h)).map(|i| (i * 977 % 4001) as u16).collect();
+        let params = DisplayParams { scale_min: 0.0, scale_max: 4000.0, gamma: 1.7, ..Default::default() };
+        let cmap = Colormap::new(ColormapKind::Inferno);
+        let shade = Shading::new(&params, &cmap).shader(&cmap);
+
+        let (bw, bh) = ((w as usize).div_ceil(bin), (h as usize).div_ceil(bin));
+        let mut means = vec![0.0f32; bw * bh];
+        for oy in 0..bh {
+            for ox in 0..bw {
+                let (mut sum, mut n) = (0.0f32, 0.0f32);
+                for y in oy * bin..((oy + 1) * bin).min(h as usize) {
+                    for x in ox * bin..((ox + 1) * bin).min(w as usize) {
+                        sum += raw[y * w as usize + x] as f32;
+                        n += 1.0;
+                    }
+                }
+                means[oy * bw + ox] = sum / n;
+            }
+        }
+
+        let mut vf = ImageViewer::new();
+        vf.update_rgba(&Pixels::F32(Arc::new(raw.iter().map(|&x| x as f32).collect())), w, h, bin as u32, &params, &cmap);
+        assert_eq!(vf.image.size, [bw, bh]);
+        let expect_f: Vec<Color32> = means.iter().map(|&m| shade(m)).collect();
+        assert_eq!(vf.image.pixels, expect_f);
+
+        let mut vu = ImageViewer::new();
+        vu.update_rgba(&Pixels::U16(Arc::new(raw.clone())), w, h, bin as u32, &params, &cmap);
+        let expect_u: Vec<Color32> = means.iter().map(|&m| shade(m.round())).collect();
+        assert_eq!(vu.image.pixels, expect_u);
+
+        // Bin 1 is the unbinned path, byte for byte.
+        let mut v1 = ImageViewer::new();
+        v1.update_rgba(&Pixels::U16(Arc::new(raw.clone())), w, h, 1, &params, &cmap);
+        let expect_1: Vec<Color32> = raw.iter().map(|&x| shade(x as f32)).collect();
+        assert_eq!(v1.image.pixels, expect_1);
     }
 
     #[test]

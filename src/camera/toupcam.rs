@@ -164,8 +164,6 @@ pub struct FilterWheelState {
 #[derive(Clone)]
 pub struct FocuserState {
     pub position: i32,
-    /// UI-side target position (sent on "Move").
-    pub target: i32,
     pub max_step: i32,
     pub moving: bool,
 }
@@ -443,14 +441,14 @@ pub fn enumerate() -> Vec<DeviceInfo> {
 /// start a capture thread, and return a handle plus the initial control values.
 pub fn start_camera(
     info: &DeviceInfo,
-    frame_tx: Sender<super::FrameData>,
-    log_tx: Sender<super::LogEntry>,
+    frame_tx: Sender<crate::FrameData>,
+    log_tx: Sender<crate::LogEntry>,
 ) -> anyhow::Result<(ToupHandle, ToupControls)> {
     let cam = Camera::open(&info.id)
         .map_err(|e| anyhow::anyhow!("{}: {}", info.display_name, e))?;
 
     if info.model.is_usb3_over_usb2() {
-        let _ = log_tx.try_send(super::LogEntry::warn(format!(
+        let _ = log_tx.try_send(crate::LogEntry::warn(format!(
             "{}: USB3 camera on a USB2 link — bandwidth limited",
             info.display_name
         )));
@@ -480,7 +478,7 @@ pub fn start_camera(
             .ok()
             .and_then(|(fourcc, _)| crate::bayer::CfaPattern::from_fourcc(fourcc))
     };
-    let _ = log_tx.try_send(super::LogEntry::info(format!(
+    let _ = log_tx.try_send(crate::LogEntry::info(format!(
         "{}: RAW {} capture, {}-bit{}",
         info.display_name,
         if mono { "mono" } else { "color (Bayer)" },
@@ -591,7 +589,6 @@ pub fn start_camera(
     let focuser = if info.model.has_flag(sys::TOUPCAM_FLAG_AUTOFOCUSER) {
         cam.focuser_position().ok().map(|position| FocuserState {
             position,
-            target: position,
             max_step: cam.aaf(sys::TOUPCAM_AAF_GETMAXSTEP, 0).unwrap_or(100_000).max(1),
             moving: false,
         })
@@ -684,9 +681,9 @@ pub fn start_camera(
 struct CaptureCtx {
     cam: Camera,
     cam_name: String,
-    frame_tx: Sender<super::FrameData>,
+    frame_tx: Sender<crate::FrameData>,
     cmd_rx: Receiver<ToupCmd>,
-    log_tx: Sender<super::LogEntry>,
+    log_tx: Sender<crate::LogEntry>,
     telemetry_tx: Sender<ToupTelemetry>,
     pull_bits: BitDepth,
     bit_depth: u8,
@@ -818,13 +815,13 @@ fn capture_loop(ctx: CaptureCtx) {
                 match result {
                     Ok(()) => {
                         let (w, h) = cam.size().unwrap_or((0, 0));
-                        let _ = log_tx.try_send(super::LogEntry::info(format!(
+                        let _ = log_tx.try_send(crate::LogEntry::info(format!(
                             "{}: resolution changed to {} × {}",
                             cam_name, w, h
                         )));
                     }
                     Err(e) => {
-                        let _ = log_tx.try_send(super::LogEntry::error(format!(
+                        let _ = log_tx.try_send(crate::LogEntry::error(format!(
                             "{}: resolution change failed: {}",
                             cam_name, e
                         )));
@@ -845,7 +842,7 @@ fn capture_loop(ctx: CaptureCtx) {
                 }
             }
             if let Err(e) = apply_cmd(&cam, cmd) {
-                let _ = log_tx.try_send(super::LogEntry::error(format!(
+                let _ = log_tx.try_send(crate::LogEntry::error(format!(
                     "{}: set control failed: {}",
                     cam_name, e
                 )));
@@ -865,7 +862,7 @@ fn capture_loop(ctx: CaptureCtx) {
                 let frame = match cam.pull_image(pull_bits) {
                     Ok(f) => f,
                     Err(e) => {
-                        let _ = log_tx.try_send(super::LogEntry::error(format!(
+                        let _ = log_tx.try_send(crate::LogEntry::error(format!(
                             "{}: pull image failed: {}",
                             cam_name, e
                         )));
@@ -876,7 +873,7 @@ fn capture_loop(ctx: CaptureCtx) {
                 if pull_bits == BitDepth::Bpp16 && bit_depth < 16 {
                     if shift_bits == 0 && image_exceeds(&img, native_max) {
                         shift_bits = 16 - bit_depth;
-                        let _ = log_tx.try_send(super::LogEntry::info(format!(
+                        let _ = log_tx.try_send(crate::LogEntry::info(format!(
                             "{}: 16-bit samples are left-justified, shifting right by {}",
                             cam_name, shift_bits
                         )));
@@ -894,7 +891,7 @@ fn capture_loop(ctx: CaptureCtx) {
                 if superpixel && cfa_live.is_some() {
                     img = crate::bayer::superpixel_bin(img);
                 }
-                let mut frame_data = super::process_image(img, bit_depth);
+                let mut frame_data = crate::process_image(img, bit_depth);
                 frame_data.channel_hists = channel_hists;
                 // The pixels only carry the mosaic if superpixel didn't
                 // average it away (hardware binning already covered above).
@@ -906,14 +903,14 @@ fn capture_loop(ctx: CaptureCtx) {
                 }
             }
             Ok(Event::Disconnected) => {
-                let _ = log_tx.try_send(super::LogEntry::error(format!(
+                let _ = log_tx.try_send(crate::LogEntry::error(format!(
                     "{}: camera disconnected",
                     cam_name
                 )));
                 return;
             }
             Ok(Event::Error) => {
-                let _ = log_tx.try_send(super::LogEntry::error(format!(
+                let _ = log_tx.try_send(crate::LogEntry::error(format!(
                     "{}: camera reported an error, stopping capture",
                     cam_name
                 )));

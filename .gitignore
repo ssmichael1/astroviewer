@@ -4,3 +4,4 @@
 *.rkyv
 .DS_Store
 /data/
+/.cargo/config.toml

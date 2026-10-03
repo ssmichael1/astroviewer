@@ -25,6 +25,17 @@
 //! After each move the first `settle_frames` frames are discarded: a frame
 //! that arrives just after the motor stops was at least partly exposed while
 //! it was still turning.
+//!
+//! # Starting far from focus
+//!
+//! A sweep only works when it brackets the minimum. When the lowest HFR
+//! lands on an end of the sweep the routine does not stop there: it keeps
+//! walking in that direction with a step that doubles each time
+//! (`max_extensions` batches of `points_per_side` points), and once the HFR
+//! turns back up it discards the coarse points and runs a fresh sweep at the
+//! original step around the turn. Only when it cannot extend further (end of
+//! travel, or the extension limit) does it settle for the best measured
+//! point, and then it reports [`Outcome::Unbracketed`] rather than a focus.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -49,6 +60,9 @@ pub struct AutofocusConfig {
     /// Give up on a move that has not been reported complete within this
     /// long.
     pub move_timeout: Duration,
+    /// How many times the sweep may be extended when the HFR is still
+    /// falling at one end; each extension doubles the step.
+    pub max_extensions: usize,
 }
 
 impl Default for AutofocusConfig {
@@ -61,6 +75,7 @@ impl Default for AutofocusConfig {
             overshoot: 500,
             max_misses: 6,
             move_timeout: Duration::from_secs(60),
+            max_extensions: 5,
         }
     }
 }
@@ -184,6 +199,24 @@ fn median(v: &mut [f32]) -> f32 {
     }
 }
 
+/// Which way along the focuser's travel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Toward higher step positions.
+    Up,
+    /// Toward lower step positions.
+    Down,
+}
+
+impl Direction {
+    fn word(self) -> &'static str {
+        match self {
+            Direction::Up => "above",
+            Direction::Down => "below",
+        }
+    }
+}
+
 /// How the final position was chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -191,6 +224,9 @@ pub enum Method {
     Fit,
     /// The fit was not usable; the lowest measured point instead.
     BestPoint,
+    /// The HFR was still falling at this end of the sweep and the sweep
+    /// could not be extended; the lowest measured point, which is not focus.
+    BeyondSweep(Direction),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +238,16 @@ pub enum Outcome {
         hfr_expected: f32,
         /// HFR measured after the final move, when the verification frames
         /// found a star.
+        hfr_verified: Option<f32>,
+    },
+    /// The HFR was still falling at an end of the sweep and the sweep could
+    /// not be extended any further (end of travel, or the extension limit).
+    /// The focuser was moved to the best measured point, but focus lies
+    /// beyond it in `direction`.
+    Unbracketed {
+        position: i32,
+        direction: Direction,
+        hfr_measured: f32,
         hfr_verified: Option<f32>,
     },
     /// Nothing usable was measured; the focuser was sent back to where it started.
@@ -250,6 +296,10 @@ pub struct Autofocus {
     phase: Phase,
     /// Whether the plan being executed is the sweep or the final approach.
     finalizing: bool,
+    /// Sweep extensions made so far (see `extend`).
+    extensions: usize,
+    /// A fine sweep around the coarse walk's turning point has been run.
+    refined: bool,
     points: Vec<AfPoint>,
     total_sweep_points: usize,
     fit: Option<HyperbolaFit>,
@@ -292,6 +342,8 @@ impl Autofocus {
             plan,
             phase: Phase::Done,
             finalizing: false,
+            extensions: 0,
+            refined: false,
             points: Vec::with_capacity(total_sweep_points),
             total_sweep_points,
             fit: None,
@@ -335,6 +387,12 @@ impl Autofocus {
     /// `(measured, planned)` sweep points.
     pub fn progress(&self) -> (usize, usize) {
         (self.points.len(), self.total_sweep_points)
+    }
+
+    /// True while measuring sweep points, as opposed to the final approach
+    /// and verification.
+    pub fn sweeping(&self) -> bool {
+        self.is_running() && !self.finalizing
     }
 
     /// The position currently being measured or moved to, if any.
@@ -455,12 +513,137 @@ impl Autofocus {
             self.finish_verified(None, actions);
             return;
         }
+        self.sweep_done(actions);
+    }
+
+    /// A batch of sweep points is measured. Decide whether the minimum is
+    /// bracketed, and if not, walk further; if a coarse walk has just
+    /// bracketed it, sweep finely around the turn; otherwise fit.
+    fn sweep_done(&mut self, actions: &mut Vec<Action>) {
+        let Some(best) = self.best_point() else {
+            self.fail(format!("none of {} points measured", self.total_sweep_points), actions);
+            return;
+        };
+        if let Some(dir) = self.min_at_end(best) {
+            if self.extensions < self.cfg.max_extensions && self.extend(dir, actions) {
+                return;
+            }
+            actions.push(Action::Log(format!(
+                "Autofocus: HFR still falling at the {} end of the sweep and cannot extend further; \
+                 focus is {} {}. Moving to the best measured point.",
+                match dir { Direction::Up => "top", Direction::Down => "bottom" },
+                dir.word(),
+                best.position
+            )));
+            self.plan_approach(best.position, Method::BeyondSweep(dir), best.hfr, actions);
+            return;
+        }
+        if self.extensions > 0 && !self.refined && self.refine(best.position, actions) {
+            return;
+        }
         self.plan_final(actions);
     }
 
-    /// Sweep done: fit, choose the target, plan the backlash-safe approach.
-    fn plan_final(&mut self, actions: &mut Vec<Action>) {
+    fn best_point(&self) -> Option<AfPoint> {
+        self.points
+            .iter()
+            .min_by(|a, b| a.hfr.partial_cmp(&b.hfr).unwrap_or(std::cmp::Ordering::Equal))
+            .copied()
+    }
+
+    /// The end of the sweep the lowest point sits on, if it does: the HFR
+    /// was still falling there, so focus lies beyond it.
+    fn min_at_end(&self, best: AfPoint) -> Option<Direction> {
+        if self.points.len() < 2 {
+            return None;
+        }
+        let lo = self.points.iter().map(|p| p.position).min()?;
+        let hi = self.points.iter().map(|p| p.position).max()?;
+        if best.position == hi {
+            Some(Direction::Up)
+        } else if best.position == lo {
+            Some(Direction::Down)
+        } else {
+            None
+        }
+    }
+
+    /// Add `points_per_side` sweep points beyond the `dir` end, at a step
+    /// that doubles with each extension. Downward extensions dip under
+    /// their lowest point first so every point is still approached from
+    /// below. Returns false when no point fits in the focuser's range.
+    fn extend(&mut self, dir: Direction, actions: &mut Vec<Action>) -> bool {
+        let n = self.cfg.points_per_side as i32;
+        let step = self.cfg.step.saturating_mul(1i32 << (self.extensions + 1).min(20));
+        let lo = self.points.iter().map(|p| p.position).min().unwrap_or(self.start_pos);
+        let hi = self.points.iter().map(|p| p.position).max().unwrap_or(self.start_pos);
+        // Ascending order, so the walk is always upward.
+        let targets: Vec<i32> = match dir {
+            Direction::Up => (1..=n).map(|i| hi.saturating_add(i * step)).filter(|p| *p <= self.max_step).collect(),
+            Direction::Down => (1..=n).rev().map(|i| lo.saturating_sub(i * step)).filter(|p| *p >= 0).collect(),
+        };
+        if targets.is_empty() {
+            return false;
+        }
+        self.extensions += 1;
+        if dir == Direction::Down {
+            self.plan.push_back(Stage { target: (targets[0] - self.cfg.overshoot).max(0), measure: Measure::None });
+        }
+        for &t in &targets {
+            self.plan.push_back(Stage { target: t, measure: Measure::Sweep });
+        }
+        self.total_sweep_points += targets.len();
+        let word = match dir { Direction::Up => "up", Direction::Down => "down" };
+        actions.push(Action::Log(format!(
+            "Autofocus: HFR still falling at {}; extending the sweep {word} to {} at step {step}",
+            match dir { Direction::Up => hi, Direction::Down => lo },
+            match dir { Direction::Up => targets[targets.len() - 1], Direction::Down => targets[0] },
+        )));
+        self.status = format!("Extending sweep {word} to {}", match dir { Direction::Up => targets[targets.len() - 1], Direction::Down => targets[0] });
+        self.advance(actions);
+        true
+    }
+
+    /// The coarse walk has bracketed the minimum near `center`: drop the
+    /// coarse points and sweep at the configured step around it. Returns
+    /// false when the range is too short for a full sweep.
+    fn refine(&mut self, center: i32, actions: &mut Vec<Action>) -> bool {
+        self.refined = true;
+        let half = self.cfg.points_per_side as i32 * self.cfg.step;
+        if self.max_step < 2 * half {
+            return false;
+        }
+        let c = center.clamp(half, self.max_step - half);
+        let lo = c - half;
+        let n = 2 * self.cfg.points_per_side as i32;
+        self.points.clear();
+        self.total_sweep_points = n as usize + 1;
+        self.plan.push_back(Stage { target: (lo - self.cfg.overshoot).max(0), measure: Measure::None });
+        for i in 0..=n {
+            self.plan.push_back(Stage { target: lo + i * self.cfg.step, measure: Measure::Sweep });
+        }
+        actions.push(Action::Log(format!("Autofocus: minimum bracketed near {center}; sweeping {lo}..{} at step {}", lo + n * self.cfg.step, self.cfg.step)));
+        self.status = format!("Refining around {c}");
+        self.advance(actions);
+        true
+    }
+
+    /// Plan the backlash-safe final approach to `target` and its verification.
+    fn plan_approach(&mut self, target: i32, method: Method, expected: f32, actions: &mut Vec<Action>) {
         self.finalizing = true;
+        let target = target.clamp(0, self.max_step);
+        self.chosen = Some((target, method, expected));
+        self.plan.push_back(Stage { target: (target - self.cfg.overshoot).max(0), measure: Measure::None });
+        self.plan.push_back(Stage { target, measure: Measure::Verify });
+        self.status = match method {
+            Method::BeyondSweep(_) => format!("Moving to best point at {target}"),
+            _ => format!("Moving to focus at {target}"),
+        };
+        self.advance(actions);
+    }
+
+    /// Sweep done and bracketed: fit, choose the target, plan the approach.
+    fn plan_final(&mut self, actions: &mut Vec<Action>) {
         self.fit = fit_hyperbola(&self.points);
         let choice = match self.fit {
             Some(f) => {
@@ -494,20 +677,22 @@ impl Autofocus {
             self.fail(format!("only {} of {} points measured", self.points.len(), self.total_sweep_points), actions);
             return;
         };
-        let target = target.clamp(0, self.max_step);
-        self.chosen = Some((target, method, expected));
-        self.plan.push_back(Stage { target: (target - self.cfg.overshoot).max(0), measure: Measure::None });
-        self.plan.push_back(Stage { target, measure: Measure::Verify });
-        self.status = format!("Moving to focus at {target}");
-        self.advance(actions);
+        self.plan_approach(target, method, expected, actions);
     }
 
     fn finish_verified(&mut self, hfr_verified: Option<f32>, actions: &mut Vec<Action>) {
         let (position, method, hfr_expected) = self.chosen.unwrap_or((self.start_pos, Method::BestPoint, f32::NAN));
-        self.outcome = Some(Outcome::Focused { position, method, hfr_expected, hfr_verified });
-        self.status = match hfr_verified {
-            Some(h) => format!("Focused at {position}: HFR {h:.2}"),
-            None => format!("Focused at {position} (not verified)"),
+        let verified = match hfr_verified {
+            Some(h) => format!("HFR {h:.2}"),
+            None => "not verified".to_string(),
+        };
+        self.outcome = Some(match method {
+            Method::BeyondSweep(direction) => Outcome::Unbracketed { position, direction, hfr_measured: hfr_expected, hfr_verified },
+            _ => Outcome::Focused { position, method, hfr_expected, hfr_verified },
+        });
+        self.status = match method {
+            Method::BeyondSweep(dir) => format!("Not focused: focus is {} {position} ({verified}); run again from here", dir.word()),
+            _ => format!("Focused at {position}: {verified}"),
         };
         actions.push(Action::Log(format!("Autofocus: {}", self.status)));
         self.phase = Phase::Done;
@@ -626,6 +811,88 @@ mod tests {
         // are the final approach, which dips before coming back up).
         for w in moves[..n - 2].windows(2) {
             assert!(w[1] > w[0], "moves {:?}", moves);
+        }
+    }
+
+    /// Start 2000 steps under focus with a sweep that covers only ±400: the
+    /// walk must extend upward, bracket the minimum, refine, and land on it.
+    #[test]
+    fn far_start_extends_and_refines() {
+        let truth = HyperbolaFit { vertex: 48_873.0, hfr_min: 2.0, slope: 0.006 };
+        let cfg = AutofocusConfig { step: 100, ..Default::default() };
+        let (af, pos, moves) = run_sim(cfg, 46_898, &truth, 60_000);
+        match af.outcome() {
+            Some(Outcome::Focused { position, method: Method::Fit, hfr_verified: Some(v), .. }) => {
+                assert!((*position - 48_873).abs() <= 15, "landed at {position}");
+                assert_eq!(pos, *position);
+                assert!((*v - 2.0).abs() < 0.1);
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        assert!(af.extensions >= 1, "no extension happened");
+        assert!(af.refined, "no fine sweep after the coarse walk");
+        // The fine sweep is a fresh set of points at the configured step.
+        assert_eq!(af.points().len(), 9);
+        let ps: Vec<i32> = af.points().iter().map(|p| p.position).collect();
+        assert!(ps.windows(2).all(|w| w[1] - w[0] == 100), "fine sweep {ps:?}");
+        assert!(ps[0] <= 48_873 && 48_873 <= ps[8], "fine sweep {ps:?} does not bracket");
+        // Every measured position was approached from below: the only
+        // downward moves are overshoot dips, each followed by an upward move.
+        for w in moves.windows(3) {
+            if w[1] < w[0] {
+                assert!(w[2] > w[1], "dip not followed by an upward move: {moves:?}");
+            }
+        }
+        assert!(moves.last().unwrap() > &moves[moves.len() - 2], "final approach not from below");
+    }
+
+    /// Focus below the start: the walk must extend downward, dipping under
+    /// each new batch so the points are still approached from below.
+    #[test]
+    fn far_start_extends_downward() {
+        let truth = HyperbolaFit { vertex: 20_000.0, hfr_min: 2.0, slope: 0.006 };
+        let cfg = AutofocusConfig { step: 100, ..Default::default() };
+        let (af, pos, _) = run_sim(cfg, 22_000, &truth, 60_000);
+        match af.outcome() {
+            Some(Outcome::Focused { position, method: Method::Fit, .. }) => {
+                assert!((*position - 20_000).abs() <= 15, "landed at {position}");
+                assert_eq!(pos, *position);
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// With extensions disabled, a start far from focus ends at the top of
+    /// the sweep and says so, rather than claiming to be focused.
+    #[test]
+    fn unbracketed_is_reported_not_claimed() {
+        let truth = HyperbolaFit { vertex: 48_873.0, hfr_min: 2.0, slope: 0.006 };
+        let cfg = AutofocusConfig { step: 100, max_extensions: 0, ..Default::default() };
+        let (af, pos, _) = run_sim(cfg, 46_898, &truth, 60_000);
+        match af.outcome() {
+            Some(Outcome::Unbracketed { position, direction: Direction::Up, hfr_verified: Some(_), .. }) => {
+                assert_eq!(*position, 46_898 + 400);
+                assert_eq!(pos, *position);
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+        assert!(af.status().starts_with("Not focused"), "{}", af.status());
+    }
+
+    /// Focus beyond the end of travel: the extension is cut short by the
+    /// range, and the result is reported as unbracketed.
+    #[test]
+    fn extension_stops_at_end_of_travel() {
+        let truth = HyperbolaFit { vertex: 70_000.0, hfr_min: 2.0, slope: 0.006 };
+        let cfg = AutofocusConfig { step: 100, ..Default::default() };
+        let (af, pos, moves) = run_sim(cfg, 46_898, &truth, 50_000);
+        assert!(moves.iter().all(|m| (0..=50_000).contains(m)), "{moves:?}");
+        match af.outcome() {
+            Some(Outcome::Unbracketed { position, direction: Direction::Up, .. }) => {
+                assert_eq!(pos, *position);
+                assert!(*position > 47_298, "never extended: {position}");
+            }
+            other => panic!("unexpected outcome {other:?}"),
         }
     }
 

@@ -181,6 +181,16 @@ fn focuser_loop(
         match cmd_rx.recv_timeout(wait) {
             Ok(EafCmd::MoveTo(p)) => {
                 let p = p.clamp(0, max_step);
+                // The SDK rejects a move while the motor is turning, so a
+                // jog or Move issued mid-move would be lost. Stop the current
+                // move first; the newest target wins. A hand-controller move
+                // cannot be stopped from here, and the SDK reports that.
+                let (moving, hand) = eaf.is_moving().unwrap_or((false, false));
+                if moving && !hand {
+                    if let Err(e) = eaf.stop_and_wait(Duration::from_secs(2)) {
+                        let _ = log_tx.try_send(LogEntry::error(format!("{name}: stop before move failed: {e}")));
+                    }
+                }
                 if let Err(e) = eaf.move_to(p) {
                     let _ = log_tx.try_send(LogEntry::error(format!("{name}: move to {p} failed: {e}")));
                 }

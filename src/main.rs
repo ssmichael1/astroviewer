@@ -4606,7 +4606,7 @@ impl ViewerApp {
                     Some(_) => pal.status_warn,
                     None => pal.text_primary,
                 };
-                let text = if af.is_running() && !af.status().starts_with("Verifying") && !af.status().starts_with("Moving to focus") {
+                let text = if af.sweeping() {
                     format!("{} \u{2014} {done}/{total}", af.status())
                 } else {
                     af.status().to_string()

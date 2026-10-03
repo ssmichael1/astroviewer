@@ -27,7 +27,7 @@ svbony = { version = "0.1", features = ["image"], optional = true }
 toupcam = { version = "0.1.0", features = ["image"], optional = true }
 # ZWO EAF electronic focuser (USB). Local checkout until the crate is published.
 zwo-eaf = { path = "../zwo_eaf/zwo-eaf", optional = true }
-tetra3 = { version = "0.13.0", features = [
+tetra3 = { version = "0.14", features = [
     "image",
     "parallel",
 ], optional = true }

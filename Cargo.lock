@@ -5800,6 +5800,8 @@ dependencies = [
 [[package]]
 name = "zwo-eaf"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b13fea7b1892a81481bdb7ee983d2a6d353126da81b426f41fd826a441a7e89"
 dependencies = [
  "thiserror 2.0.20",
  "zwo-eaf-sys",
@@ -5808,6 +5810,8 @@ dependencies = [
 [[package]]
 name = "zwo-eaf-sys"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32b0c5ec31b8825d8acdbe48a19d40ae00d6e053792fd09562251d4e522eb8b9"
 dependencies = [
  "flate2",
  "sha2",

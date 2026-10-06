@@ -25,8 +25,8 @@ ctrlc = { version = "3", features = ["termination"] }
 svbony = { version = "0.1", features = ["image"], optional = true }
 # ToupTek (toupcam) USB/GigE cameras and rebrands (Altair, Omegon, RisingCam, …).
 toupcam = { version = "0.1.0", features = ["image"], optional = true }
-# ZWO EAF electronic focuser (USB). Local checkout until the crate is published.
-zwo-eaf = { path = "../zwo_eaf/zwo-eaf", optional = true }
+# ZWO EAF electronic focuser (USB).
+zwo-eaf = { version = "0.1.0", optional = true }
 tetra3 = { version = "0.14", features = [
     "image",
     "parallel",

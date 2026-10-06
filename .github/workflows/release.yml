@@ -274,6 +274,11 @@ jobs:
           # and the ToupTek toupcam.dll).
           Copy-Item "$env:SVBCAMERA_SDK_PATH/lib/x64/*.dll" dist/viewer-windows/
           Copy-Item "$env:TOUPCAM_SDK_PATH/win/x64/toupcam.dll" dist/viewer-windows/
+          # The ZWO EAF focuser links EAF_focuser.dll at load time; zwo-eaf-sys
+          # copies it next to the built executable. Without it viewer.exe
+          # does not start.
+          if (-not (Test-Path target/release/EAF_focuser.dll)) { throw "EAF_focuser.dll missing from target/release" }
+          Copy-Item target/release/EAF_focuser.dll dist/viewer-windows/
           Copy-Item catalog/gaia_merged.bin dist/viewer-windows/
           Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
           "ASSET=dist/viewer-windows.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -293,7 +298,10 @@ jobs:
           cp -P "$SVBCAMERA_SDK_PATH/lib/${{ matrix.libdir }}"/libusb-1.0.so* "dist/$OUT/"
           cp "$TOUPCAM_SDK_PATH/${{ matrix.touplibdir }}/libtoupcam.so" "dist/$OUT/"
           cp catalog/gaia_merged.bin "dist/$OUT/"
-          ldd "dist/$OUT/viewer" | grep -iE 'usb|toupcam' || true
+          # udev rule for non-root access to the ZWO EAF focuser (USB HID).
+          # The EAF library itself is static; it needs the system libudev.so.1.
+          cp packaging/linux/99-zwo-eaf.rules "dist/$OUT/"
+          ldd "dist/$OUT/viewer" | grep -iE 'usb|toupcam|udev' || true
           tar -czf "dist/$OUT.tar.gz" -C dist "$OUT"
           echo "ASSET=dist/$OUT.tar.gz" >> "$GITHUB_ENV"
 

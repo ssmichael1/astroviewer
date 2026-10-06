@@ -1,0 +1,6 @@
+# ZWO EAF electronic focuser (USB HID). Grants non-root access so the viewer
+# can open the focuser. From the ZWO EAF SDK 1.8.1 eaf.rules.
+#
+#   sudo cp 99-zwo-eaf.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+ACTION=="add", ATTRS{idVendor}=="03c3", ATTRS{idProduct}=="1f10", GROUP="users", MODE="0666"

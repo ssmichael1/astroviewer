@@ -17,6 +17,7 @@ Backends are selected at build time with Cargo features:
 | `indi` | INDI / INDIGO server | host\[:port\] address |
 | `starsolve` | Centroid extraction + lost-in-space plate solving (tetra3) | — |
 | `focus` | Focus assist: HFR readout and trend (implies `starsolve`) | — |
+| `eaf` | ZWO EAF electronic focuser; with `focus`, V-curve autofocus | discovery |
 | `all` | Everything above | — |
 
 FITS file playback is always built in.
@@ -27,6 +28,25 @@ cargo build --release --features all
 
 # Or just what you need
 cargo build --release --features svbony,indi
+```
+
+## Release packages
+
+The GitHub releases are built with `--features all`. Each package bundles the
+vendor libraries it needs; the Gaia catalog for plate solving is included.
+
+| Package | Bundled | Needs from the system |
+|---|---|---|
+| `viewer-macos.zip` | signed, notarized `Viewer.app` with libusb and libtoupcam | macOS 11+ |
+| `viewer-windows.zip` | `viewer.exe`, `SVBCameraSDK.dll`, `toupcam.dll`, `EAF_focuser.dll` | — |
+| `viewer-linux-*.tar.gz` | `viewer`, libusb, libtoupcam | GTK 3, OpenGL, `libudev1` |
+
+On Linux, copy the included udev rule so the ZWO EAF focuser can be opened
+without root, then replug the focuser:
+
+```bash
+sudo cp 99-zwo-eaf.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 ## Running

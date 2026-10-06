@@ -223,6 +223,11 @@ jobs:
             otool -L "$APP/Contents/MacOS/viewer" | grep -q "$lib" \
               || { echo "::error::viewer does not link $lib; built without the camera features?"; exit 1; }
           done
+          # String literals that only exist with the svbony / starsolve features.
+          for lit in "Using native format" "Plate Solve"; do
+            grep -q "$lit" "$APP/Contents/MacOS/viewer" \
+              || { echo "::error::viewer lacks '$lit'; built without the svbony/starsolve features?"; exit 1; }
+          done
 
       - name: Import signing certificate (macOS)
         if: matrix.name == 'macos' && env.HAS_SIGNING == 'true'
@@ -281,16 +286,20 @@ jobs:
           # and the ToupTek toupcam.dll).
           Copy-Item "$env:SVBCAMERA_SDK_PATH/lib/x64/*.dll" dist/viewer-windows/
           Copy-Item "$env:TOUPCAM_SDK_PATH/win/x64/toupcam.dll" dist/viewer-windows/
-          # The ZWO EAF focuser links EAF_focuser.dll at load time; zwo-eaf-sys
-          # copies it next to the built executable. Without it viewer.exe
-          # does not start.
-          if (-not (Test-Path target/release/EAF_focuser.dll)) { throw "EAF_focuser.dll missing from target/release" }
-          Copy-Item target/release/EAF_focuser.dll dist/viewer-windows/
-          # viewer.exe must import the vendor DLLs; otherwise it was built
-          # without the camera/focuser features.
+          # The ZWO EAF focuser links EAF_focuser.dll at load time; without it
+          # viewer.exe does not start. zwo-eaf-sys extracts the SDK into its
+          # OUT_DIR (and copies the DLL to target/release only when its build
+          # script runs, which a cache hit skips), so search the build tree.
+          $dll = Get-ChildItem -Path target/release -Recurse -Filter EAF_focuser.dll -ErrorAction SilentlyContinue |
+            Sort-Object { $_.FullName.Length } | Select-Object -First 1
+          if (-not $dll) { throw "EAF_focuser.dll not found under target/release" }
+          Write-Host "EAF_focuser.dll from $($dll.FullName)"
+          Copy-Item $dll.FullName dist/viewer-windows/
+          # viewer.exe must import the vendor DLLs and carry the svbony /
+          # starsolve string literals; otherwise it was built without them.
           $exe = [System.IO.File]::ReadAllText("target/release/viewer.exe", [System.Text.Encoding]::Latin1)
-          foreach ($dll in @("SVBCameraSDK.dll", "toupcam.dll", "EAF_focuser.dll")) {
-            if ($exe.IndexOf($dll, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "viewer.exe does not import $dll; built without the camera/focuser features?" }
+          foreach ($needle in @("SVBCameraSDK.dll", "toupcam.dll", "EAF_focuser.dll", "Using native format", "Plate Solve")) {
+            if ($exe.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "viewer.exe lacks '$needle'; built without the camera/solver/focuser features?" }
           }
           Copy-Item catalog/gaia_merged.bin dist/viewer-windows/
           Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
@@ -315,9 +324,16 @@ jobs:
           # The EAF library itself is static; it needs the system libudev.so.1.
           cp packaging/linux/99-zwo-eaf.rules "dist/$OUT/"
           ldd "dist/$OUT/viewer" | grep -iE 'usb|toupcam|udev' || true
-          for lib in libusb-1.0.so libtoupcam.so libudev.so; do
+          # libtoupcam is dynamic; libudev comes from the EAF focuser. The static
+          # SVBony archive needs nothing from the shared libusb (the linker drops
+          # it with --as-needed), so svbony is checked by a string literal below.
+          for lib in libtoupcam.so libudev.so; do
             ldd "dist/$OUT/viewer" | grep -q "$lib" \
               || { echo "::error::viewer does not link $lib; built without the camera/focuser features?"; exit 1; }
+          done
+          for lit in "Using native format" "Plate Solve"; do
+            grep -q "$lit" "dist/$OUT/viewer" \
+              || { echo "::error::viewer lacks '$lit'; built without the svbony/starsolve features?"; exit 1; }
           done
           tar -czf "dist/$OUT.tar.gz" -C dist "$OUT"
           echo "ASSET=dist/$OUT.tar.gz" >> "$GITHUB_ENV"

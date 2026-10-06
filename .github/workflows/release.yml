@@ -229,15 +229,18 @@ jobs:
               || { echo "::error::viewer lacks '$lit'; built without the svbony/starsolve features?"; exit 1; }
           done
 
+      # Signing + notarization only on tagged releases: Apple's notary queue
+      # can take 10-40 minutes, and branch builds just need to prove the
+      # package is complete.
       - name: Import signing certificate (macOS)
-        if: matrix.name == 'macos' && env.HAS_SIGNING == 'true'
+        if: matrix.name == 'macos' && env.HAS_SIGNING == 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
           p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
 
       - name: Sign, notarize & staple (macOS)
-        if: matrix.name == 'macos' && env.HAS_SIGNING == 'true'
+        if: matrix.name == 'macos' && env.HAS_SIGNING == 'true' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}

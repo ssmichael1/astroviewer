@@ -184,21 +184,23 @@ jobs:
           mkdir -p catalog
           curl -fL "$CATALOG_URL" -o catalog/gaia_merged.bin
 
-      - name: Build
-        shell: bash
-        run: cargo build --release --features "$FEATURES"
-
       # The GigE transport's loopback tests (GVSP reassembly, packet resend,
       # Windows control-message parsing, Linux recvmmsg batching) exercise
       # platform-specific receive code that only runs for real on these
       # runners. The vendor-SDK features are left out so the test binary needs
-      # no runtime DLLs; the release profile reuses the dependencies the build
-      # step just compiled.
+      # no runtime DLLs. This runs BEFORE the release build on purpose:
+      # `cargo test` also rebuilds the `viewer` binary with only the `gev`
+      # feature, and when it ran after the build it overwrote the full-feature
+      # binary that gets packaged (releases 0.3.1 to 0.4.1 shipped without
+      # the camera SDKs, the plate solver or the focuser).
       - name: Test
         shell: bash
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --release --features gev
+      - name: Build
+        shell: bash
+        run: cargo build --release --features "$FEATURES"
 
       - name: Package (macOS)
         if: matrix.name == 'macos'
@@ -213,9 +215,14 @@ jobs:
           cp "$SVBCAMERA_SDK_PATH/lib/arm64/libusb-1.0.0.dylib" "$APP/Contents/Frameworks/"
           cp "$TOUPCAM_SDK_PATH/mac/libtoupcam.dylib" "$APP/Contents/Frameworks/"
           cp catalog/gaia_merged.bin "$APP/Contents/Resources/"
-          # Sanity-check that the only non-system dylib dependencies are the
-          # bundled libusb and libtoupcam.
-          otool -L "$APP/Contents/MacOS/viewer" || true
+          # The only non-system dylib dependencies must be the bundled libusb
+          # and libtoupcam; their absence means the binary was built without
+          # the camera features.
+          otool -L "$APP/Contents/MacOS/viewer"
+          for lib in libusb-1.0.0.dylib libtoupcam.dylib; do
+            otool -L "$APP/Contents/MacOS/viewer" | grep -q "$lib" \
+              || { echo "::error::viewer does not link $lib; built without the camera features?"; exit 1; }
+          done
 
       - name: Import signing certificate (macOS)
         if: matrix.name == 'macos' && env.HAS_SIGNING == 'true'
@@ -279,6 +286,12 @@ jobs:
           # does not start.
           if (-not (Test-Path target/release/EAF_focuser.dll)) { throw "EAF_focuser.dll missing from target/release" }
           Copy-Item target/release/EAF_focuser.dll dist/viewer-windows/
+          # viewer.exe must import the vendor DLLs; otherwise it was built
+          # without the camera/focuser features.
+          $exe = [System.IO.File]::ReadAllText("target/release/viewer.exe", [System.Text.Encoding]::Latin1)
+          foreach ($dll in @("SVBCameraSDK.dll", "toupcam.dll", "EAF_focuser.dll")) {
+            if ($exe.IndexOf($dll, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "viewer.exe does not import $dll; built without the camera/focuser features?" }
+          }
           Copy-Item catalog/gaia_merged.bin dist/viewer-windows/
           Compress-Archive -Path dist/viewer-windows/* -DestinationPath dist/viewer-windows.zip -Force
           "ASSET=dist/viewer-windows.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -302,6 +315,10 @@ jobs:
           # The EAF library itself is static; it needs the system libudev.so.1.
           cp packaging/linux/99-zwo-eaf.rules "dist/$OUT/"
           ldd "dist/$OUT/viewer" | grep -iE 'usb|toupcam|udev' || true
+          for lib in libusb-1.0.so libtoupcam.so libudev.so; do
+            ldd "dist/$OUT/viewer" | grep -q "$lib" \
+              || { echo "::error::viewer does not link $lib; built without the camera/focuser features?"; exit 1; }
+          done
           tar -czf "dist/$OUT.tar.gz" -C dist "$OUT"
           echo "ASSET=dist/$OUT.tar.gz" >> "$GITHUB_ENV"
 

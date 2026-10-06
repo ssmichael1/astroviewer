@@ -20,6 +20,14 @@ fn main() {
         // loader search next to the executable, so the bundled libusb resolves.
         Ok("linux") => {
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+            // The ZWO EAF static library bundles hidapi's hidraw backend,
+            // which enumerates devices through libudev. zwo-eaf-sys 0.1.0
+            // does not link it, and with GNU ld the library must come after
+            // the archive, so pass it as a trailing linker argument rather
+            // than a `rustc-link-lib` that rustc would order earlier.
+            if std::env::var_os("CARGO_FEATURE_EAF").is_some() {
+                println!("cargo:rustc-link-arg=-ludev");
+            }
         }
         _ => {}
     }
